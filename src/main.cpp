@@ -125,7 +125,7 @@ void setup() {
     Serial.println(F("\n\n=== codelight boot ==="));
     Serial.flush();
 
-    hen/ --- 1. Config ---
+    // --- 1. Config ---
     Serial.println(F("[1] Loading config..."));
     Serial.flush();
     configLoad();

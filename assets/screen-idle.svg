@@ -1,0 +1,24 @@
+<svg width="320" height="320" viewBox="0 0 160 160" xmlns="http://www.w3.org/2000/svg">
+  <defs><style>text { font-family: 'Courier New', Courier, monospace; }</style></defs>
+  <rect width="160" height="160" fill="#040C14"/>
+  <rect x="0" y="0" width="160" height="17" fill="#0A1A2E"/>
+  <text x="4" y="12" font-size="7.5" fill="#58A6FF" font-weight="bold" letter-spacing="0.3">CLAUDE CODE</text>
+  <text x="156" y="12" font-size="7.5" fill="#8BAABF" text-anchor="end">22:15:04</text>
+  <line x1="0" y1="17" x2="160" y2="17" stroke="#152232" stroke-width="1"/>
+  <text x="4" y="27" font-size="6.5" fill="#5A7080">Weekly</text>
+  <text x="156" y="27" font-size="6.5" fill="#5A7080" text-anchor="end">2d 1h</text>
+  <rect x="4" y="29" width="116" height="6" rx="1" fill="#0D1F30"/>
+  <rect x="4" y="29" width="49" height="6" rx="1" fill="#D0F400"/>
+  <text x="124" y="35" font-size="6.5" fill="#D0F400">42%</text>
+  <text x="4" y="47" font-size="6.5" fill="#5A7080">Session</text>
+  <text x="156" y="47" font-size="6.5" fill="#5A7080" text-anchor="end">5h 30m</text>
+  <rect x="4" y="49" width="116" height="6" rx="1" fill="#0D1F30"/>
+  <rect x="4" y="49" width="9" height="6" rx="1" fill="#28C800"/>
+  <text x="124" y="55" font-size="6.5" fill="#28C800"> 8%</text>
+  <text x="4" y="68" font-size="6.5" fill="#3A5060">0 sessions</text>
+  <line x1="0" y1="73" x2="160" y2="73" stroke="#152232" stroke-width="1"/>
+  <rect x="12" y="82" width="136" height="66" rx="2" fill="#006000"/>
+  <rect x="13" y="83" width="134" height="64" rx="2" fill="#00C000"/>
+  <text x="80" y="120" font-size="14" fill="#FFFFFF" font-weight="bold" text-anchor="middle" letter-spacing="1.5">IDLE</text>
+  <rect x="0" y="0" width="160" height="160" fill="none" stroke="#0E1E2E" stroke-width="1.5"/>
+</svg>

@@ -441,6 +441,29 @@ _usage_session:   str | None = None
 _usage_probe_cwd: str | None = None
 
 
+def _kill_stale_monitor_sessions() -> None:
+    """Kill orphaned _claude_usage_* / _claude_probe_* tmux sessions.
+
+    Only kills sessions whose owning PID is dead.  Leaves sessions owned by
+    other living monitor processes alone so two concurrent instances (e.g. a
+    dry-run alongside the real monitor) don't fight each other.
+    """
+    r = subprocess.run(["tmux", "list-sessions", "-F", "#{session_name}"],
+                       capture_output=True, text=True)
+    my_pid = str(os.getpid())
+    for name in r.stdout.splitlines():
+        if name in (f"_claude_usage_{my_pid}", f"_claude_probe_{my_pid}"):
+            continue
+        if not (name.startswith("_claude_usage_") or name.startswith("_claude_probe_")):
+            continue
+        # Extract the PID suffix and only kill if that process is gone.
+        suffix = name.split("_")[-1]
+        if suffix.isdigit() and pid_alive(int(suffix)):
+            continue  # another live monitor owns this session
+        subprocess.run(["tmux", "kill-session", "-t", name], capture_output=True)
+        print(f"[usage] cleaned up stale session {name}", flush=True)
+
+
 def _start_usage_session() -> bool:
     """
     Start the persistent tmux session used for /usage queries.
@@ -451,6 +474,8 @@ def _start_usage_session() -> bool:
 
     if not shutil.which("tmux"):
         return False
+
+    _kill_stale_monitor_sessions()
 
     session   = f"_claude_usage_{os.getpid()}"
     probe_cwd = tempfile.mkdtemp(prefix=".claude_probe_")
@@ -668,6 +693,9 @@ def main():
 
     weekly_limit = args.weekly_limit
     daily_limit  = args.daily_limit
+
+    import signal
+    signal.signal(signal.SIGTERM, lambda *_: (_stop_usage_session(), sys.exit(0)))
 
     _start_usage_session()
     try:

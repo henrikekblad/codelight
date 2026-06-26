@@ -8,34 +8,12 @@ Custom firmware for the **GeekMagic Ultra** that turns it into a live Claude Cod
 dashboard. A companion Python script on your computer polls usage and session state
 and pushes it to the device over WiFi.
 
-```
-┌──────────────────────────────┐
-│ CLAUDE CODE        14:23:07  │
-├──────────────────────────────┤
-│ Weekly                 1d 7h │
-│ [██████████████░░░░░░] 46%   │
-│                              │
-│ Session               4h 50m │
-│ [█░░░░░░░░░░░░░░░░░░░]  3%   │
-│                              │
-│ 1 session active             │
-├──────────────────────────────┤
-│                              │
-│    ┌──────────────────────┐  │
-│    │                      │  │
-│    │       WORKING        │  │
-│    │                      │  │
-│    └──────────────────────┘  │
-│                              │
-└──────────────────────────────┘
-```
+<table border="1" padding="3"><tr>
+<td align="center"><img src="assets/screen-working.svg" width="160"></td>
+<td align="center"><img src="assets/screen-waiting.svg" width="160"></td>
+<td align="center"><img src="assets/screen-idle.svg" width="160"></td>
+</tr></table>
 
-Status colours:
-- **Green** — no active Claude sessions
-- **Orange** — session in progress (tools running)
-- **Red** — waiting for your input (permission request)
-
----
 
 ## Hardware
 
@@ -45,6 +23,8 @@ Status colours:
 | Display | ST7789V 240×240 IPS TFT |
 | Flash | 4 MB |
 | Connectivity | 2.4 GHz WiFi only (no Bluetooth) |
+
+[GeekMagic Ultra on Aliexpress](https://s.click.aliexpress.com/e/_c32BRoxx) (affiliate link)
 
 ---
 
@@ -204,9 +184,18 @@ ordering constraints.
 ```bash
 systemctl --user daemon-reload
 systemctl --user enable --now claude-monitor
+systemctl --user status claude-monitor   # verify it's running
 
 # To start at boot without being logged in:
 sudo loginctl enable-linger $USER
+```
+
+Useful commands:
+
+```bash
+journalctl --user -fu claude-monitor     # live logs
+systemctl --user restart claude-monitor  # restart after config change
+systemctl --user disable --now claude-monitor  # disable
 ```
 
 ### Optional: shared secret
