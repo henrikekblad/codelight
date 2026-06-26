@@ -12,13 +12,11 @@ import argparse
 import glob
 import json
 import os
-import re
-import shutil
-import subprocess
 import sys
-import tempfile
 import time
-from datetime import datetime, timezone, timedelta
+import urllib.request
+import urllib.error
+from datetime import datetime, timezone
 
 # ── Config ────────────────────────────────────────────────────────────────────
 
@@ -26,8 +24,8 @@ CLAUDE_SESSIONS_DIR  = os.path.expanduser("~/.claude/sessions")
 CLAUDE_PROJECTS_DIR  = os.path.expanduser("~/.claude/projects")
 MONITOR_STATE_DIR    = os.path.expanduser("~/.claude/monitor_state")
 
-STATUS_INTERVAL  =  2   # seconds between POST /status calls (low cost, fast detection)
-USAGE_INTERVAL   = 60   # seconds between `claude /usage` calls (tmux spawn takes ~7s)
+STATUS_INTERVAL  =  2   # seconds between POST /status calls
+USAGE_INTERVAL   = 60   # seconds between usage API polls
 WORKING_ACTIVITY = 15   # any JSONL write within N seconds → WORKING (type-agnostic)
 WAITING_WINDOW   = 90   # seconds: recent "assistant" message → WAITING
 IDLE_WINDOW      = 600  # seconds: ignore sessions with no activity in the last 10 min
@@ -343,290 +341,73 @@ def _format_countdown(diff_secs: int) -> str:
     return f"{mins}m"
 
 
-def parse_reset_time(text: str) -> str:
-    """
-    Parse a reset time string into a countdown like '2h 15m' or '3d 4h'.
-    Handles:
-      "Jun 27, 5pm"     – date + hour only (TUI interactive format)
-      "Jun 24, 3:20pm"  – date + time
-      "2:30pm"          – time only, assumes today (session reset within 24h)
-    Trailing timezone like "(Europe/Stockholm)" is ignored.
-    """
-    now = datetime.now()
-
-    # Format: "Month day, hour[:min]am/pm"
-    m = re.search(r"(\w+ \d+),\s*(\d+)(?::(\d+))?\s*(am|pm)", text, re.IGNORECASE)
-    if m:
-        month_day = m.group(1)
-        hour      = m.group(2)
-        minute    = m.group(3) or "00"
-        ampm      = m.group(4).lower()
-        try:
-            target = datetime.strptime(
-                f"{month_day} {now.year} {hour}:{minute}{ampm}", "%b %d %Y %I:%M%p")
-            if target < now:
-                target = target.replace(year=now.year + 1)
-            return _format_countdown(int((target - now).total_seconds()))
-        except Exception:
-            return "--"
-
-    # Format: "hour[:min]am/pm"  (session reset, same day or next day)
-    m = re.search(r"(\d+)(?::(\d+))?\s*(am|pm)", text, re.IGNORECASE)
-    if m:
-        hour   = m.group(1)
-        minute = m.group(2) or "00"
-        ampm   = m.group(3).lower()
-        try:
-            target = datetime.strptime(
-                f"{now.strftime('%b %d %Y')} {hour}:{minute}{ampm}", "%b %d %Y %I:%M%p")
-            if target < now:
-                target += timedelta(days=1)
-            return _format_countdown(int((target - now).total_seconds()))
-        except Exception:
-            return "--"
-
-    return "--"
-
-
-def _parse_usage_text(text: str, weekly_limit: int, daily_limit: int) -> dict | None:
-    """Parse /usage output into a payload dict. Returns None if nothing useful is found."""
-    # TUI format (tmux):    "43% used" on bar line, "Resets 2:30pm" on next line
-    # Old inline format:    "Current session: 43% used · resets Jun 24, 3:20pm"
-    pct_matches   = re.findall(r"(\d+)%\s+used", text)
-    reset_matches = re.findall(r"[Rr]esets\s+([^\n(]+)", text)
-
-    if pct_matches:
-        # session is listed before weekly in the TUI output
-        session_pct   = int(pct_matches[0]) / 100.0
-        weekly_pct    = int(pct_matches[1]) / 100.0 if len(pct_matches) > 1 else 0.0
-        session_reset = parse_reset_time(reset_matches[0]) if reset_matches else "--"
-        weekly_reset  = parse_reset_time(reset_matches[1]) if len(reset_matches) > 1 else "--"
-        vprint(f"[usage] pct mode: weekly={weekly_pct:.0%} session={session_pct:.0%}")
-        return {
-            "session_pct":   session_pct,
-            "weekly_pct":    weekly_pct,
-            "session_reset": session_reset,
-            "weekly_reset":  weekly_reset,
-        }
-
-    wm2 = re.search(r"Last 7d\s*·\s*(\d+)\s*requests", text)
-    dm2 = re.search(r"Last 24h\s*·\s*(\d+)\s*requests", text)
-    if not wm2 and not dm2:
-        vprint("[usage] no parseable usage patterns in screen capture")
-        return None
-
-    weekly_req  = int(wm2.group(1)) if wm2 else 0
-    daily_req   = int(dm2.group(1)) if dm2 else 0
-    weekly_pct  = min(1.0, weekly_req  / weekly_limit)  if weekly_limit  else 0.0
-    session_pct = min(1.0, daily_req   / daily_limit)   if daily_limit   else 0.0
-    vprint(f"[usage] req mode: 7d={weekly_req} 24h={daily_req}  "
-           f"limits={weekly_limit}/{daily_limit}")
-    return {
-        "session_pct":   session_pct,
-        "weekly_pct":    weekly_pct,
-        "session_reset": "--",
-        "weekly_reset":  "--",
-    }
-
-
-class _RateLimited(Exception):
-    pass
-
-
-# ── Persistent tmux session for /usage queries ────────────────────────────────
-# One long-lived session started at monitor boot; reused for every poll.
-# Avoids the per-startup auth call that triggers rate limiting.
-
-_usage_session:   str | None = None
-_usage_probe_cwd: str | None = None
-
-
-def _kill_stale_monitor_sessions() -> None:
-    """Kill orphaned _claude_usage_* / _claude_probe_* tmux sessions.
-
-    Only kills sessions whose owning PID is dead.  Leaves sessions owned by
-    other living monitor processes alone so two concurrent instances (e.g. a
-    dry-run alongside the real monitor) don't fight each other.
-    """
-    r = subprocess.run(["tmux", "list-sessions", "-F", "#{session_name}"],
-                       capture_output=True, text=True)
-    my_pid = str(os.getpid())
-    for name in r.stdout.splitlines():
-        if name in (f"_claude_usage_{my_pid}", f"_claude_probe_{my_pid}"):
-            continue
-        if not (name.startswith("_claude_usage_") or name.startswith("_claude_probe_")):
-            continue
-        # Extract the PID suffix and only kill if that process is gone.
-        suffix = name.split("_")[-1]
-        if suffix.isdigit() and pid_alive(int(suffix)):
-            continue  # another live monitor owns this session
-        subprocess.run(["tmux", "kill-session", "-t", name], capture_output=True)
-        print(f"[usage] cleaned up stale session {name}", flush=True)
-
-
-def _start_usage_session() -> bool:
-    """
-    Start the persistent tmux session used for /usage queries.
-    Handles the folder-trust dialog once at startup.
-    Returns True if the session is ready, False if tmux is unavailable.
-    """
-    global _usage_session, _usage_probe_cwd
-
-    if not shutil.which("tmux"):
-        return False
-
-    _kill_stale_monitor_sessions()
-
-    session   = f"_claude_usage_{os.getpid()}"
-    probe_cwd = tempfile.mkdtemp(prefix=".claude_probe_")
-
+def _format_iso_countdown(iso_ts: str) -> str:
+    """Convert an ISO-8601 timestamp to a human-readable countdown like '3h 45m'."""
+    if not iso_ts:
+        return "--"
     try:
-        env = {k: v for k, v in os.environ.items()
-               if k != "CLAUDE_CODE_CHILD_SESSION"}
-
-        subprocess.run(
-            ["tmux", "new-session", "-d", "-s", session,
-             "-x", "200", "-y", "50", "-c", probe_cwd, "claude"],
-            env=env, check=True, timeout=10, capture_output=True,
-        )
-
-        # Wait for the prompt (up to 20s), dismissing the trust dialog if it appears.
-        trust_dismissed = False
-        for _ in range(40):
-            time.sleep(0.5)
-            r = subprocess.run(["tmux", "capture-pane", "-t", session, "-p"],
-                               capture_output=True, text=True, timeout=5)
-            if "? for shortcuts" in r.stdout:
-                break
-            if not trust_dismissed and (
-                    "trust this folder" in r.stdout.lower()
-                    or "Enter to confirm" in r.stdout):
-                subprocess.run(["tmux", "send-keys", "-t", session, "", "Enter"],
-                               capture_output=True, timeout=3)
-                trust_dismissed = True
-
-        _usage_session   = session
-        _usage_probe_cwd = probe_cwd
-        vprint(f"[usage] persistent session ready ({session})")
-        return True
-
-    except Exception as e:
-        print(f"[usage] failed to start session: {e}", file=sys.stderr)
-        subprocess.run(["tmux", "kill-session", "-t", session], capture_output=True)
-        shutil.rmtree(probe_cwd, ignore_errors=True)
-        return False
+        target = datetime.fromisoformat(iso_ts.replace("Z", "+00:00"))
+        diff = int((target - datetime.now(timezone.utc)).total_seconds())
+        return _format_countdown(diff)
+    except Exception:
+        return "--"
 
 
-def _stop_usage_session() -> None:
-    """Kill the persistent tmux session and clean up its temp dir."""
-    global _usage_session, _usage_probe_cwd
-    if _usage_session:
-        subprocess.run(["tmux", "kill-session", "-t", _usage_session],
-                       capture_output=True, timeout=3)
-        _usage_session = None
-    if _usage_probe_cwd:
-        shutil.rmtree(_usage_probe_cwd, ignore_errors=True)
-        _usage_probe_cwd = None
+# ── Usage via claude.ai /api/oauth/usage ─────────────────────────────────────
+# Direct API call — no subprocess, no screen scraping.  Credentials are read
+# fresh each poll so token rotations by Claude Code are picked up automatically.
 
-
-def _session_alive(session: str) -> bool:
-    return subprocess.run(["tmux", "has-session", "-t", session],
-                          capture_output=True).returncode == 0
-
-
-def _get_usage_pty(weekly_limit: int, daily_limit: int) -> dict:
-    """
-    Query /usage in the persistent tmux session.
-    Raises _RateLimited if the endpoint is rate limited.
-    Returns None if the session is unavailable.
-    """
-    global _usage_session, _usage_probe_cwd
-
-    # Restart session if it died unexpectedly.
-    if not _usage_session or not _session_alive(_usage_session):
-        _usage_session = None
-        if not _start_usage_session():
-            return None
-
-    session = _usage_session
-
-    try:
-        # Dismiss any leftover panel, then wait until "% used" is actually gone
-        # from the screen before snapshotting. A fixed sleep is not enough —
-        # if the TUI is slow the panel is still visible, `before` contains the
-        # old percentage, and when /usage re-renders the same value the screen
-        # looks identical → screen == before → poll loop never breaks.
-        subprocess.run(["tmux", "send-keys", "-t", session, "Escape", ""],
-                       capture_output=True, timeout=3)
-        before = ""
-        for _ in range(10):
-            time.sleep(0.2)
-            r = subprocess.run(["tmux", "capture-pane", "-t", session, "-p"],
-                               capture_output=True, text=True, timeout=5)
-            before = r.stdout
-            if "% used" not in before:
-                break
-
-        subprocess.run(["tmux", "send-keys", "-t", session, "/usage", "Enter"],
-                       check=True, timeout=3, capture_output=True)
-
-        # Poll until "% used" appears. The `before` snapshot is now guaranteed
-        # panel-free, so any "% used" we see is freshly rendered.
-        screen = ""
-        for _ in range(20):
-            time.sleep(0.5)
-            r = subprocess.run(["tmux", "capture-pane", "-t", session, "-p"],
-                               capture_output=True, text=True, timeout=5)
-            screen = r.stdout
-            if "% used" in screen or "rate limited" in screen.lower():
-                break
-
-        # If rate limited, use Claude's own "r to retry" up to 3 times.
-        for attempt in range(3):
-            if "% used" in screen or "rate limited" not in screen.lower():
-                break
-            vprint(f"[usage] rate limited, retrying ({attempt + 1}/3)…")
-            subprocess.run(["tmux", "send-keys", "-t", session, "r", ""],
-                           capture_output=True, timeout=3)
-            for _ in range(10):
-                time.sleep(1)
-                r = subprocess.run(["tmux", "capture-pane", "-t", session, "-p"],
-                                   capture_output=True, text=True, timeout=5)
-                screen = r.stdout
-                if "% used" in screen or "rate limited" in screen.lower():
-                    break
-
-        # Dismiss the usage panel so the next query starts from a clean prompt.
-        subprocess.run(["tmux", "send-keys", "-t", session, "Escape", ""],
-                       capture_output=True, timeout=3)
-
-        vprint("[usage] tmux screen capture:")
-        for line in screen.splitlines():
-            if line.strip():
-                vprint(f"  {line.rstrip()}")
-
-        if "rate limited" in screen.lower() and "% used" not in screen:
-            raise _RateLimited()
-
-        return _parse_usage_text(screen, weekly_limit, daily_limit)
-
-    except _RateLimited:
-        raise
-    except Exception as e:
-        print(f"[usage] tmux error: {e}", file=sys.stderr)
-        return None
+_USAGE_API = "https://claude.ai/api/oauth/usage"
+_CREDS_PATH = os.path.expanduser("~/.claude/.credentials.json")
 
 
 def get_usage(weekly_limit: int = 0, daily_limit: int = 0) -> dict | None:
     """
-    Get /usage data. Returns a dict on success, or None if rate-limited
-    (caller should keep using the last cached values).
+    Fetch usage from the claude.ai OAuth usage API.
+    Returns a dict with session_pct/weekly_pct/resets, or None on failure
+    (caller keeps cached values).
     """
     try:
-        return _get_usage_pty(weekly_limit, daily_limit)
-    except _RateLimited:
-        vprint("[usage] rate limited – returning None to preserve cached values")
+        with open(_CREDS_PATH) as f:
+            creds = json.load(f)
+        token = creds["claudeAiOauth"]["accessToken"]
+    except Exception as e:
+        vprint(f"[usage] could not read credentials: {e}")
         return None
+
+    req = urllib.request.Request(
+        _USAGE_API,
+        headers={
+            "Authorization": f"Bearer {token}",
+            "User-Agent":    "claude-code/1.0.0",
+            "Accept":        "application/json",
+        },
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=10) as r:
+            data = json.loads(r.read())
+    except urllib.error.HTTPError as e:
+        vprint(f"[usage] HTTP {e.code}: {e.reason}")
+        return None
+    except Exception as e:
+        vprint(f"[usage] request error: {e}")
+        return None
+
+    session = data.get("five_hour") or {}
+    weekly  = data.get("seven_day")  or {}
+
+    session_pct   = float(session.get("utilization") or 0.0) / 100.0
+    weekly_pct    = float(weekly.get("utilization")  or 0.0) / 100.0
+    session_reset = _format_iso_countdown(session.get("resets_at", ""))
+    weekly_reset  = _format_iso_countdown(weekly.get("resets_at",  ""))
+
+    vprint(f"[usage] API: session={session_pct:.0%} weekly={weekly_pct:.0%}")
+    return {
+        "session_pct":   session_pct,
+        "weekly_pct":    weekly_pct,
+        "session_reset": session_reset,
+        "weekly_reset":  weekly_reset,
+    }
 
 
 def print_payload(payload: dict, url: str) -> None:
@@ -695,13 +476,9 @@ def main():
     daily_limit  = args.daily_limit
 
     import signal
-    signal.signal(signal.SIGTERM, lambda *_: (_stop_usage_session(), sys.exit(0)))
+    signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
 
-    _start_usage_session()
-    try:
-        _run_loop(args, url, headers, weekly_limit, daily_limit)
-    finally:
-        _stop_usage_session()
+    _run_loop(args, url, headers, weekly_limit, daily_limit)
 
 
 def _run_loop(args, url, headers, weekly_limit, daily_limit):
@@ -713,22 +490,25 @@ def _run_loop(args, url, headers, weekly_limit, daily_limit):
 
     _empty = {"session_pct": 0.0, "weekly_pct": 0.0,
               "session_reset": "--", "weekly_reset": "--"}
-    usage_cache = _empty
-    # Defer the first /usage call by 10s so the persistent session fully initialises
-    # before hitting the usage endpoint (avoids spurious rate-limit on first query).
-    last_usage  = time.monotonic() - USAGE_INTERVAL + 10
-    last_working = 0.0  # monotonic time of last WORKING detection (for sticky state)
+    usage_cache  = _empty
+    last_usage   = 0.0   # 0 → poll immediately on first iteration
+    last_working = 0.0   # monotonic time of last WORKING detection (for sticky state)
 
     while True:
         loop_start = time.monotonic()
 
         if loop_start - last_usage >= USAGE_INTERVAL:
-            fresh = get_usage(weekly_limit, daily_limit)
+            last_usage = loop_start   # update first — guarantees 60s gap even on error
+            print(f"[{datetime.now().strftime('%H:%M:%S')}] [usage] polling…", flush=True)
+            try:
+                fresh = get_usage(weekly_limit, daily_limit)
+            except Exception as e:
+                print(f"[usage] unexpected error: {e}", file=sys.stderr, flush=True)
+                fresh = None
             if fresh is None:
-                vprint("[usage] no data – keeping cached values")
+                print("[usage] no data – keeping cached values", flush=True)
             else:
                 usage_cache = fresh
-            last_usage = loop_start
 
         sessions, live, status = get_active_sessions()
 

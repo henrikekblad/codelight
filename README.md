@@ -1,5 +1,7 @@
 # codelight — Claude Code status display
 
+<img src="assets/demo.jpg" width="600" alt="GeekMagic Ultra showing the codelight IDLE screen">
+
 > **Work in progress — not yet fully verified on real hardware.** The firmware compiles
 > and the companion script runs, but the full stack has not been tested on an actual
 > GeekMagic Ultra. I accidently ripped the screen flex cable while testing/flashing. Still waiting for new screens to arrive from Aliexpress for final test.
@@ -22,9 +24,8 @@ and pushes it to the device over WiFi.
 | Chip | ESP8266 (80 MHz, ~45 KB RAM) |
 | Display | ST7789V 240×240 IPS TFT |
 | Flash | 4 MB |
-| Connectivity | 2.4 GHz WiFi only (no Bluetooth) |
-
-[GeekMagic Ultra on Aliexpress](https://s.click.aliexpress.com/e/_c32BRoxx) (affiliate link)
+| Connectivity | 2.4 GHz WiFi only (no Bluetooth), USB - power only, 6-pad debug header |
+| Price | 10-15 USD - [GeekMagic Ultra on Aliexpress](https://s.click.aliexpress.com/e/_c32BRoxx) (affiliate link) |
 
 ---
 
@@ -139,12 +140,12 @@ status data to the device every 2 seconds.
 
 **Arch Linux**
 ```bash
-sudo pacman -S python-requests tmux
+sudo pacman -S python-requests
 ```
 
 **Debian / Ubuntu**
 ```bash
-sudo apt install python3-requests tmux
+sudo apt install python3-requests
 ```
 
 ### Run
@@ -206,6 +207,86 @@ page and pass it to the script:
 ```bash
 python3 companion/claude_monitor.py --device claude-screen.local --secret mypassword
 ```
+
+---
+
+## How it works
+
+```
+Claude Code                    claude_monitor.py              GeekMagic Ultra
+───────────────                ─────────────────              ───────────────
+hooks fire on     ──────────►  reads state files
+tool use /         --hook       every 2 s          ─────────►  POST /status
+messages           mode                                         (JSON payload)
+
+                               polls claude.ai API
+                               every 60 s
+                               (session & weekly %)
+```
+
+### Status detection — hooks
+
+Claude Code hooks are shell commands that Claude Code invokes at specific points
+during a session. On first run, `claude_monitor.py` registers entries in
+`~/.claude/settings.json` for events such as `PreToolUse`, `PostToolUse`,
+`PermissionRequest`, and `SessionEnd`. When an event fires, Claude Code runs:
+
+```
+python3 claude_monitor.py --hook working
+```
+
+with session metadata on stdin. The hook mode writes a small JSON state file to
+`~/.claude/monitor_state/<sessionId>.json` and exits immediately — it is designed
+to be fast and never block Claude Code.
+
+### Usage data — claude.ai API
+
+Every 60 seconds the monitor fetches `https://claude.ai/api/oauth/usage` using
+the OAuth access token from `~/.claude/.credentials.json` — the same credential
+Claude Code itself uses, so no extra authentication is needed. The response
+contains:
+
+- `five_hour.utilization` — current 5-hour session window (0–100 %)
+- `seven_day.utilization` — rolling 7-day total (0–100 %)
+- `resets_at` — ISO-8601 timestamp for each window reset
+
+Values are cached between polls so the display always shows something even when
+the API is temporarily unreachable.
+
+### Display update — POST /status
+
+Every 2 seconds the monitor reads the state files, computes an overall status
+(`working` / `waiting` / `inactive`), merges the cached usage percentages and
+reset countdowns, and POSTs a JSON payload to `http://<device>/status`. The
+ESP8266 re-renders the full display on each received payload.
+
+---
+
+## Uninstalling
+
+1. **Stop the monitor** — Ctrl-C, or if running as a service:
+   ```bash
+   systemctl --user disable --now claude-monitor
+   ```
+
+2. **Remove the hooks** from `~/.claude/settings.json`. Open the file and delete
+   all hook entries whose `command` field contains `claude_monitor`. The monitor
+   registers hooks under `PreToolUse`, `PostToolUse`, `UserPromptSubmit`,
+   `PermissionRequest`, `PermissionDenied`, `MessageDisplay`, and `SessionEnd`.
+   If any of those event lists become empty after removing the monitor entries,
+   delete the key as well.
+
+   If you have no other hooks configured you can remove the entire `"hooks"`
+   object from the file.
+
+   > **The monitor does not remove its own hooks on exit.** If you skip this step,
+   > Claude Code will continue trying to invoke the script on every tool use and
+   > print errors to the terminal.
+
+3. **Remove leftover state files** (optional):
+   ```bash
+   rm -rf ~/.claude/monitor_state
+   ```
 
 ---
 
