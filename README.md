@@ -31,7 +31,11 @@ and pushes it to the device over WiFi.
 
 ## Building
 
-Install [PlatformIO](https://platformio.org/), then:
+Pre-built firmware binaries are available on the
+[Releases page](https://github.com/henrikekblad/codelight/releases) — download
+`codelight-vX.Y.Z.bin` and skip straight to [Flashing](#flashing).
+
+To build from source, install [PlatformIO](https://platformio.org/), then:
 
 ```bash
 pio run

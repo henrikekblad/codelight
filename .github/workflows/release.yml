@@ -1,0 +1,62 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*.*.*'
+
+jobs:
+  build-and-release:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Cache PlatformIO
+        uses: actions/cache@v4
+        with:
+          path: ~/.platformio
+          key: platformio-${{ hashFiles('platformio.ini') }}
+          restore-keys: platformio-
+
+      - name: Install PlatformIO
+        run: pip install platformio
+
+      - name: Build firmware
+        run: pio run
+
+      - name: Rename binary
+        run: |
+          cp .pio/build/geekmagic_ultra/firmware.bin \
+             .pio/build/geekmagic_ultra/codelight-${{ github.ref_name }}.bin
+
+      - name: Create GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          name: codelight ${{ github.ref_name }}
+          generate_release_notes: true
+          body: |
+            Flash `codelight-${{ github.ref_name }}.bin` to your GeekMagic Ultra.
+            See the [README](https://github.com/${{ github.repository }}/blob/main/README.md) for full flashing and setup instructions.
+
+            ### Quick start
+
+            **Stock OTA** (no disassembly — works on a fresh device):
+            1. Connect your computer to the device's WiFi AP
+            2. Open `http://192.168.4.1/update` in your browser
+            3. Upload `codelight-${{ github.ref_name }}.bin`
+            4. After reboot, connect the device to your network via the setup page
+
+            **ElegantOTA** (already running codelight):
+            - Open `http://<device>.local/update` and upload the `.bin`
+
+            ### Companion script
+
+            ```bash
+            pip install requests
+            python3 companion/claude_monitor.py --device claude-screen.local
+            ```
+          files: .pio/build/geekmagic_ultra/codelight-${{ github.ref_name }}.bin
+          fail_on_unmatched_files: true
