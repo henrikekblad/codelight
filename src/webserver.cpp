@@ -39,7 +39,7 @@ static const char INDEX_HTML[] PROGMEM = R"rawhtml(<!DOCTYPE html>
   <label>Device name (used as mDNS hostname)</label>
   <input type="text" id="deviceName" placeholder="claude-screen" maxlength="32">
 
-  <label>Companion secret <span style="color:#8b949e;font-size:.8rem">(optional – match in claude_monitor.py)</span></label>
+  <label>Companion secret <span style="color:#8b949e;font-size:.8rem">(optional – match in codelight.py)</span></label>
   <input type="password" id="companionSecret" placeholder="leave blank to disable auth">
 
   <h2>WiFi networks <span style="color:#8b949e;font-size:.8rem">(up to 3, tried in order)</span></h2>

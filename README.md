@@ -137,8 +137,8 @@ Config is stored in LittleFS and survives firmware OTA updates.
 
 ## Companion script
 
-The Python script `companion/claude_monitor.py` runs on your computer and pushes
-status data to the device every 2 seconds.
+The Python script `companion/codelight.py` runs on your computer and instantly pushes
+status data to the device.
 
 ### Dependencies
 
@@ -155,7 +155,7 @@ sudo apt install python3-requests
 ### Run
 
 ```bash
-python3 companion/claude_monitor.py --device claude-screen.local
+python3 companion/codelight.py --device claude-screen.local
 ```
 
 On first run the script automatically installs Claude Code hooks in
@@ -166,14 +166,14 @@ raw usage captures and session scans.
 
 ### Run as a systemd user service
 
-Create `~/.config/systemd/user/claude-monitor.service`:
+Create `~/.config/systemd/user/codelight.service`:
 
 ```ini
 [Unit]
 Description=Claude Code status monitor
 
 [Service]
-ExecStart=/usr/bin/python3 -u /path/to/companion/claude_monitor.py \
+ExecStart=/usr/bin/python3 -u /path/to/companion/codelight.py \
     --device claude-screen.local
 Restart=always
 RestartSec=15
@@ -188,8 +188,8 @@ ordering constraints.
 
 ```bash
 systemctl --user daemon-reload
-systemctl --user enable --now claude-monitor
-systemctl --user status claude-monitor   # verify it's running
+systemctl --user enable --now codelight
+systemctl --user status codelight   # verify it's running
 
 # To start at boot without being logged in:
 sudo loginctl enable-linger $USER
@@ -198,9 +198,9 @@ sudo loginctl enable-linger $USER
 Useful commands:
 
 ```bash
-journalctl --user -fu claude-monitor     # live logs
-systemctl --user restart claude-monitor  # restart after config change
-systemctl --user disable --now claude-monitor  # disable
+journalctl --user -fu codelight     # live logs
+systemctl --user restart codelight  # restart after config change
+systemctl --user disable --now codelight  # disable
 ```
 
 ### Optional: shared secret
@@ -209,7 +209,7 @@ If multiple people are on the same network, set a secret in the device config
 page and pass it to the script:
 
 ```bash
-python3 companion/claude_monitor.py --device claude-screen.local --secret mypassword
+python3 companion/codelight.py --device claude-screen.local --secret mypassword
 ```
 
 ---
@@ -217,51 +217,56 @@ python3 companion/claude_monitor.py --device claude-screen.local --secret mypass
 ## How it works
 
 ```
-Claude Code                    claude_monitor.py              GeekMagic Ultra
-───────────────                ─────────────────              ───────────────
-hooks fire on     ──────────►  reads state files
-tool use /         --hook       every 2 s          ─────────►  POST /status
-messages           mode                                         (JSON payload)
+Claude Code               codelight.py (daemon)          GeekMagic Ultra
+───────────────           ─────────────────────          ───────────────
+                          Unix socket thread
+hooks fire on  ────────►  receives event        ───────►  POST /status
+tool use /      --hook    updates state                    immediately
+messages        mode      POSTs to device
 
-                               polls claude.ai API
-                               every 60 s
-                               (session & weekly %)
+                          Usage poller thread
+                          fetches claude.ai API  ───────►  POST /status
+                          every 60 s                        after each poll
 ```
+
+`codelight.py` runs as a persistent daemon with two threads. Status updates
+reach the display the moment a hook fires — there is no polling delay.
 
 ### Status detection — hooks
 
 Claude Code hooks are shell commands that Claude Code invokes at specific points
-during a session. On first run, `claude_monitor.py` registers entries in
+during a session. On first run, `codelight.py` registers entries in
 `~/.claude/settings.json` for events such as `PreToolUse`, `PostToolUse`,
 `PermissionRequest`, and `SessionEnd`. When an event fires, Claude Code runs:
 
 ```
-python3 claude_monitor.py --hook working
+python3 codelight.py --hook working
 ```
 
-with session metadata on stdin. The hook mode writes a small JSON state file to
-`~/.claude/monitor_state/<sessionId>.json` and exits immediately — it is designed
-to be fast and never block Claude Code.
+with session metadata on stdin. The hook mode connects to a Unix socket at
+`~/.claude/codelight.sock`, sends a one-line JSON event, and exits in ~1 ms.
+The daemon's socket thread receives the event, updates its in-memory session
+state, and immediately POSTs to the device. If the daemon is not running the
+hook falls back to writing a state file so no errors appear in the terminal.
 
 ### Usage data — claude.ai API
 
-Every 60 seconds the monitor fetches `https://claude.ai/api/oauth/usage` using
-the OAuth access token from `~/.claude/.credentials.json` — the same credential
-Claude Code itself uses, so no extra authentication is needed. The response
-contains:
+Every 60 seconds the usage thread fetches `https://claude.ai/api/oauth/usage`
+using the OAuth access token from `~/.claude/.credentials.json` — the same
+credential Claude Code itself uses, so no extra authentication is needed. The
+response contains:
 
 - `five_hour.utilization` — current 5-hour session window (0–100 %)
 - `seven_day.utilization` — rolling 7-day total (0–100 %)
 - `resets_at` — ISO-8601 timestamp for each window reset
 
-Values are cached between polls so the display always shows something even when
-the API is temporarily unreachable.
+Values are cached so the display always shows something even when the API is
+temporarily unreachable.
 
 ### Display update — POST /status
 
-Every 2 seconds the monitor reads the state files, computes an overall status
-(`working` / `waiting` / `inactive`), merges the cached usage percentages and
-reset countdowns, and POSTs a JSON payload to `http://<device>/status`. The
+The daemon POSTs a JSON payload to `http://<device>/status` on two triggers:
+every hook event (immediate) and after each usage poll (every 60 s). The
 ESP8266 re-renders the full display on each received payload.
 
 ---
@@ -270,27 +275,18 @@ ESP8266 re-renders the full display on each received payload.
 
 1. **Stop the monitor** — Ctrl-C, or if running as a service:
    ```bash
-   systemctl --user disable --now claude-monitor
+   systemctl --user disable --now codelight
    ```
 
-2. **Remove the hooks** from `~/.claude/settings.json`. Open the file and delete
-   all hook entries whose `command` field contains `claude_monitor`. The monitor
-   registers hooks under `PreToolUse`, `PostToolUse`, `UserPromptSubmit`,
-   `PermissionRequest`, `PermissionDenied`, `MessageDisplay`, and `SessionEnd`.
-   If any of those event lists become empty after removing the monitor entries,
-   delete the key as well.
-
-   If you have no other hooks configured you can remove the entire `"hooks"`
-   object from the file.
-
-   > **The monitor does not remove its own hooks on exit.** If you skip this step,
-   > Claude Code will continue trying to invoke the script on every tool use and
-   > print errors to the terminal.
-
-3. **Remove leftover state files** (optional):
+2. **Remove hooks and state files:**
    ```bash
-   rm -rf ~/.claude/monitor_state
+   python3 companion/codelight.py --uninstall
    ```
+   This removes all codelight entries from `~/.claude/settings.json` and deletes
+   `~/.claude/codelight.sock` and `~/.claude/monitor_state/`.
+
+   > **Stop the daemon before uninstalling.** If it is still running it will
+   > re-install the hooks on its next startup.
 
 ---
 

@@ -56,7 +56,7 @@ jobs:
 
             ```bash
             pip install requests
-            python3 companion/claude_monitor.py --device claude-screen.local
+            python3 companion/codelight.py --device claude-screen.local
             ```
           files: .pio/build/geekmagic_ultra/codelight-${{ github.ref_name }}.bin
           fail_on_unmatched_files: true
