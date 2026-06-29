@@ -126,7 +126,7 @@ void displayUpdate() {
     tft.setTextSize(1);
     tft.setTextColor(COL_TITLE, COL_BG);
     tft.setCursor(X_MARGIN, Y_TITLE);
-    tft.print("CLAUDE CODE");
+    tft.print("codelight");
     displayUpdateClock();
 
     // Meter blocks

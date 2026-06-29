@@ -6,6 +6,7 @@ Config cfg;
 void configDefaults() {
     cfg.wifiCount = 0;
     cfg.deviceName = "claude-screen";
+    cfg.companionName   = "";
     cfg.companionSecret = "";
 }
 
@@ -32,7 +33,8 @@ bool configLoad() {
     f.close();
     if (err) { configDefaults(); return false; }
 
-    cfg.deviceName = doc["deviceName"] | "claude-screen";
+    cfg.deviceName      = doc["deviceName"]      | "claude-screen";
+    cfg.companionName   = doc["companionName"]   | "";
     cfg.companionSecret = doc["companionSecret"] | "";
 
     JsonArray nets = doc["wifi"].as<JsonArray>();
@@ -52,6 +54,7 @@ void configSave() {
 
     JsonDocument doc;
     doc["deviceName"]      = cfg.deviceName;
+    doc["companionName"]   = cfg.companionName;
     doc["companionSecret"] = cfg.companionSecret;
 
     JsonArray nets = doc["wifi"].to<JsonArray>();

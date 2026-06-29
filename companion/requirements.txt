@@ -1,1 +1,2 @@
-requests>=2.31.0
+websockets>=12.0
+zeroconf>=0.131.0

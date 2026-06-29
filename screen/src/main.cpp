@@ -3,29 +3,80 @@
 #include <ESP8266mDNS.h>
 #include <ESPAsyncWebServer.h>
 #include <ElegantOTA.h>
+#include <WebSocketsClient.h>
+#include <ArduinoJson.h>
 #include <time.h>
 #include "config.h"
 #include "display.h"
 #include "webserver.h"
 
-static AsyncWebServer server(80);
+static AsyncWebServer   server(80);
+static WebSocketsClient wsClient;
 
 static String mdnsName;
 
-static unsigned long lastStatusMs = 0;
-#define COMPANION_TIMEOUT_MS 30000
+static bool          wsConnected      = false;
+static bool          wsBegun          = false;
+static unsigned long wsLastDiscoverMs = 0;
+#define WS_DISCOVER_MS 15000UL
 
 static unsigned long lastClockMs = 0;
+static bool          displayReady = false;
 
 static const char* ntpServer = "pool.ntp.org";
 static const char* ntpTZ     = "CET-1CEST,M3.5.0,M10.5.0/3";
-
-static bool displayReady = false;
 
 // RTC memory slot 0: crash-guard for displayInit().
 // If displayInit() crashes, next boot sees DISPLAY_TRYING and skips it.
 #define DISPLAY_OK     0x12345678u
 #define DISPLAY_TRYING 0xDEADBEEFu
+
+static void applyStatus(uint8_t* payload, size_t length) {
+    JsonDocument doc;
+    if (deserializeJson(doc, payload, length)) return;
+
+    displayData.weeklyPct    = doc["weekly_pct"]   | 0.0f;
+    displayData.sessionPct   = doc["session_pct"]  | 0.0f;
+    displayData.weeklyReset  = doc["weekly_reset"].as<String>();
+    displayData.sessionReset = doc["session_reset"].as<String>();
+    displayData.sessions     = doc["sessions"]     | 0;
+    displayData.connected    = true;
+
+    const char* st = doc["status"] | "inactive";
+    if      (strcmp(st, "working") == 0) displayData.status = STATUS_WORKING;
+    else if (strcmp(st, "waiting") == 0) displayData.status = STATUS_WAITING;
+    else                                  displayData.status = STATUS_INACTIVE;
+
+    if (displayReady) displayUpdate();
+}
+
+static void wsEvent(WStype_t type, uint8_t* payload, size_t length) {
+    switch (type) {
+        case WStype_DISCONNECTED:
+            Serial.println(F("[ws] disconnected"));
+            wsConnected = false;
+            wsBegun     = false;  // re-discover after interval
+            displayData.connected = false;
+            if (displayReady) displayUpdate();
+            break;
+
+        case WStype_CONNECTED:
+            Serial.println(F("[ws] connected"));
+            wsConnected = true;
+            if (cfg.companionSecret.length() > 0) {
+                String auth = "{\"auth\":\"" + cfg.companionSecret + "\"}";
+                wsClient.sendTXT(auth);
+            }
+            break;
+
+        case WStype_TEXT:
+            applyStatus(payload, length);
+            break;
+
+        default:
+            break;
+    }
+}
 
 static void connectWifi() {
     WiFi.persistent(false);
@@ -81,7 +132,7 @@ static void showWifiStatus() {
         tft.print(WiFi.localIP().toString());
         delay(2000);
     } else {
-        tft.fillScreen(TFT_NAVY);   // dark blue so we can tell display is working
+        tft.fillScreen(TFT_NAVY);
         tft.setTextFont(2);
 
         tft.setTextColor(0xFD20, TFT_NAVY);
@@ -117,6 +168,45 @@ static void sanitiseMdnsName(const String& name, String& out) {
         else if (c == '-' || c == ' ') out += '-';
     }
     if (out.length() == 0) out = "claude-screen";
+}
+
+static void tryDiscover() {
+    Serial.println(F("[ws] querying mDNS for _codelight._tcp..."));
+    int n = MDNS.queryService("_codelight", "tcp");
+    if (n <= 0) {
+        Serial.println(F("[ws] not found, will retry"));
+        return;
+    }
+
+    // Pick by configured name, or fall back to first result
+    int idx = 0;
+    if (cfg.companionName.length() > 0) {
+        bool found = false;
+        for (int i = 0; i < n; i++) {
+            if (MDNS.hostname(i) == cfg.companionName) {
+                idx = i;
+                found = true;
+                break;
+            }
+        }
+        if (!found) {
+            Serial.println("[ws] companion '" + cfg.companionName + "' not found, will retry");
+            return;
+        }
+    }
+
+    IPAddress ip   = MDNS.IP(idx);
+    uint16_t  port = MDNS.port(idx);
+    Serial.print(F("[ws] connecting to "));
+    Serial.print(MDNS.hostname(idx));
+    Serial.print(F(" at "));
+    Serial.print(ip);
+    Serial.print(':');
+    Serial.println(port);
+    wsClient.begin(ip, port, "/");
+    wsClient.onEvent(wsEvent);
+    wsClient.enableHeartbeat(15000, 3000, 2);
+    wsBegun = true;
 }
 
 void setup() {
@@ -180,8 +270,13 @@ void setup() {
         displayUpdate();
     }
 
+    // --- 5. Initial WS discovery ---
+    if (WiFi.status() == WL_CONNECTED) {
+        tryDiscover();
+        wsLastDiscoverMs = millis();
+    }
+
     lastClockMs = millis();
-    lastStatusMs = millis();
     Serial.println(F("=== setup complete ==="));
     Serial.flush();
 }
@@ -197,15 +292,13 @@ void loop() {
         displayUpdateClock();
     }
 
-    if (displayReady && displayData.connected && (now - lastStatusMs >= COMPANION_TIMEOUT_MS)) {
-        displayData.connected = false;
-        displayUpdate();
-    }
-
-    extern volatile bool g_statusUpdated;
-    if (g_statusUpdated) {
-        g_statusUpdated = false;
-        lastStatusMs = now;
+    if (WiFi.status() == WL_CONNECTED) {
+        // Re-discover companion via mDNS when not yet connected
+        if (!wsBegun && (now - wsLastDiscoverMs >= WS_DISCOVER_MS)) {
+            wsLastDiscoverMs = now;
+            tryDiscover();
+        }
+        wsClient.loop();
     }
 
     yield();

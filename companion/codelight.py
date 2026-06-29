@@ -1,14 +1,15 @@
 #!/usr/bin/env python3
 """
-codelight.py – pushes Claude Code status to GeekMagic Ultra display.
+codelight.py – pushes Claude Code status to codelight clients (screen + Android widget).
 
 Usage:
-    python3 codelight.py --device claude-screen.local
-    python3 codelight.py --dry-run            # print payload, no POST
-    python3 codelight.py --dry-run --verbose  # also show socket events and API data
-    python3 -u codelight.py | tee             # -u avoids buffering when piping
+    python3 codelight.py --name henrik-laptop
+    python3 codelight.py --name henrik-laptop --dry-run   # print payload, no broadcast
+    python3 codelight.py --dry-run --verbose              # also show socket events and API data
+    python3 -u codelight.py | tee                         # -u avoids buffering when piping
 """
 import argparse
+import asyncio
 import json
 import os
 import shutil
@@ -22,17 +23,24 @@ import urllib.error
 from datetime import datetime, timezone
 
 try:
-    import requests as _requests
+    import websockets as _websockets
+    _have_websockets = True
 except ImportError:
-    _requests = None
+    _have_websockets = False
+
+try:
+    from zeroconf import Zeroconf, ServiceInfo
+    _have_zeroconf = True
+except ImportError:
+    _have_zeroconf = False
 
 # ── Config ────────────────────────────────────────────────────────────────────
 
 MONITOR_STATE_DIR = os.path.expanduser("~/.claude/monitor_state")
 SOCKET_PATH       = os.path.expanduser("~/.claude/codelight.sock")
-
-USAGE_INTERVAL = 60    # seconds between usage API polls
-IDLE_WINDOW    = 600   # seconds before a silent session is dropped from state
+USAGE_INTERVAL      = 60   # seconds between usage API polls
+IDLE_WINDOW         = 600  # seconds before a silent "working" session is dropped
+IDLE_WINDOW_WAITING = 30   # seconds before a "waiting" session is dropped (subagents resolve quickly)
 
 # ── Module-level state ────────────────────────────────────────────────────────
 
@@ -46,6 +54,10 @@ _usage_cache: dict = {
     "session_pct": 0.0, "weekly_pct": 0.0,
     "session_reset": "--", "weekly_reset": "--",
 }
+
+_ws_loop:    asyncio.AbstractEventLoop | None = None
+_ws_clients: set = set()
+_last_ws_status: str = "inactive"   # updated by _broadcast; watched by timeout-watchdog
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -78,6 +90,36 @@ def _format_iso_countdown(iso_ts: str) -> str:
     except Exception:
         return "--"
 
+def _get_local_ip() -> str:
+    """Return the LAN IP this machine uses for outbound traffic."""
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.connect(("8.8.8.8", 80))
+        ip = s.getsockname()[0]
+        s.close()
+        return ip
+    except Exception:
+        return "127.0.0.1"
+
+
+def _broadcast(payload: dict) -> None:
+    """Thread-safe push of a payload to all connected WebSocket clients."""
+    global _last_ws_status
+    _last_ws_status = payload.get("status", _last_ws_status)
+    if _ws_loop is None or not _ws_clients:
+        return
+    msg = json.dumps(payload)
+
+    async def _send_all() -> None:
+        if _ws_clients:
+            await asyncio.gather(
+                *[c.send(msg) for c in list(_ws_clients)],
+                return_exceptions=True,
+            )
+
+    asyncio.run_coroutine_threadsafe(_send_all(), _ws_loop)
+
+
 # ── Session state ─────────────────────────────────────────────────────────────
 
 def _update_session(session_id: str, state: str) -> None:
@@ -96,7 +138,9 @@ def _overall_status() -> tuple[int, str]:
     overall = "inactive"
     with _lock:
         stale = [sid for sid, info in _sessions.items()
-                 if now - info["time"] > IDLE_WINDOW]
+                 if now - info["time"] > (IDLE_WINDOW_WAITING
+                                          if info["state"] == "waiting"
+                                          else IDLE_WINDOW)]
         for sid in stale:
             del _sessions[sid]
         for info in _sessions.values():
@@ -128,12 +172,12 @@ def install_hooks(script_path: str) -> None:
 
     cmd_base = f"python3 {script_path} --hook"
     desired = {
-        "PreToolUse":        f"{cmd_base} working",
-        "PostToolUse":       f"{cmd_base} working",   # clears "waiting" after permission granted
-        "UserPromptSubmit":  f"{cmd_base} working",
-        "PermissionRequest": f"{cmd_base} waiting",   # Claude blocked, needs user decision
-        "PermissionDenied":  f"{cmd_base} working",   # denied → Claude resumes, clear waiting
-        "MessageDisplay":    f"{cmd_base} ended",     # response shown → clear working state
+        "PreToolUse":       f"{cmd_base} working",
+        "PostToolUse":      f"{cmd_base} working",
+        "UserPromptSubmit": f"{cmd_base} working",
+        "PermissionRequest": f"{cmd_base} waiting",
+        "PermissionDenied":  f"{cmd_base} working",
+        "Stop":              f"{cmd_base} ended",
         "SessionEnd":        f"{cmd_base} ended",
     }
 
@@ -252,7 +296,7 @@ _USAGE_API  = "https://claude.ai/api/oauth/usage"
 _CREDS_PATH = os.path.expanduser("~/.claude/.credentials.json")
 
 
-def get_usage(weekly_limit: int = 0, daily_limit: int = 0) -> dict | None:
+def get_usage() -> dict | None:
     """
     Fetch usage from the claude.ai OAuth usage API.
     Returns a dict with session_pct/weekly_pct/resets, or None on failure
@@ -300,10 +344,10 @@ def get_usage(weekly_limit: int = 0, daily_limit: int = 0) -> dict | None:
         "weekly_reset":  weekly_reset,
     }
 
-# ── Device payload ────────────────────────────────────────────────────────────
+# ── Payload helpers ───────────────────────────────────────────────────────────
 
-def print_payload(payload: dict, url: str) -> None:
-    """Pretty-print the payload that would be sent to the device."""
+def print_payload(payload: dict) -> None:
+    """Pretty-print the payload that would be broadcast to clients."""
     ts = datetime.now().strftime("%H:%M:%S")
     status = payload["status"]
     status_colors = {"working": "\033[33m", "waiting": "\033[31m", "inactive": "\033[32m"}
@@ -315,39 +359,145 @@ def print_payload(payload: dict, url: str) -> None:
         filled = round(pct * bar_w)
         return "[" + "█" * filled + "░" * (bar_w - filled) + f"] {pct:.0%}"
 
-    print(f"\n[{ts}] DRY RUN – would POST to {url}")
+    print(f"\n[{ts}] DRY RUN")
     print(f"  Weekly:   {bar(payload['weekly_pct'])}  resets {payload['weekly_reset']}")
     print(f"  Session:  {bar(payload['session_pct'])}  resets {payload['session_reset']}")
     print(f"  Sessions: {payload['sessions']}")
     print(f"  Status:   {color}{status.upper()}{reset}", flush=True)
 
 
-def _post_to_device(url: str, headers: dict, dry_run: bool) -> None:
-    """Build payload from current state and POST it to the device."""
+def _push(dry_run: bool) -> None:
+    """Build payload from current state and broadcast to all WebSocket clients."""
     sessions, status = _overall_status()
     with _lock:
         usage = dict(_usage_cache)
     payload = {**usage, "sessions": sessions, "status": status}
 
     if dry_run:
-        print_payload(payload, url)
+        print_payload(payload)
         return
 
-    try:
-        r = _requests.post(url, json=payload, headers=headers, timeout=5)
-        ts = datetime.now().strftime("%H:%M:%S")
-        print(f"[{ts}] status={status} sessions={sessions} "
-              f"weekly={usage['weekly_pct']:.0%} "
-              f"session={usage['session_pct']:.0%}  "
-              f"→ {r.status_code}", flush=True)
-    except Exception as e:
-        ts = datetime.now().strftime("%H:%M:%S")
-        print(f"[{ts}] POST failed: {e}", file=sys.stderr, flush=True)
+    _broadcast(payload)
+    ts = datetime.now().strftime("%H:%M:%S")
+    print(f"[{ts}] status={status} sessions={sessions} "
+          f"weekly={usage['weekly_pct']:.0%} "
+          f"session={usage['session_pct']:.0%}  "
+          f"→ {len(_ws_clients)} client(s)", flush=True)
 
 # ── Daemon threads ────────────────────────────────────────────────────────────
 
-def _socket_thread(url: str, headers: dict, dry_run: bool) -> None:
-    """Accept hook events on the Unix socket and POST to the device immediately."""
+def _ws_thread(port: int, secret: str) -> None:
+    """Run a WebSocket server; screen and Android clients connect here for live updates."""
+    global _ws_loop, _ws_clients
+
+    if not _have_websockets:
+        print("[ws] websockets not installed — clients unavailable", file=sys.stderr)
+        print("[ws] Install: pip install websockets", file=sys.stderr)
+        return
+
+    async def handler(ws, *_) -> None:
+        if secret:
+            try:
+                msg = await asyncio.wait_for(ws.recv(), timeout=5.0)
+                if json.loads(msg).get("auth") != secret:
+                    await ws.close(1008, "Unauthorized")
+                    return
+            except Exception:
+                await ws.close(1008, "Unauthorized")
+                return
+
+        _ws_clients.add(ws)
+        vprint(f"[ws] client connected ({len(_ws_clients)} total)")
+        try:
+            # Send current state immediately so the client isn't blank on connect
+            sessions, status = _overall_status()
+            with _lock:
+                usage = dict(_usage_cache)
+            await ws.send(json.dumps({**usage, "sessions": sessions, "status": status}))
+            try:
+                await ws.wait_closed()
+            except Exception:
+                pass  # connection reset without close frame — normal on app restart
+        finally:
+            _ws_clients.discard(ws)
+            vprint(f"[ws] client disconnected ({len(_ws_clients)} remaining)")
+
+    async def serve() -> None:
+        global _last_ws_status
+        async with _websockets.serve(handler, "0.0.0.0", port):
+            vprint(f"[ws] listening on :{port}")
+            while not _shutdown.is_set():
+                await asyncio.sleep(2)
+                if not _ws_clients:
+                    continue
+                # Detect status changes caused by session timeouts (no hook fires for those).
+                sessions, current_status = _overall_status()
+                if current_status != _last_ws_status:
+                    _last_ws_status = current_status
+                    with _lock:
+                        usage = dict(_usage_cache)
+                    payload = {**usage, "sessions": sessions, "status": current_status}
+                    vprint(f"[ws] timeout push → {current_status}")
+                    await asyncio.gather(
+                        *[c.send(json.dumps(payload)) for c in list(_ws_clients)],
+                        return_exceptions=True,
+                    )
+
+    _ws_loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(_ws_loop)
+    try:
+        _ws_loop.run_until_complete(serve())
+    except Exception as e:
+        print(f"[ws] server error: {e}", file=sys.stderr)
+    finally:
+        _ws_loop.close()
+        _ws_loop = None
+
+
+def _mdns_thread(port: int, name: str) -> None:
+    """Advertise the WebSocket service via mDNS so clients find it automatically.
+    Re-registers whenever the local IP changes (e.g. switching WiFi networks)."""
+    if not _have_zeroconf:
+        print("[mdns] zeroconf not installed — skipping advertisement", file=sys.stderr)
+        print("[mdns] Install: pip install zeroconf", file=sys.stderr)
+        return
+
+    zc = Zeroconf()
+    current_ip: str | None = None
+    info = None
+    try:
+        while not _shutdown.is_set():
+            ip = _get_local_ip()
+            if ip != current_ip:
+                if info is not None:
+                    try:
+                        zc.unregister_service(info)
+                    except Exception:
+                        pass
+                current_ip = ip
+                ip_bytes   = bytes(int(x) for x in ip.split("."))
+                info = ServiceInfo(
+                    "_codelight._tcp.local.",
+                    f"{name}._codelight._tcp.local.",
+                    addresses=[ip_bytes],
+                    port=port,
+                    properties={"version": "1"},
+                )
+                zc.register_service(info)
+                print(f"[mdns] advertising {name}._codelight._tcp on {ip}:{port}", flush=True)
+            _shutdown.wait(30)   # re-check IP every 30 s
+    finally:
+        if info is not None:
+            try:
+                zc.unregister_service(info)
+            except Exception:
+                pass
+        zc.close()
+        vprint("[mdns] stopped")
+
+
+def _socket_thread(dry_run: bool) -> None:
+    """Accept hook events on the Unix socket and broadcast to clients immediately."""
     try:
         os.unlink(SOCKET_PATH)
     except FileNotFoundError:
@@ -366,14 +516,15 @@ def _socket_thread(url: str, headers: dict, dry_run: bool) -> None:
             except socket.timeout:
                 continue
             try:
-                raw   = conn.recv(4096).decode()
-                msg   = json.loads(raw)
+                raw      = conn.recv(4096).decode()
+                msg      = json.loads(raw)
                 sid   = msg.get("session_id", "unknown")
                 state = msg.get("state", "")
+
                 if state:
                     _update_session(sid, state)
                     vprint(f"[socket] {sid[:8]}… → {state}")
-                    _post_to_device(url, headers, dry_run)
+                    _push(dry_run)
             except Exception as e:
                 vprint(f"[socket] error: {e}")
             finally:
@@ -386,14 +537,13 @@ def _socket_thread(url: str, headers: dict, dry_run: bool) -> None:
             pass
 
 
-def _usage_thread(url: str, headers: dict, dry_run: bool,
-                  weekly_limit: int, daily_limit: int) -> None:
-    """Poll the usage API every USAGE_INTERVAL seconds and POST after each update."""
+def _usage_thread(dry_run: bool) -> None:
+    """Poll the usage API every USAGE_INTERVAL seconds and broadcast after each update."""
     while not _shutdown.is_set():
         ts = datetime.now().strftime("%H:%M:%S")
         print(f"[{ts}] [usage] polling…", flush=True)
         try:
-            fresh = get_usage(weekly_limit, daily_limit)
+            fresh = get_usage()
         except Exception as e:
             print(f"[usage] unexpected error: {e}", file=sys.stderr, flush=True)
             fresh = None
@@ -404,7 +554,9 @@ def _usage_thread(url: str, headers: dict, dry_run: bool,
         else:
             print("[usage] no data – keeping cached values", flush=True)
 
-        _post_to_device(url, headers, dry_run)
+        _push(dry_run)
+        ts = datetime.now().strftime("%H:%M:%S")
+        print(f"[{ts}] [usage] next poll in {USAGE_INTERVAL}s…", flush=True)
         _shutdown.wait(USAGE_INTERVAL)
 
 # ── Uninstall ─────────────────────────────────────────────────────────────────
@@ -476,18 +628,16 @@ def main():
     parser.add_argument("--hook", metavar="STATE",
                         help="Hook mode: send STATE event to daemon and exit. "
                              "Used internally by Claude Code hooks (working/waiting/ended).")
-    parser.add_argument("--device", default="claude-screen.local",
-                        help="Device hostname or IP (default: claude-screen.local)")
-    parser.add_argument("--secret", default="",
-                        help="Shared secret (X-Secret header)")
     parser.add_argument("--dry-run", "-n", action="store_true",
-                        help="Print payload instead of POSTing to device")
+                        help="Print payload instead of broadcasting to clients")
     parser.add_argument("--verbose", "-v", action="store_true",
                         help="Show socket events and usage API responses")
-    parser.add_argument("--weekly-limit", type=int, default=0,
-                        help="Max weekly requests for fallback progress bar (0=disable)")
-    parser.add_argument("--daily-limit", type=int, default=0,
-                        help="Max daily requests for fallback progress bar (0=disable)")
+    parser.add_argument("--ws-port", type=int, default=8765,
+                        help="WebSocket port for clients (default: 8765)")
+    parser.add_argument("--name", default=None,
+                        help="mDNS service name visible to clients (required)")
+    parser.add_argument("--secret", default="",
+                        help="Shared secret for WebSocket auth (match in screen config)")
     args = parser.parse_args()
 
     if args.uninstall:
@@ -498,32 +648,42 @@ def main():
         run_hook(args.hook)
         return
 
-    _verbose = args.verbose
+    if args.name is None:
+        parser.error("--name is required (e.g. --name henrik-laptop). "
+                     "It identifies this daemon to clients.")
 
-    if not args.dry_run and _requests is None:
-        sys.exit("Install requests:  pip install requests")
+    _verbose = args.verbose
 
     install_hooks(os.path.abspath(__file__))
 
-    url     = f"http://{args.device}/status"
-    headers = {"Content-Type": "application/json"}
-    if args.secret:
-        headers["X-Secret"] = args.secret
-
-    mode = "DRY RUN" if args.dry_run else f"posting to {url}"
+    mode = "DRY RUN" if args.dry_run else f"ws://0.0.0.0:{args.ws_port}"
     print(f"codelight  [{mode}]  (Ctrl-C to stop)", flush=True)
 
     threading.Thread(
         target=_socket_thread,
-        args=(url, headers, args.dry_run),
+        args=(args.dry_run,),
         daemon=True,
     ).start()
 
     threading.Thread(
         target=_usage_thread,
-        args=(url, headers, args.dry_run, args.weekly_limit, args.daily_limit),
+        args=(args.dry_run,),
         daemon=True,
     ).start()
+
+    threading.Thread(
+        target=_ws_thread,
+        args=(args.ws_port, args.secret),
+        daemon=True,
+    ).start()
+
+    threading.Thread(
+        target=_mdns_thread,
+        args=(args.ws_port, args.name),
+        daemon=True,
+    ).start()
+
+    print(f"daemon ready — next usage poll in {USAGE_INTERVAL}s", flush=True)
 
     signal.signal(signal.SIGTERM, lambda *_: (_shutdown.set(), sys.exit(0)))
 

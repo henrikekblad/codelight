@@ -5,6 +5,14 @@
 __pycache__/
 *.pyc
 
+# Android build output and local config
+android/.gradle/
+android/build/
+android/app/build/
+android/local.properties
+*.jks
+*.keystore
+
 # Claude Code local settings
 .claude/
 

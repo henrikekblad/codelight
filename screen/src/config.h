@@ -15,8 +15,8 @@ struct Config {
     WifiEntry wifi[MAX_WIFI_NETWORKS];
     uint8_t wifiCount;
     String deviceName;
-    // Companion pushes data; no polling URL needed on device side
-    String companionSecret;  // optional shared secret for POST /status
+    String companionName;    // mDNS instance name to connect to (e.g. "henrik-laptop"); blank = first found
+    String companionSecret;  // optional shared secret for WebSocket auth
 };
 
 extern Config cfg;

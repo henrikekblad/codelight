@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">codelight</string>
+    <string name="widget_description">Claude Code status widget</string>
+    <string name="settings_title">codelight Settings</string>
+    <string name="pref_secret_hint">Password (leave empty if none set)</string>
+    <string name="save">Save</string>
+    <string name="saved">Saved</string>
+</resources>

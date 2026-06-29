@@ -1,6 +1,5 @@
 #include "webserver.h"
 #include "config.h"
-#include "display.h"
 #include <ArduinoJson.h>
 #include <ElegantOTA.h>
 
@@ -39,7 +38,10 @@ static const char INDEX_HTML[] PROGMEM = R"rawhtml(<!DOCTYPE html>
   <label>Device name (used as mDNS hostname)</label>
   <input type="text" id="deviceName" placeholder="claude-screen" maxlength="32">
 
-  <label>Companion secret <span style="color:#8b949e;font-size:.8rem">(optional – match in codelight.py)</span></label>
+  <label>Companion name <span style="color:#8b949e;font-size:.8rem">(--name passed to codelight.py; blank = first found)</span></label>
+  <input type="text" id="companionName" placeholder="e.g. henrik-laptop" maxlength="64">
+
+  <label>Companion secret <span style="color:#8b949e;font-size:.8rem">(optional – match --secret in codelight.py)</span></label>
   <input type="password" id="companionSecret" placeholder="leave blank to disable auth">
 
   <h2>WiFi networks <span style="color:#8b949e;font-size:.8rem">(up to 3, tried in order)</span></h2>
@@ -72,7 +74,8 @@ function escHtml(s) {
 }
 
 fetch('/api/config').then(r=>r.json()).then(cfg => {
-  document.getElementById('deviceName').value = cfg.deviceName || '';
+  document.getElementById('deviceName').value    = cfg.deviceName    || '';
+  document.getElementById('companionName').value = cfg.companionName || '';
   const nets = cfg.wifi || [];
   nets.forEach(n => addNetRow(n.ssid, ''));
   if (nets.length === 0) addNetRow();
@@ -92,7 +95,8 @@ document.getElementById('cfg').onsubmit = async (e) => {
   }).filter(n => n.ssid.length > 0);
 
   const body = {
-    deviceName: document.getElementById('deviceName').value.trim(),
+    deviceName:      document.getElementById('deviceName').value.trim(),
+    companionName:   document.getElementById('companionName').value.trim(),
     companionSecret: document.getElementById('companionSecret').value,
     wifi,
   };
@@ -114,51 +118,11 @@ document.getElementById('cfg').onsubmit = async (e) => {
 </body>
 </html>)rawhtml";
 
-volatile bool g_statusUpdated = false;
-
-// POST /status  – companion script calls this every ~5 s
-// Body: {"weekly_pct":0.22,"session_pct":0.71,"weekly_reset":"3d 1h",
-//        "session_reset":"2h 15m","sessions":2,"status":"working"}
-static void handleStatus(AsyncWebServerRequest* req, uint8_t* data, size_t len,
-                         size_t index, size_t total) {
-    if (index + len < total) return;  // wait for full body
-
-    // Optional shared-secret check
-    if (cfg.companionSecret.length() > 0) {
-        const AsyncWebHeader* h = req->getHeader("X-Secret");
-        if (!h || h->value() != cfg.companionSecret) {
-            req->send(401, "text/plain", "Unauthorized");
-            return;
-        }
-    }
-
-    JsonDocument doc;
-    if (deserializeJson(doc, data, len)) {
-        req->send(400, "text/plain", "Bad JSON");
-        return;
-    }
-
-    displayData.weeklyPct   = doc["weekly_pct"]   | 0.0f;
-    displayData.sessionPct  = doc["session_pct"]  | 0.0f;
-    displayData.weeklyReset  = doc["weekly_reset"].as<String>();
-    displayData.sessionReset = doc["session_reset"].as<String>();
-    displayData.sessions    = doc["sessions"]     | 0;
-    displayData.connected   = true;
-
-    const char* st = doc["status"] | "inactive";
-    if      (strcmp(st, "working") == 0) displayData.status = STATUS_WORKING;
-    else if (strcmp(st, "waiting") == 0) displayData.status = STATUS_WAITING;
-    else                                 displayData.status = STATUS_INACTIVE;
-
-    displayUpdate();
-    g_statusUpdated = true;
-    req->send(200, "text/plain", "OK");
-}
-
 // GET /api/config  – return current config as JSON (passwords redacted)
 static void handleGetConfig(AsyncWebServerRequest* req) {
     JsonDocument doc;
     doc["deviceName"]      = cfg.deviceName;
+    doc["companionName"]   = cfg.companionName;
     doc["wifiCount"]       = cfg.wifiCount;
     doc["hasSecret"]       = cfg.companionSecret.length() > 0;
     JsonArray nets = doc["wifi"].to<JsonArray>();
@@ -182,6 +146,8 @@ static void handlePostConfig(AsyncWebServerRequest* req, uint8_t* data, size_t l
 
     if (doc["deviceName"].is<String>())
         cfg.deviceName = doc["deviceName"].as<String>();
+    if (doc["companionName"].is<String>())
+        cfg.companionName = doc["companionName"].as<String>();
     if (doc["companionSecret"].is<String>())
         cfg.companionSecret = doc["companionSecret"].as<String>();
 
@@ -214,11 +180,6 @@ void webserverInit(AsyncWebServer& server) {
     server.on("/", HTTP_GET, [](AsyncWebServerRequest* req) {
         req->send_P(200, "text/html", INDEX_HTML);
     });
-
-    server.on("/status", HTTP_POST,
-        [](AsyncWebServerRequest* r){},
-        nullptr,
-        handleStatus);
 
     server.on("/api/config", HTTP_GET, handleGetConfig);
 
