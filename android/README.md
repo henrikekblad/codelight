@@ -16,7 +16,7 @@ companion daemon sends new data.
 
 2. Start the companion daemon with `--secret` (recommended):
    ```bash
-   python3 companion/codelight.py --device claude-screen.local --secret mypassword
+   python3 companion/codelight.py --secret mypassword
    ```
 
 3. Build and install the Android app:
@@ -29,6 +29,18 @@ companion daemon sends new data.
    Leave it blank if you did not set `--secret`.
 
 The widget connects automatically and stays updated in the background.
+
+## Hiding the persistent notification
+
+The app runs as a foreground service, which Android requires to show a
+persistent notification. To hide it from the status bar without stopping
+the service:
+
+1. Long-press the notification in the drawer and tap the cog icon.
+2. Tap **Notification categories** → **codelight service**.
+3. Select **Minimize notification**.
+
+The service keeps running; only the status bar icon disappears.
 
 ## How it discovers the daemon
 
