@@ -7,8 +7,7 @@ Live Claude Code dashboard built with four components. Pick and choose whatever 
 | [**companion/**](companion/README.md) | Python daemon that polls Claude Code usage and pushes it over WebSocket|
 | [**screen/**](screen/README.md) | ESP8266 firmware for the GeekMagic Ultra — renders usage bars and status | <img src="assets/demo.jpg" width="600" alt="GeekMagic Ultra showing the codelight IDLE screen"> |
 | [**android/**](android/README.md) | Android home-screen widget showing the same data via WebSocket | <img src="assets/android.jpg" width="360" alt="codelight Android widget"> |
-| [**gnome-extension/**](gnome-extension/README.md) | GNOME Shell status-bar extension | <img src="assets/gnome-extension.png" width="600" alt="codelight GNOME Shell extension">
-|
+| [**gnome-extension/**](gnome-extension/README.md) | GNOME Shell status-bar extension | <img src="assets/gnome-extension.png" width="600" alt="codelight GNOME Shell extension">|
 
 The different UI variants shows basically the same information.
 <table border="1" padding="3"><tr>
