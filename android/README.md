@@ -55,6 +55,14 @@ If mDNS doesn't work on your network, open the codelight app, enter the
 daemon's IP address and port (default 8765), and save. The app skips
 discovery and connects directly.
 
+## Samsung battery optimization
+
+Samsung's "App sleeping" can kill the background service. To prevent this:
+
+1. Long-press the app icon and tap the **i** (App Info) button.
+2. Tap **Battery**.
+3. Change from **Optimized** to **Unrestricted**.
+
 ## Firewall
 
 The app connects to port 8765 (TCP) and uses mDNS on port 5353 (UDP) for

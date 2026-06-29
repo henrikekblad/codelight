@@ -21,6 +21,8 @@ import org.json.JSONArray
 import org.json.JSONObject
 import android.appwidget.AppWidgetManager
 import android.content.ComponentName
+import android.content.pm.ServiceInfo
+import android.os.Build
 import android.util.Log
 import androidx.glance.appwidget.GlanceAppWidgetManager
 import androidx.glance.appwidget.state.updateAppWidgetState
@@ -87,7 +89,11 @@ class CodelightService : LifecycleService() {
             .remove(KEY_CONNECTED_PORT)
             .apply()
         createNotificationChannels()
-        startForeground(SVC_NOTIF_ID, buildServiceNotification("Connecting…"))
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            startForeground(SVC_NOTIF_ID, buildServiceNotification("Connecting…"), ServiceInfo.FOREGROUND_SERVICE_TYPE_CONNECTED_DEVICE)
+        } else {
+            startForeground(SVC_NOTIF_ID, buildServiceNotification("Connecting…"))
+        }
         pushWidgetUpdate()
         nsdManager = getSystemService(NSD_SERVICE) as NsdManager
         registerNetworkCallback()
