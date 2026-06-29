@@ -31,7 +31,7 @@ jobs:
 
       - uses: gradle/actions/setup-gradle@v3
         with:
-          gradle-version: wrapper
+          gradle-version: '8.14.5'
           cache-read-only: false
 
       - name: Decode keystore
