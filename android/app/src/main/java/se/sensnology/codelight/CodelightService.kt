@@ -263,6 +263,7 @@ class CodelightService : LifecycleService() {
     private fun parseAndStore(json: String) {
         try {
             val obj  = JSONObject(json)
+            if (obj.optString("type") == "config") return
             val edit = getSharedPreferences(STATE_PREFS, MODE_PRIVATE).edit()
             if (obj.has("session_pct"))   edit.putFloat(KEY_SESSION_PCT,   obj.getDouble("session_pct").toFloat())
             if (obj.has("weekly_pct"))    edit.putFloat(KEY_WEEKLY_PCT,    obj.getDouble("weekly_pct").toFloat())

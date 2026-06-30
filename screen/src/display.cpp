@@ -64,13 +64,18 @@ static void drawMeterBlock(int labelY, const char* label, float pct,
     int barW = 240 - X_MARGIN * 2 - 30;   // leaves room for "100%"
 
     // Row 1: label (left) + reset countdown (right)
+    // Text renderer fills its own character backgrounds; only clear the gap between them.
     tft.setTextFont(2);
     tft.setTextSize(1);
     tft.setTextColor(COL_LABEL, COL_BG);
     tft.setCursor(X_MARGIN, labelY);
     tft.print(label);
+    int labelRight = tft.getCursorX();
+    int resetX = 240 - X_MARGIN - tft.textWidth(resetStr);
+    if (resetX > labelRight)
+        tft.fillRect(labelRight, labelY, resetX - labelRight, H_LABEL, COL_BG);
     tft.setTextColor(COL_RESET, COL_BG);
-    tft.setCursor(240 - X_MARGIN - tft.textWidth(resetStr), labelY);
+    tft.setCursor(resetX, labelY);
     tft.print(resetStr);
 
     // Row 2: bar + percentage
@@ -100,15 +105,14 @@ static void drawStatusBox(ClaudeStatus status, bool connected, bool authFailed) 
         default:              color = COL_OFFLINE; label = "OFFLINE"; break;
     }
 
-    int bx = (240 - BOX_SIZE) / 2;
-    tft.fillRect(bx, Y_BOX, BOX_SIZE, BOX_SIZE, color);
+    tft.fillRect(0, Y_BOX, 240, BOX_SIZE, color);
 
     tft.setTextFont(4);
     tft.setTextSize(1);
-    tft.setTextColor(TFT_WHITE, color);
+    tft.setTextColor(TFT_BLACK, color);
     int tw = tft.textWidth(label);
     int th = tft.fontHeight(4);
-    tft.setCursor(bx + (BOX_SIZE - tw) / 2, Y_BOX + (BOX_SIZE - th) / 2);
+    tft.setCursor((240 - tw) / 2, Y_BOX + (BOX_SIZE - th) / 2);
     tft.print(label);
 }
 
@@ -119,37 +123,157 @@ void displayInit() {
     tft.fillScreen(COL_BG);
     pinMode(TFT_BL, OUTPUT);
     digitalWrite(TFT_BL, LOW);   // active LOW = backlight on
-}
 
-void displayUpdate() {
-    tft.fillScreen(COL_BG);
-
-    // Title + clock
+    // Static elements — drawn once, never change
     tft.setTextFont(2);
     tft.setTextSize(1);
     tft.setTextColor(COL_TITLE, COL_BG);
     tft.setCursor(X_MARGIN, Y_TITLE);
     tft.print("codelight");
-    displayUpdateClock();
+    tft.drawFastHLine(0, Y_DIVIDER, 240, COL_BAR_BG);
+}
 
-    // Meter blocks
-    drawMeterBlock(Y_WMETER, "Weekly",  displayData.weeklyPct,  displayData.weeklyReset);
-    drawMeterBlock(Y_SMETER, "Session", displayData.sessionPct, displayData.sessionReset);
+void displayUpdate() {
+    static DisplayData prev = {-1.0f, -1.0f, "", "", -1, (ClaudeStatus)-1, false, false};
+
+    if (displayData.weeklyPct != prev.weeklyPct || displayData.weeklyReset != prev.weeklyReset)
+        drawMeterBlock(Y_WMETER, "Weekly", displayData.weeklyPct, displayData.weeklyReset);
+
+    if (displayData.sessionPct != prev.sessionPct || displayData.sessionReset != prev.sessionReset)
+        drawMeterBlock(Y_SMETER, "Session", displayData.sessionPct, displayData.sessionReset);
+
+    if (displayData.sessions != prev.sessions) {
+        tft.setTextFont(2);
+        tft.setTextSize(1);
+        tft.setTextColor(COL_LABEL, COL_BG);
+        tft.setCursor(X_MARGIN, Y_SESSIONS);
+        char sbuf[24];
+        snprintf(sbuf, sizeof(sbuf), "%d session%s active",
+                 displayData.sessions, displayData.sessions == 1 ? "" : "s");
+        tft.print(sbuf);
+        tft.fillRect(tft.getCursorX(), Y_SESSIONS, 240 - tft.getCursorX(), H_LABEL, COL_BG);
+    }
+
+    if (displayData.status != prev.status || displayData.connected != prev.connected ||
+        displayData.authFailed != prev.authFailed)
+        drawStatusBox(displayData.status, displayData.connected, displayData.authFailed);
+
+    prev = displayData;
+
+    displayUpdateClock();
+}
+
+// ── SVG screen dump ───────────────────────────────────────────────────────────
+
+static String rgb888Hex(uint8_t r, uint8_t g, uint8_t b) {
+    char buf[8];
+    snprintf(buf, sizeof(buf), "#%02x%02x%02x", r, g, b);
+    return String(buf);
+}
+
+static String usageColorHex(float pct) {
+    struct Stop { float edge; uint8_t r, g, b; };
+    static const Stop stops[4] = {
+        {0.00f,   0, 200,   0},
+        {0.50f, 255, 255,   0},
+        {0.75f, 255, 140,   0},
+        {1.00f, 255,  34,   0},
+    };
+    if (pct <= 0.0f) return rgb888Hex(stops[0].r, stops[0].g, stops[0].b);
+    if (pct >= 1.0f) return rgb888Hex(stops[3].r, stops[3].g, stops[3].b);
+    for (int i = 0; i < 3; i++) {
+        if (pct <= stops[i+1].edge) {
+            float t = (pct - stops[i].edge) / (stops[i+1].edge - stops[i].edge);
+            return rgb888Hex(
+                (uint8_t)(stops[i].r + t*(stops[i+1].r - stops[i].r)),
+                (uint8_t)(stops[i].g + t*(stops[i+1].g - stops[i].g)),
+                (uint8_t)(stops[i].b + t*(stops[i+1].b - stops[i].b)));
+        }
+    }
+    return "#ff2200";
+}
+
+static void svgText(String& s, int x, int y, const char* fill, int sz,
+                    const char* anchor, const String& text) {
+    s += "<text x='"; s += x; s += "' y='"; s += y;
+    s += "' fill='"; s += fill;
+    s += "' font-family='monospace' font-size='"; s += sz; s += "'";
+    if (anchor) { s += " text-anchor='"; s += anchor; s += "'"; }
+    s += '>'; s += text; s += "</text>";
+}
+
+static void svgMeter(String& s, int labelY, const char* label, float pct,
+                     const String& resetStr) {
+    int barY  = labelY + H_LABEL + 2;
+    int barW  = 240 - X_MARGIN * 2 - 30;
+    int filled = constrain((int)(pct * barW), 0, barW);
+
+    svgText(s, X_MARGIN,      labelY + 13, "#c0c0c0", 13, nullptr,  label);
+    svgText(s, 234,           labelY + 13, "#808080", 13, "end",     resetStr);
+
+    s += "<rect x='"; s += X_MARGIN; s += "' y='"; s += barY;
+    s += "' width='"; s += barW;     s += "' height='"; s += H_BAR; s += "' fill='#202020'/>";
+
+    if (filled > 0) {
+        s += "<rect x='"; s += X_MARGIN; s += "' y='"; s += barY;
+        s += "' width='"; s += filled; s += "' height='"; s += H_BAR;
+        s += "' fill='"; s += usageColorHex(pct); s += "'/>";
+    }
+
+    char buf[6]; snprintf(buf, sizeof(buf), "%d%%", (int)(pct * 100));
+    svgText(s, 234, barY + 14, "#ffffff", 13, "end", buf);
+}
+
+String generateScreenSvg() {
+    String s;
+    s.reserve(1500);
+
+    s  = "<svg xmlns='http://www.w3.org/2000/svg' width='240' height='240'>";
+    s += "<rect width='240' height='240' fill='#000'/>";
+
+    // Title + clock
+    svgText(s, X_MARGIN, Y_TITLE + 13, "#ffffff", 13, nullptr, "codelight");
+    time_t now = time(nullptr);
+    struct tm* tm_ = localtime(&now);
+    char clk[10];
+    snprintf(clk, sizeof(clk), "%02d:%02d:%02d", tm_->tm_hour, tm_->tm_min, tm_->tm_sec);
+    svgText(s, 234, Y_TITLE + 13, "#ffffff", 13, "end", clk);
+
+    // Meter bars
+    svgMeter(s, Y_WMETER, "Weekly",  displayData.weeklyPct,  displayData.weeklyReset);
+    svgMeter(s, Y_SMETER, "Session", displayData.sessionPct, displayData.sessionReset);
 
     // Session count
-    tft.setTextFont(2);
-    tft.setTextSize(1);
-    tft.setTextColor(COL_LABEL, COL_BG);
-    tft.setCursor(X_MARGIN, Y_SESSIONS);
     char sbuf[24];
     snprintf(sbuf, sizeof(sbuf), "%d session%s active",
              displayData.sessions, displayData.sessions == 1 ? "" : "s");
-    tft.print(sbuf);
+    svgText(s, X_MARGIN, Y_SESSIONS + 13, "#c0c0c0", 13, nullptr, sbuf);
 
     // Divider
-    tft.drawFastHLine(0, Y_DIVIDER, 240, COL_BAR_BG);
+    s += "<line x1='0' y1='"; s += Y_DIVIDER;
+    s += "' x2='240' y2='"; s += Y_DIVIDER; s += "' stroke='#202020'/>";
 
-    drawStatusBox(displayData.status, displayData.connected, displayData.authFailed);
+    // Status box
+    const char* sc; const char* sl;
+    if (displayData.authFailed) {
+        sc = "#ff2200"; sl = "AUTH FAIL";
+    } else if (!displayData.connected) {
+        sc = "#404040"; sl = "OFFLINE";
+    } else switch (displayData.status) {
+        case STATUS_WORKING:  sc = "#ff8c00"; sl = "WORKING";  break;
+        case STATUS_WAITING:  sc = "#ff2200"; sl = "WAITING";  break;
+        case STATUS_INACTIVE: sc = "#00c800"; sl = "IDLE";     break;
+        default:              sc = "#404040"; sl = "OFFLINE";  break;
+    }
+    s += "<rect x='0' y='"; s += Y_BOX;
+    s += "' width='240' height='"; s += BOX_SIZE;
+    s += "' fill='"; s += sc; s += "'/>";
+    s += "<text x='120' y='"; s += (Y_BOX + BOX_SIZE/2 + 8);
+    s += "' fill='#000' font-family='sans-serif' font-size='20' font-weight='bold'"
+         " text-anchor='middle'>"; s += sl; s += "</text>";
+
+    s += "</svg>";
+    return s;
 }
 
 void displayUpdateClock() {

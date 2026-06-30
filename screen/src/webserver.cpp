@@ -1,7 +1,32 @@
 #include "webserver.h"
 #include "config.h"
+#include "display.h"
 #include <ArduinoJson.h>
 #include <ElegantOTA.h>
+#include <time.h>
+
+// ── Debug log buffer ──────────────────────────────────────────────────────────
+#define DBG_LINES    20
+#define DBG_LINE_LEN 96
+
+static char     _dbgBuf[DBG_LINES][DBG_LINE_LEN];
+static uint16_t _dbgSeq = 0;
+
+void dbgLog(const String& msg) {
+    char line[DBG_LINE_LEN];
+    time_t now = time(nullptr);
+    if (now > 1000000000UL) {
+        struct tm* t = localtime(&now);
+        snprintf(line, sizeof(line), "[%02d:%02d:%02d] %s", t->tm_hour, t->tm_min, t->tm_sec, msg.c_str());
+    } else {
+        unsigned long ms = millis();
+        snprintf(line, sizeof(line), "[+%lus] %s", ms / 1000, msg.c_str());
+    }
+    strncpy(_dbgBuf[_dbgSeq % DBG_LINES], line, DBG_LINE_LEN - 1);
+    _dbgBuf[_dbgSeq % DBG_LINES][DBG_LINE_LEN - 1] = '\0';
+    _dbgSeq++;
+    Serial.println(line);
+}
 
 static const char INDEX_HTML[] PROGMEM = R"rawhtml(<!DOCTYPE html>
 <html lang="en">
@@ -41,6 +66,9 @@ static const char INDEX_HTML[] PROGMEM = R"rawhtml(<!DOCTYPE html>
   <label>Companion name <span style="color:#8b949e;font-size:.8rem">(--name passed to codelight.py; blank = first found)</span></label>
   <input type="text" id="companionName" placeholder="e.g. henrik-laptop" maxlength="64">
 
+  <label>Companion host <span style="color:#8b949e;font-size:.8rem">(IP or hostname – bypasses mDNS when set)</span></label>
+  <input type="text" id="companionHost" placeholder="e.g. 192.168.1.100" maxlength="64">
+
   <label>Companion secret <span style="color:#8b949e;font-size:.8rem">(optional – match --secret in codelight.py)</span></label>
   <input type="password" id="companionSecret" placeholder="leave blank to disable auth">
 
@@ -54,6 +82,7 @@ static const char INDEX_HTML[] PROGMEM = R"rawhtml(<!DOCTYPE html>
 </form>
 
 <a class="ota" href="/update">Firmware update (OTA) &#x2192;</a>
+<a class="ota" href="/debug">Debug log &#x2192;</a>
 
 <script>
 const list = document.getElementById('wifi-list');
@@ -76,6 +105,7 @@ function escHtml(s) {
 fetch('/api/config').then(r=>r.json()).then(cfg => {
   document.getElementById('deviceName').value    = cfg.deviceName    || '';
   document.getElementById('companionName').value = cfg.companionName || '';
+  document.getElementById('companionHost').value = cfg.companionHost || '';
   const nets = cfg.wifi || [];
   nets.forEach(n => addNetRow(n.ssid, ''));
   if (nets.length === 0) addNetRow();
@@ -97,6 +127,7 @@ document.getElementById('cfg').onsubmit = async (e) => {
   const body = {
     deviceName:      document.getElementById('deviceName').value.trim(),
     companionName:   document.getElementById('companionName').value.trim(),
+    companionHost:   document.getElementById('companionHost').value.trim(),
     companionSecret: document.getElementById('companionSecret').value,
     wifi,
   };
@@ -118,11 +149,73 @@ document.getElementById('cfg').onsubmit = async (e) => {
 </body>
 </html>)rawhtml";
 
+static const char DEBUG_HTML[] PROGMEM = R"rawhtml(<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>codelight debug</title>
+<style>
+*{box-sizing:border-box;margin:0;padding:0}
+body{font-family:monospace;background:#0d1117;color:#3fb950;padding:12px;height:100vh;display:flex;flex-direction:column}
+h1{font-size:.85rem;color:#58a6ff;margin-bottom:8px;flex-shrink:0}
+#log{flex:1;overflow-y:auto;font-size:.78rem;line-height:1.5;white-space:pre-wrap;word-break:break-all}
+.err{color:#f85149}
+#screen{position:fixed;top:8px;right:8px;width:160px;height:160px;border:1px solid #30363d;border-radius:4px;background:#000}
+</style>
+</head>
+<body>
+<h1>codelight debug &mdash; <span id="st">connecting&hellip;</span></h1>
+<img id="screen" src="/screendump" alt="screen">
+<div id="log"></div>
+<script>
+let seq=0,el=document.getElementById('log'),st=document.getElementById('st'),sc=document.getElementById('screen');
+function poll(){
+  fetch('/api/debug/log?from='+seq)
+    .then(r=>r.json())
+    .then(d=>{
+      st.textContent='live';
+      if(d.lines&&d.lines.length){
+        let atBottom=el.scrollHeight-el.scrollTop<=el.clientHeight+4;
+        d.lines.forEach(l=>{
+          let div=document.createElement('div');
+          div.textContent=l;
+          el.appendChild(div);
+        });
+        seq=d.seq;
+        if(atBottom)el.scrollTop=el.scrollHeight;
+      }
+      sc.src='/screendump?t='+Date.now();
+    })
+    .catch(()=>{st.textContent='disconnected';st.className='err';})
+    .finally(()=>setTimeout(poll,1000));
+}
+poll();
+</script>
+</body>
+</html>)rawhtml";
+
+// GET /api/debug/log?from=N  – return log lines with index >= N
+static void handleDebugLog(AsyncWebServerRequest* req) {
+    uint16_t from = req->hasParam("from") ? (uint16_t)req->getParam("from")->value().toInt() : 0;
+    if (_dbgSeq > DBG_LINES && from < _dbgSeq - DBG_LINES)
+        from = _dbgSeq - DBG_LINES;
+    JsonDocument doc;
+    doc["seq"] = _dbgSeq;
+    JsonArray lines = doc["lines"].to<JsonArray>();
+    for (uint16_t i = from; i < _dbgSeq; i++)
+        lines.add(_dbgBuf[i % DBG_LINES]);
+    String out;
+    serializeJson(doc, out);
+    req->send(200, "application/json", out);
+}
+
 // GET /api/config  – return current config as JSON (passwords redacted)
 static void handleGetConfig(AsyncWebServerRequest* req) {
     JsonDocument doc;
     doc["deviceName"]      = cfg.deviceName;
     doc["companionName"]   = cfg.companionName;
+    doc["companionHost"]   = cfg.companionHost;
     doc["wifiCount"]       = cfg.wifiCount;
     doc["hasSecret"]       = cfg.companionSecret.length() > 0;
     JsonArray nets = doc["wifi"].to<JsonArray>();
@@ -139,15 +232,35 @@ static void handleGetConfig(AsyncWebServerRequest* req) {
 // POST /api/config  – update config
 static void handlePostConfig(AsyncWebServerRequest* req, uint8_t* data, size_t len,
                              size_t index, size_t total) {
+    // Accumulate chunks into a heap buffer; _tempObject is auto-freed by request destructor
+    if (index == 0) {
+        req->_tempObject = malloc(total + 1);
+        if (!req->_tempObject) { req->send(500); return; }
+    }
+    if (req->_tempObject)
+        memcpy((uint8_t*)req->_tempObject + index, data, len);
     if (index + len < total) return;
 
+    uint8_t* body = (uint8_t*)req->_tempObject;
+    if (!body) { req->send(500); return; }
+    body[total] = '\0';
+
     JsonDocument doc;
-    if (deserializeJson(doc, data, len)) { req->send(400); return; }
+    DeserializationError err = deserializeJson(doc, body, total);
+    free(body);
+    req->_tempObject = nullptr;
+    if (err) {
+        dbgLog("POST /api/config parse error: " + String(err.c_str()));
+        req->send(400);
+        return;
+    }
 
     if (doc["deviceName"].is<String>())
         cfg.deviceName = doc["deviceName"].as<String>();
     if (doc["companionName"].is<String>())
         cfg.companionName = doc["companionName"].as<String>();
+    if (doc["companionHost"].is<String>())
+        cfg.companionHost = doc["companionHost"].as<String>();
     if (doc["companionSecret"].is<String>())
         cfg.companionSecret = doc["companionSecret"].as<String>();
 
@@ -187,6 +300,16 @@ void webserverInit(AsyncWebServer& server) {
         [](AsyncWebServerRequest* r){},
         nullptr,
         handlePostConfig);
+
+    server.on("/debug", HTTP_GET, [](AsyncWebServerRequest* req) {
+        req->send_P(200, "text/html", DEBUG_HTML);
+    });
+
+    server.on("/api/debug/log", HTTP_GET, handleDebugLog);
+
+    server.on("/screendump", HTTP_GET, [](AsyncWebServerRequest* req) {
+        req->send(200, "image/svg+xml", generateScreenSvg());
+    });
 
     // ElegantOTA mounts /update (GET = page, POST = upload)
     ElegantOTA.begin(&server);

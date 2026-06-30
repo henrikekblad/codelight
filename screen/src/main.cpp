@@ -25,7 +25,6 @@ static unsigned long lastClockMs = 0;
 static bool          displayReady = false;
 
 static const char* ntpServer = "pool.ntp.org";
-static const char* ntpTZ     = "CET-1CEST,M3.5.0,M10.5.0/3";
 
 // RTC memory slot 0: crash-guard for displayInit().
 // If displayInit() crashes, next boot sees DISPLAY_TRYING and skips it.
@@ -49,19 +48,25 @@ static void applyStatus(uint8_t* payload, size_t length) {
     else if (strcmp(st, "waiting") == 0) displayData.status = STATUS_WAITING;
     else                                  displayData.status = STATUS_INACTIVE;
 
+    dbgLog(String("status=") + st +
+           " session=" + String((int)(displayData.sessionPct * 100)) + "%" +
+           " weekly="  + String((int)(displayData.weeklyPct  * 100)) + "%");
+
     if (displayReady) displayUpdate();
 }
 
 static void wsEvent(WStype_t type, uint8_t* payload, size_t length) {
     switch (type) {
         case WStype_DISCONNECTED:
-            Serial.println(F("[ws] disconnected"));
+            if (!wsConnected && !wsAuthFailed) break;  // suppress library retry spam
             wsConnected = false;
             if (wsAuthFailed) {
-                Serial.println(F("[ws] auth failed; reconnect disabled"));
+                dbgLog(F("[ws] disconnected – auth failed, reconnect disabled"));
                 wsBegun = true;
             } else {
-                wsBegun = false;  // re-discover after interval
+                dbgLog(F("[ws] disconnected"));
+                wsBegun = false;
+                wsLastDiscoverMs = millis();  // reset timer; retry after WS_DISCOVER_MS
             }
             displayData.connected = false;
             displayData.authFailed = wsAuthFailed;
@@ -72,7 +77,7 @@ static void wsEvent(WStype_t type, uint8_t* payload, size_t length) {
             break;
 
         case WStype_CONNECTED:
-            Serial.println(F("[ws] connected"));
+            dbgLog(F("[ws] connected"));
             wsConnected = true;
             wsAuthFailed = false;
             displayData.authFailed = false;
@@ -85,9 +90,10 @@ static void wsEvent(WStype_t type, uint8_t* payload, size_t length) {
         case WStype_TEXT:
             {
                 JsonDocument doc;
-                if (!deserializeJson(doc, payload, length) &&
-                    String(doc["error"] | "") == "unauthorized") {
-                    Serial.println(F("[ws] unauthorized; check companion secret"));
+                if (deserializeJson(doc, payload, length)) break;
+
+                if (strcmp(doc["error"] | "", "unauthorized") == 0) {
+                    dbgLog(F("[ws] unauthorized – check companion secret"));
                     wsAuthFailed = true;
                     wsConnected = false;
                     wsClient.disconnect();
@@ -97,8 +103,18 @@ static void wsEvent(WStype_t type, uint8_t* payload, size_t length) {
                     if (displayReady) displayUpdate();
                     break;
                 }
+
+                if (strcmp(doc["type"] | "", "config") == 0) {
+                    if (doc["utc_offset"].is<long>()) {
+                        long off = doc["utc_offset"].as<long>();
+                        configTime(off, 0L, ntpServer);
+                        dbgLog("[ws] utc_offset=" + String(off) + "s");
+                    }
+                    break;
+                }
+
+                applyStatus(payload, length);
             }
-            applyStatus(payload, length);
             break;
 
         default:
@@ -129,10 +145,8 @@ static void connectWifi() {
         Serial.println();
 
         if (WiFi.status() == WL_CONNECTED) {
-            Serial.print(F("  Connected! IP: "));
-            Serial.println(WiFi.localIP());
-            Serial.flush();
-            configTime(ntpTZ, ntpServer);
+            dbgLog("WiFi connected: " + WiFi.localIP().toString());
+            configTime(0, 0, ntpServer);  // offset corrected when companion sends config
             return;
         }
 
@@ -201,11 +215,25 @@ static void sanitiseMdnsName(const String& name, String& out) {
 static void tryDiscover() {
     if (wsAuthFailed) return;
 
-    Serial.println(F("[ws] querying mDNS for _codelight._tcp..."));
-    int n = MDNS.queryService("_codelight", "tcp");
-    if (n <= 0) {
-        Serial.println(F("[ws] not found, will retry"));
+    if (cfg.companionHost.length() > 0) {
+        dbgLog("[ws] direct connect to " + cfg.companionHost);
+        wsClient.begin(cfg.companionHost, 8765, "/");
+        wsClient.onEvent(wsEvent);
+        wsClient.enableHeartbeat(15000, 3000, 2);
+        wsBegun = true;
         return;
+    }
+
+    dbgLog(F("[ws] querying mDNS _codelight._tcp (2s timeout)..."));
+    int n = MDNS.queryService("codelight", "tcp", 2000);
+    dbgLog("[ws] mDNS query returned n=" + String(n));
+    if (n <= 0) {
+        dbgLog(F("[ws] not found, will retry"));
+        return;
+    }
+    for (int i = 0; i < n; i++) {
+        dbgLog("[ws] found[" + String(i) + "] " + MDNS.hostname(i) +
+               " " + MDNS.IP(i).toString() + ":" + String(MDNS.port(i)));
     }
 
     // Pick by configured name, or fall back to first result
@@ -213,26 +241,23 @@ static void tryDiscover() {
     if (cfg.companionName.length() > 0) {
         bool found = false;
         for (int i = 0; i < n; i++) {
-            if (MDNS.hostname(i) == cfg.companionName) {
+            String h = MDNS.hostname(i);
+            if (h.indexOf('.') > 0) h = h.substring(0, h.indexOf('.'));
+            if (h == cfg.companionName) {
                 idx = i;
                 found = true;
                 break;
             }
         }
         if (!found) {
-            Serial.println("[ws] companion '" + cfg.companionName + "' not found, will retry");
+            dbgLog("[ws] companion '" + cfg.companionName + "' not found in results, will retry");
             return;
         }
     }
 
     IPAddress ip   = MDNS.IP(idx);
     uint16_t  port = MDNS.port(idx);
-    Serial.print(F("[ws] connecting to "));
-    Serial.print(MDNS.hostname(idx));
-    Serial.print(F(" at "));
-    Serial.print(ip);
-    Serial.print(':');
-    Serial.println(port);
+    dbgLog("[ws] connecting to " + MDNS.hostname(idx) + " at " + ip.toString() + ":" + String(port));
     wsClient.begin(ip, port, "/");
     wsClient.onEvent(wsEvent);
     wsClient.enableHeartbeat(15000, 3000, 2);

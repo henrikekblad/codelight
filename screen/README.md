@@ -71,9 +71,9 @@ directly over serial without any tools.
 
 | Device pad | FTDI pin |
 |---|---|
-| 1 GND | GND |
-| 2 TXD0 | RX |
-| 3 RXD0 | TX |
+| 1 GND | GND (black) | 
+| 2 TXD0 | RX (green) |
+| 3 RXD0 | TX (white) |
 | 4 3V3 | 3V3 |
 | 5 GPIO0 | GND (via jumper wire) |
 
@@ -122,18 +122,33 @@ mode and shows setup instructions on screen:
 5. Set a **companion name** — the `--name` value of the `codelight.py` daemon you
    want to connect to (e.g. `henrik-laptop`). Leave blank to connect to the first
    companion found on the network.
-6. Optionally set a **companion secret** to match `--secret` on the daemon.
-7. Click **Save & apply**. The device reboots, connects to your network, and
-   discovers the companion automatically via mDNS.
+6. Optionally set a **companion host** — the IP address of the machine running
+   `codelight.py` (e.g. `192.168.1.100`). When set, mDNS discovery is skipped and
+   the screen connects directly. Useful if mDNS is unreliable on your network.
+7. Optionally set a **companion secret** to match `--secret` on the daemon.
+8. Click **Save & apply**. The device reboots, connects to your network, and
+   discovers the companion automatically via mDNS (or directly if a host is set).
 
 Config is stored in LittleFS and survives firmware OTA updates.
 
 ## How it connects
 
-On boot the screen queries mDNS for `_codelight._tcp` services. When it finds a
-match (filtered by companion name if configured) it connects as a WebSocket client
-and receives push updates in real time. If the connection drops it re-discovers and
-reconnects automatically after 15 seconds.
+On boot the screen connects to the companion daemon over WebSocket:
+
+- **Direct IP** (if *companion host* is set): connects immediately without mDNS.
+- **mDNS discovery** (default): queries for `_codelight._tcp` services, filtered by
+  companion name if configured.
+
+Once connected it receives push updates in real time. If the connection drops it
+reconnects automatically after 15 seconds. The timezone offset is pushed by the
+companion on every new connection so the clock always shows the correct local time.
+
+## Debug page
+
+Every device running the custom firmware exposes a live debug log at
+`http://<device>.local/debug`. It shows timestamped internal events (WiFi,
+WebSocket, incoming status) and includes a live screenshot of the current display
+state in the top-right corner, updated every second.
 
 ## Multiple screens or companions on one network
 

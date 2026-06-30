@@ -219,6 +219,7 @@ export default class CodelightExtension extends Extension {
                             this._markAuthFailed();
                             return;
                         }
+                        if (data?.type === 'config') return;
                         this._handleMessage(data);
                     } catch (_) {}
                 });

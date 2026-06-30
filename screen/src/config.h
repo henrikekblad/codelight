@@ -16,6 +16,7 @@ struct Config {
     uint8_t wifiCount;
     String deviceName;
     String companionName;    // mDNS instance name to connect to (e.g. "henrik-laptop"); blank = first found
+    String companionHost;    // direct IP or hostname, bypasses mDNS when set
     String companionSecret;  // optional shared secret for WebSocket auth
 };
 

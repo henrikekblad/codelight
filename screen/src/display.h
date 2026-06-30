@@ -27,3 +27,4 @@ extern DisplayData displayData;
 void displayInit();
 void displayUpdate();          // full redraw
 void displayUpdateClock();     // clock-only partial update (called every second)
+String generateScreenSvg();    // SVG representation of current display state

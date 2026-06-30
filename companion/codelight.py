@@ -419,6 +419,10 @@ def _ws_thread(port: int, secret: str) -> None:
         _ws_clients.add(ws)
         vprint(f"[ws] client connected ({len(_ws_clients)} total)")
         try:
+            # Push timezone offset so the screen can configure NTP correctly
+            utc_offset = int(datetime.now().astimezone().utcoffset().total_seconds())
+            await ws.send(json.dumps({"type": "config", "utc_offset": utc_offset}))
+
             # Send current state immediately so the client isn't blank on connect
             sessions, status = _overall_status()
             with _lock:
@@ -472,37 +476,46 @@ def _mdns_thread(port: int, name: str) -> None:
         print("[mdns] Install: pip install zeroconf", file=sys.stderr)
         return
 
-    zc = Zeroconf()
+    zc: Zeroconf | None = None
     current_ip: str | None = None
     info = None
     try:
         while not _shutdown.is_set():
             ip = _get_local_ip()
             if ip != current_ip:
-                if info is not None:
+                # Tear down old instance before rebinding to the new interface
+                if info is not None and zc is not None:
                     try:
                         zc.unregister_service(info)
                     except Exception:
                         pass
+                if zc is not None:
+                    try:
+                        zc.close()
+                    except Exception:
+                        pass
                 current_ip = ip
-                ip_bytes   = bytes(int(x) for x in ip.split("."))
+                # Bind to the specific IPv4 interface so the mDNS response stays
+                # small — the ESP8266 UDP buffer drops oversized multi-interface packets
+                zc = Zeroconf(interfaces=[current_ip])
                 info = ServiceInfo(
                     "_codelight._tcp.local.",
                     f"{name}._codelight._tcp.local.",
-                    addresses=[ip_bytes],
+                    addresses=[socket.inet_aton(current_ip)],
                     port=port,
-                    properties={"version": "1"},
+                    properties={},
                 )
                 zc.register_service(info)
                 print(f"[mdns] advertising {name}._codelight._tcp on {ip}:{port}", flush=True)
             _shutdown.wait(30)   # re-check IP every 30 s
     finally:
-        if info is not None:
+        if info is not None and zc is not None:
             try:
                 zc.unregister_service(info)
             except Exception:
                 pass
-        zc.close()
+        if zc is not None:
+            zc.close()
         vprint("[mdns] stopped")
 
 
