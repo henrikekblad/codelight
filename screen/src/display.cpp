@@ -1,7 +1,7 @@
 #include "display.h"
 
 TFT_eSPI tft = TFT_eSPI();
-DisplayData displayData = {0, 0, "--", "--", 0, STATUS_OFFLINE, false};
+DisplayData displayData = {0, 0, "--", "--", 0, STATUS_OFFLINE, false, false};
 
 // Palette
 #define COL_BG       TFT_BLACK
@@ -85,15 +85,18 @@ static void drawMeterBlock(int labelY, const char* label, float pct,
     tft.print(buf);
 }
 
-static void drawStatusBox(ClaudeStatus status, bool connected) {
+static void drawStatusBox(ClaudeStatus status, bool connected, bool authFailed) {
     uint16_t color;
     const char* label;
-    if (!connected) {
+    if (authFailed) {
+        color = COL_RED; label = "AUTH FAIL";
+    } else if (!connected) {
         color = COL_OFFLINE; label = "OFFLINE";
     } else switch (status) {
         case STATUS_WORKING:  color = COL_ORANGE; label = "WORKING";  break;
         case STATUS_WAITING:  color = COL_RED;    label = "WAITING";  break;
         case STATUS_INACTIVE: color = COL_GREEN;  label = "IDLE";     break;
+        case STATUS_AUTH_FAILED: color = COL_RED; label = "AUTH FAIL"; break;
         default:              color = COL_OFFLINE; label = "OFFLINE"; break;
     }
 
@@ -146,7 +149,7 @@ void displayUpdate() {
     // Divider
     tft.drawFastHLine(0, Y_DIVIDER, 240, COL_BAR_BG);
 
-    drawStatusBox(displayData.status, displayData.connected);
+    drawStatusBox(displayData.status, displayData.connected, displayData.authFailed);
 }
 
 void displayUpdateClock() {

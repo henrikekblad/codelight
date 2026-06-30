@@ -6,7 +6,8 @@ enum ClaudeStatus {
     STATUS_INACTIVE = 0,
     STATUS_WORKING  = 1,
     STATUS_WAITING  = 2,
-    STATUS_OFFLINE  = 3
+    STATUS_OFFLINE  = 3,
+    STATUS_AUTH_FAILED = 4
 };
 
 struct DisplayData {
@@ -17,6 +18,7 @@ struct DisplayData {
     int      sessions;
     ClaudeStatus status;
     bool     connected;       // companion reachable
+    bool     authFailed;      // companion rejected auth secret
 };
 
 extern TFT_eSPI tft;

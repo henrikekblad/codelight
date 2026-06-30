@@ -17,6 +17,7 @@ static String mdnsName;
 
 static bool          wsConnected      = false;
 static bool          wsBegun          = false;
+static bool          wsAuthFailed     = false;
 static unsigned long wsLastDiscoverMs = 0;
 #define WS_DISCOVER_MS 15000UL
 
@@ -41,6 +42,7 @@ static void applyStatus(uint8_t* payload, size_t length) {
     displayData.sessionReset = doc["session_reset"].as<String>();
     displayData.sessions     = doc["sessions"]     | 0;
     displayData.connected    = true;
+    displayData.authFailed   = false;
 
     const char* st = doc["status"] | "inactive";
     if      (strcmp(st, "working") == 0) displayData.status = STATUS_WORKING;
@@ -55,14 +57,25 @@ static void wsEvent(WStype_t type, uint8_t* payload, size_t length) {
         case WStype_DISCONNECTED:
             Serial.println(F("[ws] disconnected"));
             wsConnected = false;
-            wsBegun     = false;  // re-discover after interval
+            if (wsAuthFailed) {
+                Serial.println(F("[ws] auth failed; reconnect disabled"));
+                wsBegun = true;
+            } else {
+                wsBegun = false;  // re-discover after interval
+            }
             displayData.connected = false;
+            displayData.authFailed = wsAuthFailed;
+            if (wsAuthFailed) {
+                displayData.status = STATUS_AUTH_FAILED;
+            }
             if (displayReady) displayUpdate();
             break;
 
         case WStype_CONNECTED:
             Serial.println(F("[ws] connected"));
             wsConnected = true;
+            wsAuthFailed = false;
+            displayData.authFailed = false;
             if (cfg.companionSecret.length() > 0) {
                 String auth = "{\"auth\":\"" + cfg.companionSecret + "\"}";
                 wsClient.sendTXT(auth);
@@ -70,6 +83,21 @@ static void wsEvent(WStype_t type, uint8_t* payload, size_t length) {
             break;
 
         case WStype_TEXT:
+            {
+                JsonDocument doc;
+                if (!deserializeJson(doc, payload, length) &&
+                    String(doc["error"] | "") == "unauthorized") {
+                    Serial.println(F("[ws] unauthorized; check companion secret"));
+                    wsAuthFailed = true;
+                    wsConnected = false;
+                    wsClient.disconnect();
+                    displayData.connected = false;
+                    displayData.authFailed = true;
+                    displayData.status = STATUS_AUTH_FAILED;
+                    if (displayReady) displayUpdate();
+                    break;
+                }
+            }
             applyStatus(payload, length);
             break;
 
@@ -171,6 +199,8 @@ static void sanitiseMdnsName(const String& name, String& out) {
 }
 
 static void tryDiscover() {
+    if (wsAuthFailed) return;
+
     Serial.println(F("[ws] querying mDNS for _codelight._tcp..."));
     int n = MDNS.queryService("_codelight", "tcp");
     if (n <= 0) {
@@ -267,6 +297,7 @@ void setup() {
 
     if (displayReady && WiFi.status() == WL_CONNECTED) {
         displayData.connected = false;
+        displayData.authFailed = false;
         displayUpdate();
     }
 
@@ -294,7 +325,7 @@ void loop() {
 
     if (WiFi.status() == WL_CONNECTED) {
         // Re-discover companion via mDNS when not yet connected
-        if (!wsBegun && (now - wsLastDiscoverMs >= WS_DISCOVER_MS)) {
+        if (!wsAuthFailed && !wsBegun && (now - wsLastDiscoverMs >= WS_DISCOVER_MS)) {
             wsLastDiscoverMs = now;
             tryDiscover();
         }

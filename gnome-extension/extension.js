@@ -118,6 +118,7 @@ export default class CodelightExtension extends Extension {
     enable() {
         this._settings        = this.getSettings();
         this._ws              = null;
+        this._authFailed      = false;
         this._reconnectTimer  = null;
         this._session         = new Soup.Session();
         this._indicator       = new PanelMenu.Button(0.0, 'Codelight', false);
@@ -168,6 +169,7 @@ export default class CodelightExtension extends Extension {
         Main.panel.addToStatusArea(this.uuid, this._indicator);
 
         this._settingsChangedId = this._settings.connect('changed', () => {
+            this._authFailed = false;
             this._disconnect();
             this._scheduleReconnect(0);
         });
@@ -177,6 +179,9 @@ export default class CodelightExtension extends Extension {
     }
 
     _connect() {
+        if (this._authFailed)
+            return;
+
         const host   = this._settings.get_string('host');
         const port   = this._settings.get_int('port');
         const secret = this._settings.get_string('secret');
@@ -209,23 +214,50 @@ export default class CodelightExtension extends Extension {
                 ws.connect('message', (_ws, _type, bytes) => {
                     try {
                         const text = new TextDecoder().decode(bytes.get_data());
-                        this._handleMessage(JSON.parse(text));
+                        const data = JSON.parse(text);
+                        if (data?.error === 'unauthorized') {
+                            this._markAuthFailed();
+                            return;
+                        }
+                        this._handleMessage(data);
                     } catch (_) {}
                 });
 
                 ws.connect('closed', () => {
+                    const code = ws.get_close_code();
                     this._ws = null;
-                    this._setOffline();
-                    this._scheduleReconnect();
+                    if (code === 1008) {
+                        this._markAuthFailed();
+                        return;
+                    }
+                    if (!this._authFailed) {
+                        this._setOffline();
+                        this._scheduleReconnect();
+                    }
                 });
 
                 ws.connect('error', () => {
                     this._ws = null;
-                    this._setOffline();
-                    this._scheduleReconnect();
+                    if (!this._authFailed) {
+                        this._setOffline();
+                        this._scheduleReconnect();
+                    }
                 });
             }
         );
+    }
+
+    _markAuthFailed() {
+        if (this._authFailed)
+            return;
+
+        this._authFailed = true;
+        this._setAuthFailed();
+        if (this._ws) {
+            this._ws.close(1000, null);
+            this._ws = null;
+        }
+        Main.notify('codelight', 'Wrong password. Open Settings to fix.');
     }
 
     _handleMessage(data) {
@@ -266,6 +298,19 @@ export default class CodelightExtension extends Extension {
         this._hdrDot.set_text('●');
         this._hdrStatus.set_text('OFFLINE');
         this._hdrSessions.set_text('daemon offline');
+        this._setMeter(this._weeklyItem,  null, null);
+        this._setMeter(this._sessionItem, null, null);
+    }
+
+    _setAuthFailed() {
+        const hex = toHex(C.waiting);
+        this._panelDot.set_style(`color: ${hex};`);
+        this._panelDot.set_text('● ');
+        this._panelStatus.set_text('AUTH FAIL');
+        this._hdrDot.set_style(`color: ${hex};`);
+        this._hdrDot.set_text('●');
+        this._hdrStatus.set_text('AUTH FAIL');
+        this._hdrSessions.set_text('wrong password');
         this._setMeter(this._weeklyItem,  null, null);
         this._setMeter(this._sessionItem, null, null);
     }

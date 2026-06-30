@@ -244,7 +244,11 @@ class CodelightService : LifecycleService() {
                 Log.w("Codelight", "WS onClosed code=$code reason=$reason")
                 this@CodelightService.webSocket = null
                 setConnected(false)
-                scheduleReconnect()
+                if (code == 1008) {
+                    sendAuthFailedNotification()
+                } else {
+                    scheduleReconnect()
+                }
             }
 
             override fun onFailure(webSocket: WebSocket, t: Throwable, response: Response?) {
@@ -314,6 +318,22 @@ class CodelightService : LifecycleService() {
             .setSmallIcon(android.R.drawable.stat_notify_chat)
             .setContentTitle("codelight")
             .setContentText(text)
+            .setContentIntent(pi)
+            .setDefaults(NotificationCompat.DEFAULT_ALL)
+            .setAutoCancel(true)
+            .build()
+        getSystemService(NotificationManager::class.java).notify(ALERT_NOTIF_ID, notif)
+    }
+
+    private fun sendAuthFailedNotification() {
+        val pi = PendingIntent.getActivity(
+            this, 0, Intent(this, SettingsActivity::class.java),
+            PendingIntent.FLAG_IMMUTABLE,
+        )
+        val notif = NotificationCompat.Builder(this, ALERT_CHANNEL_ID)
+            .setSmallIcon(android.R.drawable.stat_notify_error)
+            .setContentTitle("codelight")
+            .setContentText("Wrong password — tap to fix")
             .setContentIntent(pi)
             .setDefaults(NotificationCompat.DEFAULT_ALL)
             .setAutoCancel(true)

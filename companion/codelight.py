@@ -307,7 +307,7 @@ def get_usage() -> dict | None:
             creds = json.load(f)
         token = creds["claudeAiOauth"]["accessToken"]
     except Exception as e:
-        vprint(f"[usage] could not read credentials: {e}")
+        print(f"[usage] could not read credentials: {e}", file=sys.stderr, flush=True)
         return None
 
     req = urllib.request.Request(
@@ -322,10 +322,10 @@ def get_usage() -> dict | None:
         with urllib.request.urlopen(req, timeout=10) as r:
             data = json.loads(r.read())
     except urllib.error.HTTPError as e:
-        vprint(f"[usage] HTTP {e.code}: {e.reason}")
+        print(f"[usage] HTTP {e.code}: {e.reason}", file=sys.stderr, flush=True)
         return None
     except Exception as e:
-        vprint(f"[usage] request error: {e}")
+        print(f"[usage] request error: {e}", file=sys.stderr, flush=True)
         return None
 
     session = data.get("five_hour") or {}
@@ -400,9 +400,19 @@ def _ws_thread(port: int, secret: str) -> None:
             try:
                 msg = await asyncio.wait_for(ws.recv(), timeout=5.0)
                 if json.loads(msg).get("auth") != secret:
+                    print(f"[ws] auth failed from {ws.remote_address}", flush=True)
+                    try:
+                        await ws.send(json.dumps({"error": "unauthorized", "message": "Wrong password"}))
+                    except Exception:
+                        pass
                     await ws.close(1008, "Unauthorized")
                     return
             except Exception:
+                print(f"[ws] auth error from {ws.remote_address}", flush=True)
+                try:
+                    await ws.send(json.dumps({"error": "unauthorized", "message": "Wrong password"}))
+                except Exception:
+                    pass
                 await ws.close(1008, "Unauthorized")
                 return
 
