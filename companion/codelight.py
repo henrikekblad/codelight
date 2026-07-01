@@ -195,8 +195,8 @@ if _have_dbus:
             super().__init__('se.sensnology.codelight')
 
         @_dbus_signal()
-        def StatusChanged(self) -> 's':  # type: ignore[return]
-            pass
+        def StatusChanged(self, status_json: str) -> 's':  # type: ignore[return]
+            return status_json
 
         @_dbus_method()
         def GetStatus(self) -> 's':  # type: ignore[return]
