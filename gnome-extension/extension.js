@@ -135,11 +135,13 @@ export default class CodelightExtension extends Extension {
         this._indicator = new PanelMenu.Button(0.0, 'Codelight', false);
 
         // ── Panel button ────────────────────────────────────────────────────
-        const panelBox    = new St.BoxLayout({ style_class: 'panel-status-menu-box' });
-        this._panelDot    = new St.Label({ y_expand: true, y_align: Clutter.ActorAlign.CENTER });
-        this._panelStatus = new St.Label({ y_expand: true, y_align: Clutter.ActorAlign.CENTER });
-        panelBox.add_child(this._panelDot);
-        panelBox.add_child(this._panelStatus);
+        const panelBox = new St.BoxLayout({ style_class: 'panel-status-menu-box' });
+        this._panelIcon = new St.Icon({
+            gicon: Gio.icon_new_for_string(this.path + '/icons/claude-symbolic.svg'),
+            icon_size: 16,
+            style_class: 'system-status-icon',
+        });
+        panelBox.add_child(this._panelIcon);
         this._indicator.add_child(panelBox);
 
         // ── Popup ────────────────────────────────────────────────────────────
@@ -229,9 +231,7 @@ export default class CodelightExtension extends Extension {
         const sessions = data?.sessions ?? 0;
         const label    = status.toUpperCase();
 
-        this._panelDot.set_style(`color: ${hex};`);
-        this._panelDot.set_text('● ');
-        this._panelStatus.set_text(label);
+        this._panelIcon.set_style(`color: ${hex};`);
 
         this._hdrDot.set_style(`color: ${hex};`);
         this._hdrDot.set_text('●');
@@ -253,9 +253,7 @@ export default class CodelightExtension extends Extension {
 
     _setOffline() {
         const hex = toHex(C.offline);
-        this._panelDot.set_style(`color: ${hex};`);
-        this._panelDot.set_text('● ');
-        this._panelStatus.set_text('OFFLINE');
+        this._panelIcon.set_style(`color: ${hex};`);
         this._hdrDot.set_style(`color: ${hex};`);
         this._hdrDot.set_text('●');
         this._hdrStatus.set_text('OFFLINE');
