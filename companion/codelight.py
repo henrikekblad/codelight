@@ -785,7 +785,68 @@ def uninstall() -> None:
         except FileNotFoundError:
             pass
 
+    service_path = os.path.expanduser("~/.config/systemd/user/codelight.service")
+    if os.path.exists(service_path):
+        import subprocess
+        subprocess.run(["systemctl", "--user", "disable", "--now", "codelight"],
+                       capture_output=True)
+        os.unlink(service_path)
+        subprocess.run(["systemctl", "--user", "daemon-reload"], capture_output=True)
+        print(f"[uninstall] removed {service_path}")
+
     print("[uninstall] done")
+
+
+# ── Systemd service install ───────────────────────────────────────────────────
+
+def install_service(name: str, secret: str, ws_port: int, verbose: bool) -> None:
+    """Write ~/.config/systemd/user/codelight.service and enable it."""
+    import subprocess
+
+    script_path = os.path.abspath(__file__)
+    python_path = shutil.which("python3") or "python3"
+
+    args_line = f"--name {name}"
+    if secret:
+        args_line += f" --secret {secret}"
+    if ws_port != 8765:
+        args_line += f" --ws-port {ws_port}"
+    if verbose:
+        args_line += " --verbose"
+
+    unit = f"""\
+[Unit]
+Description=Claude Code status monitor
+
+[Service]
+ExecStart={python_path} -u {script_path} {args_line}
+Restart=always
+RestartSec=15
+
+[Install]
+WantedBy=default.target
+"""
+
+    service_dir = os.path.expanduser("~/.config/systemd/user")
+    os.makedirs(service_dir, exist_ok=True)
+    service_path = os.path.join(service_dir, "codelight.service")
+
+    with open(service_path, "w") as f:
+        f.write(unit)
+    print(f"[install] wrote {service_path}")
+
+    for cmd in [
+        ["systemctl", "--user", "daemon-reload"],
+        ["systemctl", "--user", "enable", "--now", "codelight"],
+    ]:
+        result = subprocess.run(cmd, capture_output=True, text=True)
+        label = " ".join(cmd[2:])
+        if result.returncode == 0:
+            print(f"[install] systemctl {label}: ok")
+        else:
+            print(f"[install] systemctl {label}: {result.stderr.strip()}", file=sys.stderr)
+
+    print("[install] done — check status with: systemctl --user status codelight")
 
 
 # ── Main ──────────────────────────────────────────────────────────────────────
@@ -796,6 +857,8 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--uninstall", action="store_true",
                         help="Remove hooks from ~/.claude/settings.json and delete state files.")
+    parser.add_argument("--install", action="store_true",
+                        help="Install and start a systemd user service (requires --name).")
     parser.add_argument("--hook", metavar="STATE",
                         help="Hook mode: send STATE event to daemon and exit. "
                              "Used internally by Claude Code hooks (working/waiting/ended).")
@@ -811,6 +874,12 @@ def main():
 
     if args.uninstall:
         uninstall()
+        return
+
+    if args.install:
+        if args.name is None:
+            parser.error("--name is required with --install")
+        install_service(args.name, args.secret, args.ws_port, args.verbose)
         return
 
     if args.hook:

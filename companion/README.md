@@ -48,28 +48,19 @@ raw API responses) to the activity log.
 
 ## Run as a systemd user service
 
-Create `~/.config/systemd/user/codelight.service`:
+The `--install` flag writes the unit file and enables the service in one step:
 
-```ini
-[Unit]
-Description=Claude Code status monitor
-
-[Service]
-ExecStart=/usr/bin/python3 -u /path/to/companion/codelight.py \
-    --name henrik-laptop
-Restart=always
-RestartSec=15
-
-[Install]
-WantedBy=default.target
+```bash
+python3 companion/codelight.py --install --name henrik-laptop
+python3 companion/codelight.py --install --name henrik-laptop --secret mypassword
 ```
 
 ```bash
-systemctl --user daemon-reload
-systemctl --user enable --now codelight
 systemctl --user status codelight   # verify it's running
+```
 
-# To start at boot without being logged in:
+To start at boot without being logged in:
+```bash
 sudo loginctl enable-linger $USER
 ```
 
@@ -124,13 +115,13 @@ needed for that.
 
 ## Uninstalling
 
-1. Stop the daemon (Ctrl-C, or `systemctl --user disable --now codelight`).
-2. Remove hooks and state files:
-   ```bash
-   python3 companion/codelight.py --uninstall
-   ```
-   This removes all codelight entries from `~/.claude/settings.json` and deletes
-   `~/.claude/codelight.sock` and `~/.claude/monitor_state/`.
+```bash
+python3 companion/codelight.py --uninstall
+```
+
+This removes all codelight entries from `~/.claude/settings.json`, deletes
+`~/.claude/codelight.sock` and `~/.claude/monitor_state/`, and if the systemd
+service is installed it stops, disables, and removes it.
 
 > **Stop the daemon before uninstalling.** If it is still running it will
 > re-install the hooks on its next startup.
