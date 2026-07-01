@@ -41,7 +41,7 @@ gnome-extensions enable "$UUID"
 
 ## How it works
 
-The extension watches for the D-Bus name `se.henrikekblad.codelight` on the session bus.
+The extension watches for the D-Bus name `se.sensnology.codelight` on the session bus.
 When `codelight.py` starts, the extension automatically connects, fetches the current
 status, and subscribes to live `StatusChanged` signals. When the daemon stops, the
 indicator shows **OFFLINE**.

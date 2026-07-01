@@ -156,7 +156,7 @@ messages        mode                             ────────►  An
                                              ◄───  Android discovers daemon via mDNS
 
                           D-Bus service (session bus)
-                          se.henrikekblad.codelight ◄─── GNOME extension auto-discovers
+                          se.sensnology.codelight ◄─── GNOME extension auto-discovers
 ```
 
 Status updates reach clients the moment a Claude Code hook fires — there is no

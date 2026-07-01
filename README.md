@@ -37,7 +37,7 @@ messages        mode                             ────────►  An
                                              ◄───  Android discovers companion via mDNS
 
                           D-Bus service (session bus)
-                          se.henrikekblad.codelight ◄─── GNOME extension auto-discovers
+                          se.sensnology.codelight ◄─── GNOME extension auto-discovers
 ```
 
 The ESP8266 screen and Android widget use WebSocket (discovered via mDNS). The GNOME

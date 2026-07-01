@@ -7,12 +7,12 @@ import * as PanelMenu from 'resource:///org/gnome/shell/ui/panelMenu.js';
 import * as PopupMenu from 'resource:///org/gnome/shell/ui/popupMenu.js';
 import {Extension} from 'resource:///org/gnome/shell/extensions/extension.js';
 
-const DBUS_NAME  = 'se.henrikekblad.codelight';
-const DBUS_PATH  = '/se/henrikekblad/codelight';
-const DBUS_IFACE = 'se.henrikekblad.codelight';
+const DBUS_NAME  = 'se.sensnology.codelight';
+const DBUS_PATH  = '/se/sensnology/codelight';
+const DBUS_IFACE = 'se.sensnology.codelight';
 
 const IFACE_XML = `<node>
-  <interface name="se.henrikekblad.codelight">
+  <interface name="se.sensnology.codelight">
     <signal name="StatusChanged">
       <arg type="s" name="status_json"/>
     </signal>

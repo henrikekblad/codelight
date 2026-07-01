@@ -192,7 +192,7 @@ def _overall_status() -> tuple[int, str]:
 if _have_dbus:
     class CodelightDbusInterface(_DbusServiceInterface):  # type: ignore[misc]
         def __init__(self):
-            super().__init__('se.henrikekblad.codelight')
+            super().__init__('se.sensnology.codelight')
 
         @_dbus_signal()
         def StatusChanged(self) -> 's':  # type: ignore[return]
@@ -535,8 +535,8 @@ def _ws_thread(port: int, secret: str) -> None:
             try:
                 dbus_bus = await _DbusMessageBus(bus_type=_DbusBusType.SESSION).connect()
                 iface = CodelightDbusInterface()  # type: ignore[name-defined]
-                dbus_bus.export('/se/henrikekblad/codelight', iface)
-                await dbus_bus.request_name('se.henrikekblad.codelight')
+                dbus_bus.export('/se/sensnology/codelight', iface)
+                await dbus_bus.request_name('se.sensnology.codelight')
                 _dbus_iface = iface
                 _log("[dbus] service exported")
             except Exception as e:
