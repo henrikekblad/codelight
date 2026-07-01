@@ -90,10 +90,16 @@ jobs:
           name: codelight ${{ github.ref_name }}
           generate_release_notes: true
           body: |
-            Flash `codelight-${{ github.ref_name }}.bin` to your GeekMagic Ultra.
-            See the [README](https://github.com/${{ github.repository }}/blob/main/README.md) for full flashing and setup instructions.
+            ## Assets
 
-            ### Quick start
+            | File | Description |
+            |------|-------------|
+            | `codelight-${{ github.ref_name }}.bin` | ESP8266 firmware for GeekMagic Ultra |
+            | `codelight-${{ github.ref_name }}.apk` | Android home-screen widget |
+
+            See the [README](https://github.com/${{ github.repository }}/blob/main/README.md) for full setup instructions.
+
+            ### Flash firmware (GeekMagic Ultra)
 
             **Stock OTA** (no disassembly — works on a fresh device):
             1. Connect your computer to the device's WiFi AP
@@ -107,10 +113,11 @@ jobs:
             ### Companion script
 
             ```bash
-            pip install websockets zeroconf
+            pip install websockets zeroconf dbus-fast   # dbus-fast optional: GNOME extension
             python3 companion/codelight.py --name my-laptop
             ```
 
-            The screen discovers the companion automatically via mDNS — no IP address needed.
+            The screen and Android widget discover the companion automatically via mDNS.
+            The GNOME extension connects via D-Bus — no configuration needed.
           files: screen/.pio/build/geekmagic_ultra/codelight-${{ github.ref_name }}.bin
           fail_on_unmatched_files: true

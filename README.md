@@ -25,9 +25,9 @@ Claude Code               codelight.py (daemon)
 ───────────────           ─────────────────────
                           Unix socket thread
 hooks fire on  ────────►  receives event         broadcast
-tool use /      --hook    updates state          ────────►  GeekMagic Ultra (WS client)
-messages        mode                             ────────►  Android widget  (WS client)
-                                                 ────────►  GNOME extension (WS client)
+tool use /      --hook    updates state          ────────►  GeekMagic Ultra (WebSocket)
+messages        mode                             ────────►  Android widget  (WebSocket)
+                                                 ────────►  GNOME extension (D-Bus signal)
                           Usage poller thread
                           fetches claude.ai API   push on
                           every 60 s              each poll
@@ -35,11 +35,13 @@ messages        mode                             ────────►  An
                           WebSocket server (:8765)
                           clients connect in ◄───  screen discovers companion via mDNS
                                              ◄───  Android discovers companion via mDNS
+
+                          D-Bus service (session bus)
+                          se.henrikekblad.codelight ◄─── GNOME extension auto-discovers
 ```
 
-All clients use the same WebSocket protocol. The companion advertises itself via
-mDNS (`_codelight._tcp`) so clients find it automatically — no IP addresses to
-configure.
+The ESP8266 screen and Android widget use WebSocket (discovered via mDNS). The GNOME
+extension uses D-Bus on the session bus — no network socket or configuration needed.
 
 ## Quick start
 

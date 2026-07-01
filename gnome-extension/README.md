@@ -5,12 +5,12 @@ A GNOME Shell extension that shows Claude Code status in the top bar.
 <img src="../assets/gnome-extension.png" width="600" alt="codelight GNOME Shell extension">
 
 The panel indicator shows **WORKING** (orange), **WAITING** (red), or **IDLE** (green).
-Click it to see a popup with session and weekly token usage bars, number of active
-sessions, and a Settings link. The extension connects to the companion daemon via
-WebSocket and reconnects automatically — updates are instant, not polled.
+Click it to see a popup with session and weekly token usage bars and the number of active
+sessions. The extension connects to the companion daemon via **D-Bus** — no network socket
+or configuration needed.
 
 Requires **GNOME 45 or later** and the companion daemon from
-[companion/README.md](../companion/README.md).
+[companion/README.md](../companion/README.md) running on the same machine.
 
 ## Install
 
@@ -39,29 +39,20 @@ glib-compile-schemas "$DEST/schemas/"
 gnome-extensions enable "$UUID"
 ```
 
-## Configuration
+## How it works
 
-The defaults (localhost:8765, no secret) work out of the box when the daemon runs
-on the same machine. To change settings, click the indicator → **Settings…**, or:
+The extension watches for the D-Bus name `se.henrikekblad.codelight` on the session bus.
+When `codelight.py` starts, the extension automatically connects, fetches the current
+status, and subscribes to live `StatusChanged` signals. When the daemon stops, the
+indicator shows **OFFLINE**.
 
-```bash
-gnome-extensions prefs codelight@sensnology.se
-```
-
-| Setting | Default | Description |
-|---------|---------|-------------|
-| Host | `localhost` | Hostname or IP of the machine running `codelight.py` |
-| Port | `8765` | WebSocket port |
-| Secret | *(empty)* | Must match `--secret` passed to `codelight.py` |
+No host, port, or secret settings are needed — the session bus is user-private and only
+reachable by processes running as the same user.
 
 ## Start the daemon
 
 ```bash
-# Same machine — no configuration needed:
 python3 companion/codelight.py --name my-laptop
-
-# Remote machine — set a secret and open the firewall on port 8765:
-python3 companion/codelight.py --name my-laptop --secret mypassword
 ```
 
 See [companion/README.md](../companion/README.md) for running as a systemd service.
@@ -69,7 +60,7 @@ See [companion/README.md](../companion/README.md) for running as a systemd servi
 ## Reload after changes
 
 ```bash
-bash gnome-extension/reload.sh
+bash gnome-extension/install.sh
 ```
 
 ## Uninstall

@@ -39,22 +39,30 @@ import androidx.compose.ui.unit.sp
 
 class SettingsActivity : ComponentActivity() {
 
-    private val requestNotifPermission =
+    private val requestPermission =
         registerForActivityResult(ActivityResultContracts.RequestPermission()) { /* no-op */ }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         startService(Intent(this, CodelightService::class.java))
-        maybeRequestNotificationPermission()
+        maybeRequestPermissions()
         setContent { SettingsScreen() }
     }
 
-    private fun maybeRequestNotificationPermission() {
+    private fun maybeRequestPermissions() {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU &&
             ContextCompat.checkSelfPermission(this, Manifest.permission.POST_NOTIFICATIONS)
                 != PackageManager.PERMISSION_GRANTED
         ) {
-            requestNotifPermission.launch(Manifest.permission.POST_NOTIFICATIONS)
+            requestPermission.launch(Manifest.permission.POST_NOTIFICATIONS)
+            return
+        }
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S &&
+            ContextCompat.checkSelfPermission(this, Manifest.permission.NEARBY_WIFI_DEVICES)
+                != PackageManager.PERMISSION_GRANTED
+        ) {
+            @Suppress("NewApi")
+            requestPermission.launch(Manifest.permission.NEARBY_WIFI_DEVICES)
         }
     }
 }
@@ -74,6 +82,10 @@ private fun SettingsScreen() {
     var notifyIdle     by remember { mutableStateOf(settings.getBoolean(CodelightService.KEY_NOTIFY_ON_IDLE,    false)) }
     var notifyWaiting  by remember { mutableStateOf(settings.getBoolean(CodelightService.KEY_NOTIFY_ON_WAITING, false)) }
     var notifyDelay    by remember { mutableStateOf(settings.getInt(CodelightService.KEY_NOTIFY_DELAY_SECS, 30).toString()) }
+    var allowedSsids   by remember { mutableStateOf(
+        (settings.getStringSet(CodelightService.KEY_ALLOWED_SSIDS, emptySet()) ?: emptySet())
+            .sorted().joinToString(", ")
+    ) }
     var showPw         by remember { mutableStateOf(false) }
 
     var connected     by remember { mutableStateOf(state.getBoolean(CodelightService.KEY_CONNECTED, false)) }
@@ -100,6 +112,7 @@ private fun SettingsScreen() {
 
     fun save() {
         val port = portStr.toIntOrNull() ?: 0
+        val ssids = allowedSsids.split(",").map { it.trim() }.filter { it.isNotBlank() }.toSet()
         settings.edit()
             .putString(CodelightService.KEY_SECRET,           secret.trim())
             .putString(CodelightService.KEY_HOST,             host.trim())
@@ -107,6 +120,7 @@ private fun SettingsScreen() {
             .putBoolean(CodelightService.KEY_NOTIFY_ON_IDLE,    notifyIdle)
             .putBoolean(CodelightService.KEY_NOTIFY_ON_WAITING, notifyWaiting)
             .putInt(CodelightService.KEY_NOTIFY_DELAY_SECS,     notifyDelay.toIntOrNull() ?: 30)
+            .putStringSet(CodelightService.KEY_ALLOWED_SSIDS,   ssids)
             .apply {
                 if (selectedName != null) putString(CodelightService.KEY_SELECTED_NAME, selectedName)
                 else remove(CodelightService.KEY_SELECTED_NAME)
@@ -272,6 +286,29 @@ private fun SettingsScreen() {
                 )
                 Text("Useful if you're at the computer and about to type.",
                      style = TextStyle(color = muted, fontSize = 10.sp))
+            }
+
+            // ── Wi-Fi SSID filter ─────────────────────────────────────────────
+            SettingsCard(card, muted, label = "Wi-Fi SSID filter") {
+                Text(
+                    "Service stops automatically when connected to a Wi-Fi network not in this list. " +
+                    "Leave empty to run on any network.",
+                    style = TextStyle(color = muted, fontSize = 11.sp),
+                )
+                Spacer(Modifier.height(4.dp))
+                OutlinedTextField(
+                    value         = allowedSsids,
+                    onValueChange = { allowedSsids = it },
+                    placeholder   = { Text("HomeWiFi, OfficeWiFi", color = muted, fontSize = 13.sp) },
+                    singleLine    = false,
+                    label         = { Text("Allowed SSIDs (comma-separated)", color = muted, fontSize = 11.sp) },
+                    colors        = fieldColors(accent, muted, text),
+                    modifier      = Modifier.fillMaxWidth(),
+                )
+                Text(
+                    "Requires 'Nearby devices' permission on Android 12+.",
+                    style = TextStyle(color = muted, fontSize = 10.sp),
+                )
             }
 
             // ── Buttons ───────────────────────────────────────────────────────

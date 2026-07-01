@@ -10,6 +10,7 @@ Usage:
 """
 import argparse
 import asyncio
+import collections
 import json
 import os
 import shutil
@@ -33,6 +34,15 @@ try:
     _have_zeroconf = True
 except ImportError:
     _have_zeroconf = False
+
+try:
+    from dbus_fast.aio import MessageBus as _DbusMessageBus
+    from dbus_fast.service import ServiceInterface as _DbusServiceInterface
+    from dbus_fast.service import signal as _dbus_signal, method as _dbus_method
+    from dbus_fast import BusType as _DbusBusType
+    _have_dbus = True
+except ImportError:
+    _have_dbus = False
 
 # ── Config ────────────────────────────────────────────────────────────────────
 
@@ -58,12 +68,33 @@ _usage_cache: dict = {
 _ws_loop:    asyncio.AbstractEventLoop | None = None
 _ws_clients: set = set()
 _last_ws_status: str = "inactive"   # updated by _broadcast; watched by timeout-watchdog
+_dbus_iface: object | None = None   # CodelightDbusInterface instance when D-Bus is available
+
+_log_lines:       collections.deque = collections.deque(maxlen=10)
+_last_payload:    dict | None = None
+_render_lock:     threading.Lock = threading.Lock()
+_dashboard_ready: bool = False   # True after the first full-screen clear
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
 def vprint(*args, **kwargs):
     if _verbose:
-        print(*args, **kwargs, flush=True)
+        if sys.stdout.isatty():
+            _log(" ".join(str(a) for a in args))
+        else:
+            print(*args, **kwargs, flush=True)
+
+
+def _log(msg: str) -> None:
+    """Append a timestamped line to the rolling activity log.
+    In TTY mode the dashboard redraws immediately; in pipe mode it prints directly."""
+    ts = datetime.now().strftime("%H:%M:%S")
+    _log_lines.append(f"[{ts}] {msg}")
+    if sys.stdout.isatty() and _last_payload is not None:
+        with _render_lock:
+            _render_dashboard(_last_payload)
+    elif not sys.stdout.isatty():
+        print(f"[{ts}] {msg}", flush=True)
 
 
 def _format_countdown(diff_secs: int) -> str:
@@ -103,10 +134,10 @@ def _get_local_ip() -> str:
 
 
 def _broadcast(payload: dict) -> None:
-    """Thread-safe push of a payload to all connected WebSocket clients."""
+    """Thread-safe push to all WebSocket clients and the D-Bus signal."""
     global _last_ws_status
     _last_ws_status = payload.get("status", _last_ws_status)
-    if _ws_loop is None or not _ws_clients:
+    if _ws_loop is None:
         return
     msg = json.dumps(payload)
 
@@ -116,6 +147,11 @@ def _broadcast(payload: dict) -> None:
                 *[c.send(msg) for c in list(_ws_clients)],
                 return_exceptions=True,
             )
+        if _dbus_iface is not None:
+            try:
+                _dbus_iface.StatusChanged(msg)  # type: ignore[union-attr]
+            except Exception:
+                pass
 
     asyncio.run_coroutine_threadsafe(_send_all(), _ws_loop)
 
@@ -150,6 +186,24 @@ def _overall_status() -> tuple[int, str]:
             elif info["state"] == "waiting" and overall != "working":
                 overall = "waiting"
     return active, overall
+
+# ── D-Bus interface ───────────────────────────────────────────────────────────
+
+if _have_dbus:
+    class CodelightDbusInterface(_DbusServiceInterface):  # type: ignore[misc]
+        def __init__(self):
+            super().__init__('se.henrikekblad.codelight')
+
+        @_dbus_signal()
+        def StatusChanged(self) -> 's':  # type: ignore[return]
+            pass
+
+        @_dbus_method()
+        def GetStatus(self) -> 's':  # type: ignore[return]
+            sessions, status = _overall_status()
+            with _lock:
+                usage = dict(_usage_cache)
+            return json.dumps({**usage, 'sessions': sessions, 'status': status})
 
 # ── Hook installation ─────────────────────────────────────────────────────────
 
@@ -346,43 +400,81 @@ def get_usage() -> dict | None:
 
 # ── Payload helpers ───────────────────────────────────────────────────────────
 
+_STATUS_COLOR = {
+    "working":  "\033[33m",   # orange
+    "waiting":  "\033[31m",   # red
+    "inactive": "\033[32m",   # green
+}
+_RESET = "\033[0m"
+_BOLD  = "\033[1m"
+_DIM   = "\033[2m"
+_BAR_W = 28
+
+
+def _render_dashboard(payload: dict) -> None:
+    """Write the top-like dashboard to stdout (caller holds _render_lock)."""
+    global _dashboard_ready
+    status  = payload["status"]
+    color   = _STATUS_COLOR.get(status, "")
+    ts      = datetime.now().strftime("%H:%M:%S")
+
+    def bar(pct: float) -> str:
+        filled = round(max(0.0, min(1.0, pct)) * _BAR_W)
+        return "█" * filled + "░" * (_BAR_W - filled)
+
+    ws_count = len(_ws_clients)
+    parts: list[str] = []
+    if ws_count:
+        parts.append(f"{ws_count} WebSocket{'s' if ws_count != 1 else ''}")
+    if _dbus_iface is not None:
+        parts.append("D-Bus")
+    clients_str = "  ".join(parts) if parts else "none"
+
+    sessions = payload["sessions"]
+    lines = [
+        f"{_BOLD}CODELIGHT{_RESET}",
+        f"  Updated:  {ts}",
+        f"  Clients:  {clients_str}",
+        "",
+        f"  {color}● {status.upper()}{_RESET}  "
+        f"{_DIM}({sessions} session{'s' if sessions != 1 else ''}){_RESET}",
+        "",
+        f"  Weekly   {bar(payload['weekly_pct'])} {payload['weekly_pct']:>4.0%}"
+        f"  {_DIM}resets {payload['weekly_reset']}{_RESET}",
+        f"  Session  {bar(payload['session_pct'])} {payload['session_pct']:>4.0%}"
+        f"  {_DIM}resets {payload['session_reset']}{_RESET}",
+        "",
+        f"  {_DIM}Recent activity{_RESET}",
+    ] + [f"  {ln}" for ln in _log_lines]
+
+    # First render: clear the whole screen (removes startup messages).
+    # Subsequent renders: move to top-left and overwrite in-place.
+    # Append \033[K (erase to EOL) to every line so leftover characters
+    # from a previous longer line don't bleed through on the right.
+    prefix = "\033[2J\033[H" if not _dashboard_ready else "\033[H"
+    _dashboard_ready = True
+    cleared = [ln + "\033[K" for ln in lines]
+    sys.stdout.write(prefix + "\n".join(cleared) + "\033[J")
+    sys.stdout.flush()
+
+
 def print_payload(payload: dict) -> None:
-    """Pretty-print the payload that would be broadcast to clients."""
-    ts = datetime.now().strftime("%H:%M:%S")
-    status = payload["status"]
-    status_colors = {"working": "\033[33m", "waiting": "\033[31m", "inactive": "\033[32m"}
-    color = status_colors.get(status, "")
-    reset = "\033[0m" if color else ""
-
-    bar_w = 30
-    def bar(pct):
-        filled = round(pct * bar_w)
-        return "[" + "█" * filled + "░" * (bar_w - filled) + f"] {pct:.0%}"
-
-    print(f"\n[{ts}] DRY RUN")
-    print(f"  Weekly:   {bar(payload['weekly_pct'])}  resets {payload['weekly_reset']}")
-    print(f"  Session:  {bar(payload['session_pct'])}  resets {payload['session_reset']}")
-    print(f"  Sessions: {payload['sessions']}")
-    print(f"  Status:   {color}{status.upper()}{reset}", flush=True)
+    """Update the live dashboard (TTY). In non-TTY mode just tracks state for _log()."""
+    global _last_payload
+    _last_payload = payload
+    if sys.stdout.isatty():
+        with _render_lock:
+            _render_dashboard(payload)
 
 
-def _push(dry_run: bool) -> None:
-    """Build payload from current state and broadcast to all WebSocket clients."""
+def _push() -> None:
+    """Build payload from current state and broadcast to all clients."""
     sessions, status = _overall_status()
     with _lock:
         usage = dict(_usage_cache)
     payload = {**usage, "sessions": sessions, "status": status}
-
-    if dry_run:
-        print_payload(payload)
-        return
-
     _broadcast(payload)
-    ts = datetime.now().strftime("%H:%M:%S")
-    print(f"[{ts}] status={status} sessions={sessions} "
-          f"weekly={usage['weekly_pct']:.0%} "
-          f"session={usage['session_pct']:.0%}  "
-          f"→ {len(_ws_clients)} client(s)", flush=True)
+    print_payload(payload)
 
 # ── Daemon threads ────────────────────────────────────────────────────────────
 
@@ -400,7 +492,7 @@ def _ws_thread(port: int, secret: str) -> None:
             try:
                 msg = await asyncio.wait_for(ws.recv(), timeout=5.0)
                 if json.loads(msg).get("auth") != secret:
-                    print(f"[ws] auth failed from {ws.remote_address}", flush=True)
+                    _log(f"[ws] auth failed from {ws.remote_address}")
                     try:
                         await ws.send(json.dumps({"error": "unauthorized", "message": "Wrong password"}))
                     except Exception:
@@ -408,7 +500,7 @@ def _ws_thread(port: int, secret: str) -> None:
                     await ws.close(1008, "Unauthorized")
                     return
             except Exception:
-                print(f"[ws] auth error from {ws.remote_address}", flush=True)
+                _log(f"[ws] auth error from {ws.remote_address}")
                 try:
                     await ws.send(json.dumps({"error": "unauthorized", "message": "Wrong password"}))
                 except Exception:
@@ -417,7 +509,7 @@ def _ws_thread(port: int, secret: str) -> None:
                 return
 
         _ws_clients.add(ws)
-        vprint(f"[ws] client connected ({len(_ws_clients)} total)")
+        _log(f"[ws] client connected ({len(_ws_clients)} total)")
         try:
             # Push timezone offset so the screen can configure NTP correctly
             utc_offset = int(datetime.now().astimezone().utcoffset().total_seconds())
@@ -434,15 +526,27 @@ def _ws_thread(port: int, secret: str) -> None:
                 pass  # connection reset without close frame — normal on app restart
         finally:
             _ws_clients.discard(ws)
-            vprint(f"[ws] client disconnected ({len(_ws_clients)} remaining)")
+            _log(f"[ws] client disconnected ({len(_ws_clients)} remaining)")
 
     async def serve() -> None:
-        global _last_ws_status
+        global _last_ws_status, _dbus_iface
+
+        if _have_dbus:
+            try:
+                dbus_bus = await _DbusMessageBus(bus_type=_DbusBusType.SESSION).connect()
+                iface = CodelightDbusInterface()  # type: ignore[name-defined]
+                dbus_bus.export('/se/henrikekblad/codelight', iface)
+                await dbus_bus.request_name('se.henrikekblad.codelight')
+                _dbus_iface = iface
+                _log("[dbus] service exported")
+            except Exception as e:
+                print(f"[dbus] setup failed: {e}", file=sys.stderr, flush=True)
+
         async with _websockets.serve(handler, "0.0.0.0", port):
             vprint(f"[ws] listening on :{port}")
             while not _shutdown.is_set():
                 await asyncio.sleep(2)
-                if not _ws_clients:
+                if not _ws_clients and _dbus_iface is None:
                     continue
                 # Detect status changes caused by session timeouts (no hook fires for those).
                 sessions, current_status = _overall_status()
@@ -451,11 +555,19 @@ def _ws_thread(port: int, secret: str) -> None:
                     with _lock:
                         usage = dict(_usage_cache)
                     payload = {**usage, "sessions": sessions, "status": current_status}
-                    vprint(f"[ws] timeout push → {current_status}")
-                    await asyncio.gather(
-                        *[c.send(json.dumps(payload)) for c in list(_ws_clients)],
-                        return_exceptions=True,
-                    )
+                    msg = json.dumps(payload)
+                    print_payload(payload)  # update dashboard status immediately
+                    _log(f"[ws] timeout → {current_status}")
+                    if _ws_clients:
+                        await asyncio.gather(
+                            *[c.send(msg) for c in list(_ws_clients)],
+                            return_exceptions=True,
+                        )
+                    if _dbus_iface is not None:
+                        try:
+                            _dbus_iface.StatusChanged(msg)  # type: ignore[union-attr]
+                        except Exception:
+                            pass
 
     _ws_loop = asyncio.new_event_loop()
     asyncio.set_event_loop(_ws_loop)
@@ -479,11 +591,14 @@ def _mdns_thread(port: int, name: str) -> None:
     zc: Zeroconf | None = None
     current_ip: str | None = None
     info = None
-    try:
-        while not _shutdown.is_set():
-            ip = _get_local_ip()
-            if ip != current_ip:
-                # Tear down old instance before rebinding to the new interface
+    while not _shutdown.is_set():
+        ip = _get_local_ip()
+
+        # Skip loopback — no network yet (e.g. just woke from sleep).
+        # Retry quickly so we pick up the real IP as soon as it's available.
+        if ip.startswith("127."):
+            if current_ip is not None:
+                # Network just went away — tear down so we re-register when it returns
                 if info is not None and zc is not None:
                     try:
                         zc.unregister_service(info)
@@ -494,32 +609,67 @@ def _mdns_thread(port: int, name: str) -> None:
                         zc.close()
                     except Exception:
                         pass
-                current_ip = ip
+                zc = None
+                info = None
+                current_ip = None
+                _log("[mdns] network lost, waiting for reconnect…")
+            _shutdown.wait(5)
+            continue
+
+        if ip != current_ip:
+            # Tear down old instance before rebinding to the new interface
+            if info is not None and zc is not None:
+                try:
+                    zc.unregister_service(info)
+                except Exception:
+                    pass
+            if zc is not None:
+                try:
+                    zc.close()
+                except Exception:
+                    pass
+            zc = None
+            info = None
+            try:
                 # Bind to the specific IPv4 interface so the mDNS response stays
                 # small — the ESP8266 UDP buffer drops oversized multi-interface packets
-                zc = Zeroconf(interfaces=[current_ip])
+                zc = Zeroconf(interfaces=[ip])
                 info = ServiceInfo(
                     "_codelight._tcp.local.",
                     f"{name}._codelight._tcp.local.",
-                    addresses=[socket.inet_aton(current_ip)],
+                    addresses=[socket.inet_aton(ip)],
                     port=port,
                     properties={},
                 )
                 zc.register_service(info)
-                print(f"[mdns] advertising {name}._codelight._tcp on {ip}:{port}", flush=True)
-            _shutdown.wait(30)   # re-check IP every 30 s
-    finally:
-        if info is not None and zc is not None:
-            try:
-                zc.unregister_service(info)
-            except Exception:
-                pass
-        if zc is not None:
-            zc.close()
-        vprint("[mdns] stopped")
+                current_ip = ip
+                _log(f"[mdns] advertising on {ip}:{port}")
+            except Exception as e:
+                _log(f"[mdns] registration failed: {e}")
+                if zc is not None:
+                    try:
+                        zc.close()
+                    except Exception:
+                        pass
+                zc = None
+                info = None
+                # Don't update current_ip — forces a retry next iteration
+                _shutdown.wait(5)
+                continue
+
+        _shutdown.wait(10)   # re-check IP every 10 s
+
+    if info is not None and zc is not None:
+        try:
+            zc.unregister_service(info)
+        except Exception:
+            pass
+    if zc is not None:
+        zc.close()
+    vprint("[mdns] stopped")
 
 
-def _socket_thread(dry_run: bool) -> None:
+def _socket_thread() -> None:
     """Accept hook events on the Unix socket and broadcast to clients immediately."""
     try:
         os.unlink(SOCKET_PATH)
@@ -547,7 +697,7 @@ def _socket_thread(dry_run: bool) -> None:
                 if state:
                     _update_session(sid, state)
                     vprint(f"[socket] {sid[:8]}… → {state}")
-                    _push(dry_run)
+                    _push()
             except Exception as e:
                 vprint(f"[socket] error: {e}")
             finally:
@@ -560,11 +710,10 @@ def _socket_thread(dry_run: bool) -> None:
             pass
 
 
-def _usage_thread(dry_run: bool) -> None:
+def _usage_thread() -> None:
     """Poll the usage API every USAGE_INTERVAL seconds and broadcast after each update."""
     while not _shutdown.is_set():
-        ts = datetime.now().strftime("%H:%M:%S")
-        print(f"[{ts}] [usage] polling…", flush=True)
+        _log("[usage] polling…")
         try:
             fresh = get_usage()
         except Exception as e:
@@ -574,12 +723,11 @@ def _usage_thread(dry_run: bool) -> None:
         if fresh is not None:
             with _lock:
                 _usage_cache.update(fresh)
+            _log(f"[usage] session={fresh['session_pct']:.0%}  weekly={fresh['weekly_pct']:.0%}")
         else:
-            print("[usage] no data – keeping cached values", flush=True)
+            _log("[usage] no data – keeping cached values")
 
-        _push(dry_run)
-        ts = datetime.now().strftime("%H:%M:%S")
-        print(f"[{ts}] [usage] next poll in {USAGE_INTERVAL}s…", flush=True)
+        _push()
         _shutdown.wait(USAGE_INTERVAL)
 
 # ── Uninstall ─────────────────────────────────────────────────────────────────
@@ -651,10 +799,8 @@ def main():
     parser.add_argument("--hook", metavar="STATE",
                         help="Hook mode: send STATE event to daemon and exit. "
                              "Used internally by Claude Code hooks (working/waiting/ended).")
-    parser.add_argument("--dry-run", "-n", action="store_true",
-                        help="Print payload instead of broadcasting to clients")
     parser.add_argument("--verbose", "-v", action="store_true",
-                        help="Show socket events and usage API responses")
+                        help="Show low-level debug events (socket, API) in activity log")
     parser.add_argument("--ws-port", type=int, default=8765,
                         help="WebSocket port for clients (default: 8765)")
     parser.add_argument("--name", default=None,
@@ -679,20 +825,10 @@ def main():
 
     install_hooks(os.path.abspath(__file__))
 
-    mode = "DRY RUN" if args.dry_run else f"ws://0.0.0.0:{args.ws_port}"
-    print(f"codelight  [{mode}]  (Ctrl-C to stop)", flush=True)
+    print(f"codelight  [ws://0.0.0.0:{args.ws_port}]  (Ctrl-C to stop)", flush=True)
 
-    threading.Thread(
-        target=_socket_thread,
-        args=(args.dry_run,),
-        daemon=True,
-    ).start()
-
-    threading.Thread(
-        target=_usage_thread,
-        args=(args.dry_run,),
-        daemon=True,
-    ).start()
+    threading.Thread(target=_socket_thread, daemon=True).start()
+    threading.Thread(target=_usage_thread,  daemon=True).start()
 
     threading.Thread(
         target=_ws_thread,

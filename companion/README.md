@@ -2,24 +2,27 @@
 
 The Python daemon `codelight.py` runs on your computer and pushes Claude Code
 status to all connected clients — the GeekMagic Ultra screen, Android widget,
-and GNOME extension — over a single WebSocket server.
+and GNOME extension.
+
+When run in a terminal it shows a live dashboard. When run as a systemd service
+it is silent (key events are logged to the journal via stdout).
 
 ## Dependencies
 
 **Arch Linux**
 ```bash
 sudo pacman -S python-websockets python-zeroconf
+pip install dbus-fast   # optional — enables GNOME extension support
 ```
 
 **Debian / Ubuntu**
 ```bash
 sudo apt install python3-websockets
-pip install zeroconf          # or: sudo apt install python3-zeroconf
+pip install zeroconf dbus-fast   # dbus-fast optional, for GNOME extension
 ```
 
-`websockets` powers the WebSocket server that all clients connect to.
-`zeroconf` advertises the daemon via mDNS so clients discover it automatically —
-both are required.
+`websockets` and `zeroconf` are required. `dbus-fast` is optional — install it
+to enable the D-Bus service that the GNOME extension subscribes to.
 
 ## Run
 
@@ -31,22 +34,19 @@ python3 companion/codelight.py --name henrik-laptop
 this daemon on the network. Use something unique per machine (e.g.
 `henrik-laptop`, `alice-workstation`).
 
-**With a shared secret** (recommended in shared networks):
+**With a shared secret** (recommended on shared networks):
 ```bash
 python3 companion/codelight.py --name henrik-laptop --secret mypassword
 ```
 
 Set the same secret in the screen's config page and in the Android app.
-
-**Dry run** — print payload to terminal, no broadcast:
-```bash
-python3 companion/codelight.py --name henrik-laptop --dry-run
-```
+The GNOME extension uses D-Bus (session bus) and does not need a secret.
 
 On first run the script automatically installs Claude Code hooks in
 `~/.claude/settings.json` so it can track working/waiting state in real time.
 
-Use `--verbose` to see raw socket events and usage API responses.
+Use `--verbose` (`-v`) to add low-level debug events (per-hook socket events,
+raw API responses) to the activity log.
 
 ## Run as a systemd user service
 
@@ -121,6 +121,9 @@ sudo firewall-cmd --add-port=5353/udp --permanent
 sudo firewall-cmd --reload
 ```
 
+The GNOME extension communicates via D-Bus (session bus) — no firewall rules
+needed for that.
+
 ## Uninstalling
 
 1. Stop the daemon (Ctrl-C, or `systemctl --user disable --now codelight`).
@@ -141,9 +144,9 @@ Claude Code               codelight.py (daemon)
 ───────────────           ─────────────────────
                           Unix socket thread
 hooks fire on  ────────►  receives event         broadcast
-tool use /      --hook    updates state          ────────►  GeekMagic Ultra (WS client)
-messages        mode                             ────────►  Android widget  (WS client)
-                                                 ────────►  GNOME extension (WS client)
+tool use /      --hook    updates state          ────────►  GeekMagic Ultra (WebSocket)
+messages        mode                             ────────►  Android widget  (WebSocket)
+                                                 ────────►  GNOME extension (D-Bus signal)
                           Usage poller thread
                           fetches claude.ai API   push on
                           every 60 s              each poll
@@ -152,8 +155,8 @@ messages        mode                             ────────►  An
                           clients connect in ◄───  screen discovers daemon via mDNS
                                              ◄───  Android discovers daemon via mDNS
 
-                          mDNS advertisement
-                          _codelight._tcp
+                          D-Bus service (session bus)
+                          se.henrikekblad.codelight ◄─── GNOME extension auto-discovers
 ```
 
 Status updates reach clients the moment a Claude Code hook fires — there is no
@@ -173,9 +176,9 @@ python3 codelight.py --hook working
 with session metadata on stdin. The hook mode connects to a Unix socket at
 `~/.claude/codelight.sock`, sends a one-line JSON event, and exits in ~1 ms.
 The daemon's socket thread receives the event, updates its in-memory session
-state, and immediately broadcasts to all connected WebSocket clients. If the
-daemon is not running the hook falls back to writing a state file so no errors
-appear in the terminal.
+state, and immediately broadcasts to all connected clients. If the daemon is not
+running the hook falls back to writing a state file so no errors appear in the
+terminal.
 
 ### Usage data — claude.ai API
 

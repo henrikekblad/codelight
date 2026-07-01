@@ -1,13 +1,26 @@
 import GLib from 'gi://GLib';
+import Gio from 'gi://Gio';
 import St from 'gi://St';
 import Clutter from 'gi://Clutter';
-import Soup from 'gi://Soup';
 import * as Main from 'resource:///org/gnome/shell/ui/main.js';
 import * as PanelMenu from 'resource:///org/gnome/shell/ui/panelMenu.js';
 import * as PopupMenu from 'resource:///org/gnome/shell/ui/popupMenu.js';
 import {Extension} from 'resource:///org/gnome/shell/extensions/extension.js';
 
-const RECONNECT_DELAY_S = 5;
+const DBUS_NAME  = 'se.henrikekblad.codelight';
+const DBUS_PATH  = '/se/henrikekblad/codelight';
+const DBUS_IFACE = 'se.henrikekblad.codelight';
+
+const IFACE_XML = `<node>
+  <interface name="se.henrikekblad.codelight">
+    <signal name="StatusChanged">
+      <arg type="s" name="status_json"/>
+    </signal>
+    <method name="GetStatus">
+      <arg direction="out" type="s"/>
+    </method>
+  </interface>
+</node>`;
 
 // Colors matching Android widget / ESP8266 screen
 const C = {
@@ -116,12 +129,10 @@ function makeMeterItem(label) {
 
 export default class CodelightExtension extends Extension {
     enable() {
-        this._settings        = this.getSettings();
-        this._ws              = null;
-        this._authFailed      = false;
-        this._reconnectTimer  = null;
-        this._session         = new Soup.Session();
-        this._indicator       = new PanelMenu.Button(0.0, 'Codelight', false);
+        this._proxy    = null;
+        this._signalId = null;
+        this._watchId  = null;
+        this._indicator = new PanelMenu.Button(0.0, 'Codelight', false);
 
         // ── Panel button ────────────────────────────────────────────────────
         const panelBox    = new St.BoxLayout({ style_class: 'panel-status-menu-box' });
@@ -160,105 +171,55 @@ export default class CodelightExtension extends Extension {
         this._indicator.menu.addMenuItem(this._weeklyItem);
         this._indicator.menu.addMenuItem(this._sessionItem);
 
-        // Settings link
-        this._indicator.menu.addMenuItem(new PopupMenu.PopupSeparatorMenuItem());
-        const prefsItem = new PopupMenu.PopupMenuItem('Settings…');
-        prefsItem.connect('activate', () => this.openPreferences());
-        this._indicator.menu.addMenuItem(prefsItem);
-
         Main.panel.addToStatusArea(this.uuid, this._indicator);
 
-        this._settingsChangedId = this._settings.connect('changed', () => {
-            this._authFailed = false;
-            this._disconnect();
-            this._scheduleReconnect(0);
-        });
-
         this._setOffline();
-        this._connect();
-    }
 
-    _connect() {
-        if (this._authFailed)
-            return;
-
-        const host   = this._settings.get_string('host');
-        const port   = this._settings.get_int('port');
-        const secret = this._settings.get_string('secret');
-
-        let message;
-        try {
-            message = Soup.Message.new('GET', `ws://${host}:${port}`);
-        } catch (_) {
-            this._scheduleReconnect();
-            return;
-        }
-
-        this._session.websocket_connect_async(
-            message, null, null, GLib.PRIORITY_DEFAULT, null,
-            (session, result) => {
-                if (!this._session) return;
-                let ws;
-                try {
-                    ws = session.websocket_connect_finish(result);
-                } catch (_) {
-                    this._scheduleReconnect();
-                    return;
-                }
-
-                this._ws = ws;
-
-                if (secret)
-                    ws.send_text(JSON.stringify({auth: secret}));
-
-                ws.connect('message', (_ws, _type, bytes) => {
-                    try {
-                        const text = new TextDecoder().decode(bytes.get_data());
-                        const data = JSON.parse(text);
-                        if (data?.error === 'unauthorized') {
-                            this._markAuthFailed();
-                            return;
-                        }
-                        if (data?.type === 'config') return;
-                        this._handleMessage(data);
-                    } catch (_) {}
-                });
-
-                ws.connect('closed', () => {
-                    const code = ws.get_close_code();
-                    this._ws = null;
-                    if (code === 1008) {
-                        this._markAuthFailed();
-                        return;
-                    }
-                    if (!this._authFailed) {
-                        this._setOffline();
-                        this._scheduleReconnect();
-                    }
-                });
-
-                ws.connect('error', () => {
-                    this._ws = null;
-                    if (!this._authFailed) {
-                        this._setOffline();
-                        this._scheduleReconnect();
-                    }
-                });
-            }
+        this._watchId = Gio.bus_watch_name(
+            Gio.BusType.SESSION,
+            DBUS_NAME,
+            Gio.BusNameWatcherFlags.NONE,
+            () => this._onDaemonAppeared(),
+            () => this._onDaemonVanished()
         );
     }
 
-    _markAuthFailed() {
-        if (this._authFailed)
-            return;
-
-        this._authFailed = true;
-        this._setAuthFailed();
-        if (this._ws) {
-            this._ws.close(1000, null);
-            this._ws = null;
+    _onDaemonAppeared() {
+        try {
+            const nodeInfo = Gio.DBusNodeInfo.new_for_xml(IFACE_XML);
+            this._proxy = Gio.DBusProxy.new_for_bus_sync(
+                Gio.BusType.SESSION,
+                Gio.DBusProxyFlags.NONE,
+                nodeInfo.interfaces[0],
+                DBUS_NAME, DBUS_PATH, DBUS_IFACE,
+                null
+            );
+            this._signalId = this._proxy.connectSignal('StatusChanged', (_proxy, _sender, [json]) => {
+                try {
+                    const data = JSON.parse(json);
+                    if (data?.type === 'config') return;
+                    this._handleMessage(data);
+                } catch (_) {}
+            });
+            // Fetch current state immediately so the panel isn't blank on connect
+            try {
+                const result = this._proxy.call_sync('GetStatus', null, Gio.DBusCallFlags.NONE, -1, null);
+                const [json] = result.deepUnpack();
+                const data = JSON.parse(json);
+                if (data?.type !== 'config') this._handleMessage(data);
+            } catch (_) {}
+        } catch (e) {
+            logError(e, 'codelight D-Bus connect failed');
         }
-        Main.notify('codelight', 'Wrong password. Open Settings to fix.');
+    }
+
+    _onDaemonVanished() {
+        if (this._signalId !== null && this._proxy !== null) {
+            this._proxy.disconnectSignal(this._signalId);
+            this._signalId = null;
+        }
+        this._proxy = null;
+        this._setOffline();
     }
 
     _handleMessage(data) {
@@ -303,51 +264,16 @@ export default class CodelightExtension extends Extension {
         this._setMeter(this._sessionItem, null, null);
     }
 
-    _setAuthFailed() {
-        const hex = toHex(C.waiting);
-        this._panelDot.set_style(`color: ${hex};`);
-        this._panelDot.set_text('● ');
-        this._panelStatus.set_text('AUTH FAIL');
-        this._hdrDot.set_style(`color: ${hex};`);
-        this._hdrDot.set_text('●');
-        this._hdrStatus.set_text('AUTH FAIL');
-        this._hdrSessions.set_text('wrong password');
-        this._setMeter(this._weeklyItem,  null, null);
-        this._setMeter(this._sessionItem, null, null);
-    }
-
-    _disconnect() {
-        if (this._reconnectTimer !== null) {
-            GLib.source_remove(this._reconnectTimer);
-            this._reconnectTimer = null;
-        }
-        if (this._ws) {
-            this._ws.close(1000, null);
-            this._ws = null;
-        }
-        this._setOffline();
-    }
-
-    _scheduleReconnect(delay = RECONNECT_DELAY_S) {
-        if (this._reconnectTimer !== null) return;
-        this._reconnectTimer = GLib.timeout_add_seconds(
-            GLib.PRIORITY_DEFAULT, delay, () => {
-                this._reconnectTimer = null;
-                this._connect();
-                return GLib.SOURCE_REMOVE;
-            }
-        );
-    }
-
     disable() {
-        if (this._settingsChangedId) {
-            this._settings.disconnect(this._settingsChangedId);
-            this._settingsChangedId = null;
+        if (this._watchId !== null) {
+            Gio.bus_unwatch_name(this._watchId);
+            this._watchId = null;
         }
-        this._disconnect();
-        this._session?.abort();
-        this._session  = null;
-        this._settings = null;
+        if (this._signalId !== null && this._proxy !== null) {
+            this._proxy.disconnectSignal(this._signalId);
+            this._signalId = null;
+        }
+        this._proxy = null;
         this._indicator?.destroy();
         this._indicator = null;
     }

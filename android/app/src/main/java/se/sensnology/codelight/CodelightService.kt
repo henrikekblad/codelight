@@ -6,6 +6,8 @@ import android.app.PendingIntent
 import android.content.Intent
 import android.net.ConnectivityManager
 import android.net.Network
+import android.net.NetworkCapabilities
+import android.net.wifi.WifiInfo
 import android.net.nsd.NsdManager
 import android.net.nsd.NsdServiceInfo
 import androidx.core.app.NotificationCompat
@@ -50,9 +52,10 @@ class CodelightService : LifecycleService() {
         const val KEY_PORT           = "port"
         const val KEY_SELECTED_NAME    = "selected_name"
         const val KEY_DISCOVERED       = "discovered"   // JSON array of {name,host,port}
-        const val KEY_NOTIFY_ON_IDLE   = "notify_idle"
+        const val KEY_NOTIFY_ON_IDLE    = "notify_idle"
         const val KEY_NOTIFY_ON_WAITING = "notify_waiting"
         const val KEY_NOTIFY_DELAY_SECS = "notify_delay"
+        const val KEY_ALLOWED_SSIDS     = "allowed_ssids"
 
         private const val ALERT_NOTIF_ID    = 2
         private const val ALERT_CHANNEL_ID  = "codelight_alerts"
@@ -382,6 +385,12 @@ class CodelightService : LifecycleService() {
         }
     }
 
+    private fun isSsidAllowed(ssid: String): Boolean {
+        val allowed = getSharedPreferences(SETTINGS_PREFS, MODE_PRIVATE)
+            .getStringSet(KEY_ALLOWED_SSIDS, emptySet()) ?: emptySet()
+        return allowed.isEmpty() || ssid in allowed
+    }
+
     private fun registerNetworkCallback() {
         val cb = object : ConnectivityManager.NetworkCallback() {
             override fun onAvailable(network: Network) {
@@ -393,6 +402,20 @@ class CodelightService : LifecycleService() {
                     scheduleReconnect()
                 }
             }
+
+            @Suppress("NewApi")
+            override fun onCapabilitiesChanged(network: Network, capabilities: NetworkCapabilities) {
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S &&
+                    capabilities.hasTransport(NetworkCapabilities.TRANSPORT_WIFI)) {
+                    val wifiInfo = capabilities.transportInfo as? WifiInfo
+                    val ssid = wifiInfo?.ssid?.removeSurrounding("\"")
+                    if (!ssid.isNullOrBlank() && ssid != "<unknown ssid>" && !isSsidAllowed(ssid)) {
+                        Log.i("Codelight", "SSID '$ssid' not in allowlist — stopping service")
+                        stopSelf()
+                    }
+                }
+            }
+
             override fun onLost(network: Network) {
                 // Primary network lost — drop socket immediately so the reconnect
                 // timer starts now rather than waiting for the ping timeout.
