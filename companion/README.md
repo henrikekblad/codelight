@@ -11,8 +11,7 @@ it is silent (key events are logged to the journal via stdout).
 
 **Arch Linux**
 ```bash
-sudo pacman -S python-websockets python-zeroconf
-pip install dbus-fast   # optional — enables GNOME extension support
+sudo pacman -S python-websockets python-zeroconf python-dbus-fast  # python-dbus-fast optional: GNOME extension
 ```
 
 **Debian / Ubuntu**
