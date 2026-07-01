@@ -817,14 +817,16 @@ def install_service(name: str, secret: str, ws_port: int, verbose: bool) -> None
     unit = f"""\
 [Unit]
 Description=Claude Code status monitor
+PartOf=graphical-session.target
+After=graphical-session.target
 
 [Service]
 ExecStart={python_path} -u {script_path} {args_line}
-Restart=always
-RestartSec=15
+Restart=on-failure
+RestartSec=5
 
 [Install]
-WantedBy=default.target
+WantedBy=graphical-session.target
 """
 
     service_dir = os.path.expanduser("~/.config/systemd/user")

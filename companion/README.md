@@ -59,10 +59,7 @@ python3 companion/codelight.py --install --name henrik-laptop --secret mypasswor
 systemctl --user status codelight   # verify it's running
 ```
 
-To start at boot without being logged in:
-```bash
-sudo loginctl enable-linger $USER
-```
+The service is scoped to your graphical session — it starts automatically when you log into GNOME and stops cleanly on logout, which ensures it always connects to the correct D-Bus session bus.
 
 Useful commands:
 
