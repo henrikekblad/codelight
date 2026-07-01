@@ -16,8 +16,7 @@ sudo pacman -S python-websockets python-zeroconf python-dbus-fast  # python-dbus
 
 **Debian / Ubuntu**
 ```bash
-sudo apt install python3-websockets
-pip install zeroconf dbus-fast   # dbus-fast optional, for GNOME extension
+pip install websockets zeroconf dbus-fast  # dbus-fast optional: GNOME extension
 ```
 
 `websockets` and `zeroconf` are required. `dbus-fast` is optional — install it
