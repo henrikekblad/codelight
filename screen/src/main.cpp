@@ -43,7 +43,7 @@ static void applyStatus(uint8_t* payload, size_t length) {
     displayData.connected    = true;
     displayData.authFailed   = false;
 
-    const char* st = doc["status"] | "inactive";
+    const char* st = doc["status"] | "idle";
     if      (strcmp(st, "working") == 0) displayData.status = STATUS_WORKING;
     else if (strcmp(st, "waiting") == 0) displayData.status = STATUS_WAITING;
     else                                  displayData.status = STATUS_INACTIVE;

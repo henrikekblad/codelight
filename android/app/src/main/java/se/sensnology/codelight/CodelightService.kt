@@ -296,7 +296,7 @@ class CodelightService : LifecycleService() {
         val delaySecs     = prefs.getInt(KEY_NOTIFY_DELAY_SECS, 30).toLong()
 
         val shouldNotify = when (status) {
-            "inactive" -> notifyIdle
+            "idle" -> notifyIdle
             "waiting"  -> notifyWaiting
             else       -> false
         }
@@ -311,7 +311,7 @@ class CodelightService : LifecycleService() {
     private fun sendAlertNotification(status: String) {
         val text = when (status) {
             "waiting"  -> "Waiting for your input"
-            "inactive" -> "Session ended (IDLE)"
+            "idle" -> "Session ended (IDLE)"
             else       -> return
         }
         val pi = PendingIntent.getActivity(

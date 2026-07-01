@@ -26,7 +26,7 @@ const IFACE_XML = `<node>
 const C = {
     working:  [1.000, 0.549, 0.000],   // #FF8C00
     waiting:  [1.000, 0.133, 0.000],   // #FF2200
-    inactive: [0.000, 0.784, 0.000],   // #00C800
+    idle:     [0.000, 0.784, 0.000],   // #00C800
     offline:  [0.533, 0.533, 0.533],   // #888888
     barBg:    [0.267, 0.267, 0.267],   // #444444
 };
@@ -136,11 +136,7 @@ export default class CodelightExtension extends Extension {
 
         // ── Panel button ────────────────────────────────────────────────────
         const panelBox = new St.BoxLayout({ style_class: 'panel-status-menu-box' });
-        this._panelIcon = new St.Icon({
-            gicon: Gio.icon_new_for_string(this.path + '/icons/claude-symbolic.svg'),
-            icon_size: 16,
-            style_class: 'system-status-icon',
-        });
+        this._panelIcon = new St.Icon({ icon_size: 16, style_class: 'system-status-icon' });
         panelBox.add_child(this._panelIcon);
         this._indicator.add_child(panelBox);
 
@@ -231,7 +227,7 @@ export default class CodelightExtension extends Extension {
         const sessions = data?.sessions ?? 0;
         const label    = status.toUpperCase();
 
-        this._panelIcon.set_style(`color: ${hex};`);
+        this._panelIcon.gicon = Gio.icon_new_for_string(`${this.path}/icons/claude-${status}.svg`);
 
         this._hdrDot.set_style(`color: ${hex};`);
         this._hdrDot.set_text('●');
@@ -253,7 +249,7 @@ export default class CodelightExtension extends Extension {
 
     _setOffline() {
         const hex = toHex(C.offline);
-        this._panelIcon.set_style(`color: ${hex};`);
+        this._panelIcon.gicon = Gio.icon_new_for_string(`${this.path}/icons/claude-offline.svg`);
         this._hdrDot.set_style(`color: ${hex};`);
         this._hdrDot.set_text('●');
         this._hdrStatus.set_text('OFFLINE');

@@ -67,7 +67,7 @@ _usage_cache: dict = {
 
 _ws_loop:    asyncio.AbstractEventLoop | None = None
 _ws_clients: set = set()
-_last_ws_status: str = "inactive"   # updated by _broadcast; watched by timeout-watchdog
+_last_ws_status: str = "idle"   # updated by _broadcast; watched by timeout-watchdog
 _dbus_iface: object | None = None   # CodelightDbusInterface instance when D-Bus is available
 
 _log_lines:       collections.deque = collections.deque(maxlen=10)
@@ -171,7 +171,7 @@ def _overall_status() -> tuple[int, str]:
     Cleans up sessions that have been silent longer than IDLE_WINDOW."""
     now = time.time()
     active  = 0
-    overall = "inactive"
+    overall = "idle"
     with _lock:
         stale = [sid for sid, info in _sessions.items()
                  if now - info["time"] > (IDLE_WINDOW_WAITING
@@ -403,7 +403,7 @@ def get_usage() -> dict | None:
 _STATUS_COLOR = {
     "working":  "\033[33m",   # orange
     "waiting":  "\033[31m",   # red
-    "inactive": "\033[32m",   # green
+    "idle": "\033[32m",   # green
 }
 _RESET = "\033[0m"
 _BOLD  = "\033[1m"
@@ -839,6 +839,7 @@ WantedBy=graphical-session.target
 
     for cmd in [
         ["systemctl", "--user", "daemon-reload"],
+        ["systemctl", "--user", "disable", "codelight"],   # remove any stale symlink
         ["systemctl", "--user", "enable", "--now", "codelight"],
     ]:
         result = subprocess.run(cmd, capture_output=True, text=True)

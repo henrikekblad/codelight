@@ -46,7 +46,7 @@ class CodelightWidget : GlanceAppWidget() {
         val weeklyPct    = prefs.getFloat(CodelightService.KEY_WEEKLY_PCT, 0f)
         val sessionReset = prefs.getString(CodelightService.KEY_SESSION_RESET, "--") ?: "--"
         val weeklyReset  = prefs.getString(CodelightService.KEY_WEEKLY_RESET, "--") ?: "--"
-        val status       = prefs.getString(CodelightService.KEY_STATUS, "inactive") ?: "inactive"
+        val status       = prefs.getString(CodelightService.KEY_STATUS, "idle") ?: "idle"
         val connected    = prefs.getBoolean(CodelightService.KEY_CONNECTED, false)
         Log.d("Codelight", "WidgetContent render: connected=$connected status=$status session=${(sessionPct*100).toInt()}% weekly=${(weeklyPct*100).toInt()}%")
 
@@ -58,8 +58,7 @@ class CodelightWidget : GlanceAppWidget() {
         }
         val statusLabel = when {
             !connected          -> "OFF"
-            status == "inactive" -> "IDLE"
-            else                 -> status.uppercase()
+            else -> status.uppercase()
         }
         val statusTextColor = if (!connected) Color(0xFF555555) else Color.Black
 
