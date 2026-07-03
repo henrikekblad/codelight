@@ -83,6 +83,9 @@ jobs:
         run: |
           cp screen/.pio/build/geekmagic_ultra/firmware.bin \
              screen/.pio/build/geekmagic_ultra/codelight-${{ github.ref_name }}.bin
+          # gzipped variant for flashing from the GeekMagic stock firmware, whose
+          # flash layout leaves too little OTA staging space for the plain bin
+          gzip -9 -k screen/.pio/build/geekmagic_ultra/codelight-${{ github.ref_name }}.bin
 
       - name: Create GitHub release
         uses: softprops/action-gh-release@v2
@@ -95,6 +98,7 @@ jobs:
             | File | Description |
             |------|-------------|
             | `codelight-${{ github.ref_name }}.bin` | ESP8266 firmware for GeekMagic Ultra |
+            | `codelight-${{ github.ref_name }}.bin.gz` | Same firmware, for flashing from the stock GeekMagic firmware |
             | `codelight-${{ github.ref_name }}.apk` | Android home-screen widget |
 
             See the [README](https://github.com/${{ github.repository }}/blob/main/README.md) for full setup instructions.
@@ -104,11 +108,14 @@ jobs:
             **Stock OTA** (no disassembly — works on a fresh device):
             1. Connect your computer to the device's WiFi AP
             2. Open `http://192.168.4.1/update` in your browser
-            3. Upload `codelight-${{ github.ref_name }}.bin`
+            3. Upload `codelight-${{ github.ref_name }}.bin.gz` (the plain `.bin` is
+               too large for the stock firmware's OTA staging area)
             4. After reboot, connect the device to your network via the setup page
 
-            **ElegantOTA** (already running codelight):
-            - Open `http://<device>.local/update` and upload the `.bin`
+            **Already running codelight:**
+            - Open the device's settings page and use the *Firmware update* form
+              at the bottom (or go directly to `http://<device>.local:81/update`),
+              then upload the `.bin`
 
             ### Companion script
 
@@ -119,5 +126,7 @@ jobs:
 
             The screen and Android widget discover the companion automatically via mDNS.
             The GNOME extension connects via D-Bus — no configuration needed.
-          files: screen/.pio/build/geekmagic_ultra/codelight-${{ github.ref_name }}.bin
+          files: |
+            screen/.pio/build/geekmagic_ultra/codelight-${{ github.ref_name }}.bin
+            screen/.pio/build/geekmagic_ultra/codelight-${{ github.ref_name }}.bin.gz
           fail_on_unmatched_files: true
