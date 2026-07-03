@@ -291,6 +291,9 @@ class CodelightService : LifecycleService() {
 
     private fun maybeScheduleNotification(status: String) {
         notifJob?.cancel()
+        // A visible alert is stale once the status changes (e.g. the permission
+        // request was already answered at the computer)
+        getSystemService(NotificationManager::class.java).cancel(ALERT_NOTIF_ID)
         val prefs         = getSharedPreferences(SETTINGS_PREFS, MODE_PRIVATE)
         val notifyIdle    = prefs.getBoolean(KEY_NOTIFY_ON_IDLE,    false)
         val notifyWaiting = prefs.getBoolean(KEY_NOTIFY_ON_WAITING, false)
