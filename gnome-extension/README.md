@@ -32,8 +32,9 @@ If the indicator doesn't appear after install:
 UUID="codelight@sensnology.se"
 DEST="$HOME/.local/share/gnome-shell/extensions/$UUID"
 
-mkdir -p "$DEST/schemas"
+mkdir -p "$DEST/schemas" "$DEST/icons"
 cp metadata.json extension.js prefs.js "$DEST/"
+cp icons/*.svg "$DEST/icons/"
 cp schemas/org.gnome.shell.extensions.codelight.gschema.xml "$DEST/schemas/"
 glib-compile-schemas "$DEST/schemas/"
 gnome-extensions enable "$UUID"

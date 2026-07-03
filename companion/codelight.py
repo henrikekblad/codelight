@@ -4,8 +4,7 @@ codelight.py – pushes Claude Code status to codelight clients (screen + Androi
 
 Usage:
     python3 codelight.py --name henrik-laptop
-    python3 codelight.py --name henrik-laptop --dry-run   # print payload, no broadcast
-    python3 codelight.py --dry-run --verbose              # also show socket events and API data
+    python3 codelight.py --name henrik-laptop --verbose   # also show socket events and API data
     python3 -u codelight.py | tee                         # -u avoids buffering when piping
 """
 import argparse
@@ -839,8 +838,8 @@ WantedBy=graphical-session.target
 
     for cmd in [
         ["systemctl", "--user", "daemon-reload"],
-        ["systemctl", "--user", "disable", "codelight"],   # remove any stale symlink
-        ["systemctl", "--user", "enable", "--now", "codelight"],
+        ["systemctl", "--user", "reenable", "codelight"],  # re-link under the current WantedBy target
+        ["systemctl", "--user", "restart", "codelight"],   # replace an already-running old instance
     ]:
         result = subprocess.run(cmd, capture_output=True, text=True)
         label = " ".join(cmd[2:])

@@ -221,13 +221,16 @@ export default class CodelightExtension extends Extension {
     }
 
     _handleMessage(data) {
-        const status   = data?.status ?? 'offline';
+        let status = data?.status ?? 'offline';
+        if (status === 'inactive') status = 'idle';   // companions < 1.0.9
         const color    = C[status] ?? C.offline;
         const hex      = toHex(color);
         const sessions = data?.sessions ?? 0;
         const label    = status.toUpperCase();
 
-        this._panelIcon.gicon = Gio.icon_new_for_string(`${this.path}/icons/claude-${status}.svg`);
+        // statuses without an icon of their own fall back to the offline icon
+        this._panelIcon.gicon = Gio.icon_new_for_string(
+            `${this.path}/icons/claude-${C[status] ? status : 'offline'}.svg`);
 
         this._hdrDot.set_style(`color: ${hex};`);
         this._hdrDot.set_text('●');

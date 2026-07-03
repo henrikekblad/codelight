@@ -273,7 +273,8 @@ class CodelightService : LifecycleService() {
             if (obj.has("session_reset")) edit.putString(KEY_SESSION_RESET, obj.getString("session_reset"))
             if (obj.has("weekly_reset"))  edit.putString(KEY_WEEKLY_RESET,  obj.getString("weekly_reset"))
             if (obj.has("status")) {
-                val newStatus = obj.getString("status")
+                // companions < 1.0.9 send "inactive" for what is now "idle"
+                val newStatus = obj.getString("status").let { if (it == "inactive") "idle" else it }
                 edit.putString(KEY_STATUS, newStatus)
                 if (newStatus != lastStatus) {
                     Log.i("Codelight", "status changed: $lastStatus → $newStatus")

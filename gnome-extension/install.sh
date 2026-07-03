@@ -7,8 +7,9 @@ DEST="$HOME/.local/share/gnome-shell/extensions/$UUID"
 
 echo "Installing codelight GNOME extension to $DEST"
 
-mkdir -p "$DEST/schemas"
+mkdir -p "$DEST/schemas" "$DEST/icons"
 cp metadata.json extension.js prefs.js "$DEST/"
+cp icons/*.svg "$DEST/icons/"
 cp schemas/org.gnome.shell.extensions.codelight.gschema.xml "$DEST/schemas/"
 glib-compile-schemas "$DEST/schemas/"
 
