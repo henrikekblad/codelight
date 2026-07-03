@@ -364,8 +364,10 @@ void displaySleepStart() {
     analogWriteRange(255);
     analogWrite(TFT_BL, 255 - SLEEP_BL_LEVEL);   // active LOW
 
-    lx = (240 - LOGO_W) / 2;   // fallback/preview position until animated
-    ly = (240 - LOGO_H) / 2;
+    // Random start position — a centered start on a 45° diagonal would
+    // ping-pong along the top-left↔bottom-right diagonal forever
+    lx = SLEEP_STEP + (int)(millis()       % (240 - LOGO_W - 2 * SLEEP_STEP));
+    ly = SLEEP_STEP + (int)((millis() / 3) % (240 - LOGO_H - 2 * SLEEP_STEP));
 
     logoSpr.setColorDepth(1);
     clkSpr.setColorDepth(1);
@@ -375,8 +377,7 @@ void displaySleepStart() {
     if (!sleepAnim) {   // heap too tight for sprites: static logo instead
         logoSpr.deleteSprite();
         clkSpr.deleteSprite();
-        tft.drawBitmap((240 - LOGO_W) / 2, (240 - LOGO_H) / 2,
-                       LOGO_BITS, LOGO_W, LOGO_H, COL_LOGO);
+        tft.drawBitmap(lx, ly, LOGO_BITS, LOGO_W, LOGO_H, COL_LOGO);
         return;
     }
 

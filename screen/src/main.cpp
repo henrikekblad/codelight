@@ -2,7 +2,6 @@
 #include <ESP8266WiFi.h>
 #include <ESP8266mDNS.h>
 #include <ESPAsyncWebServer.h>
-#include <ElegantOTA.h>
 #include <WebSocketsClient.h>
 #include <ArduinoJson.h>
 #include <time.h>
@@ -41,6 +40,8 @@ static void applyStatus(uint8_t* payload, size_t length) {
     JsonDocument doc;
     if (deserializeJson(doc, payload, length)) return;
 
+    ClaudeStatus prevStatus = displayData.status;
+
     displayData.weeklyPct    = doc["weekly_pct"]   | 0.0f;
     displayData.sessionPct   = doc["session_pct"]  | 0.0f;
     displayData.weeklyReset  = doc["weekly_reset"].as<String>();
@@ -61,8 +62,10 @@ static void applyStatus(uint8_t* payload, size_t length) {
     if (displayData.status != STATUS_INACTIVE) lastActiveMs = millis();
 
     if (displayReady) {
-        // Activity wakes the sleep screen; idle broadcasts (usage polls) don't
-        if (displayData.status != STATUS_INACTIVE) displayWake();
+        // Only a status *change* to working/waiting wakes the sleep screen;
+        // rebroadcasts of an unchanged status (usage polls, hook events) don't
+        if (displayData.status != STATUS_INACTIVE && displayData.status != prevStatus)
+            displayWake();
         displayUpdate();
     }
 }
@@ -140,6 +143,9 @@ static void wsEvent(WStype_t type, uint8_t* payload, size_t length) {
 static void connectWifi() {
     WiFi.persistent(false);
     WiFi.mode(WIFI_STA);
+    // Always-powered device: modem sleep only causes missed packets and
+    // latency spikes for push updates, the web UI, and OTA uploads
+    WiFi.setSleepMode(WIFI_NONE_SLEEP);
     WiFi.disconnect();
     delay(100);
     Serial.flush();
@@ -160,7 +166,8 @@ static void connectWifi() {
         Serial.println();
 
         if (WiFi.status() == WL_CONNECTED) {
-            dbgLog("WiFi connected: " + WiFi.localIP().toString());
+            dbgLog("WiFi connected: " + WiFi.localIP().toString() +
+                   " RSSI=" + String(WiFi.RSSI()) + "dBm");
             configTime(0, 0, ntpServer);  // offset corrected when companion sends config
             return;
         }
@@ -356,7 +363,8 @@ void setup() {
 
 void loop() {
     MDNS.update();
-    ElegantOTA.loop();
+    webserverLoop();   // synchronous :81 updater (blocks here during an update,
+                       // then ESP8266HTTPUpdateServer reboots the device itself)
 
     unsigned long now = millis();
 

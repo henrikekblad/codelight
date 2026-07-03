@@ -7,10 +7,11 @@ Claude Code dashboard. The screen connects outbound to the companion daemon as a
 WebSocket client, discovers it automatically via mDNS, and re-renders on every
 push.
 
-> **Work in progress — not yet fully verified on real hardware.** The firmware compiles
-> and the companion script runs, but the full stack has not been tested on an actual
-> GeekMagic Ultra. I accidentally ripped the screen flex cable while testing/flashing.
-> Still waiting for new screens to arrive from Aliexpress for final test.
+> **Almost there.** The full stack — WiFi, companion discovery, WebSocket status
+> updates, web config/debug UI, sleep screen, and OTA updates — is verified on real
+> hardware. The one part not yet seen with human eyes is the panel itself (the flex
+> cable was ripped during an earlier disassembly), so rendering is verified via the
+> live `/screendump` preview only. A replacement screen is on its way.
 
 ## Hardware
 
@@ -41,13 +42,31 @@ The firmware binary ends up at `.pio/build/geekmagic_ultra/firmware.bin`.
 
 ### Option A — Stock firmware OTA (easiest, no disassembly)
 
-The GeekMagic Ultra ships with a stock firmware that exposes a web OTA page.
+The GeekMagic Ultra ships with a stock firmware that exposes a web OTA page
+(a plain ESP8266HTTPUpdateServer form on `/update`).
 
 1. Power on the device. It creates a WiFi AP — connect to it from your computer.
 2. Open the stock firmware's update page in a browser (usually `http://192.168.4.1/update`
    or check the screen for the address).
-3. Upload `.pio/build/geekmagic_ultra/firmware.bin`.
+3. Upload a **gzipped** build: `gzip -9 -k firmware.bin`, then upload `firmware.bin.gz`.
+   The plain `.bin` is rejected with *"Not Enough Space"* — the stock flash layout
+   only leaves ~520 KB of OTA staging room, and the compressed image fits.
 4. The device reboots into the new firmware and shows a setup screen.
+
+Or skip the browser and use the helper script, which builds and flashes in one go:
+
+```bash
+./buildAndOTAUpdate.sh 192.168.4.1
+```
+
+It auto-detects whether the device runs the stock updater or the codelight
+firmware, so the same command works for the first flash and for every
+development iteration after it:
+
+```bash
+./buildAndOTAUpdate.sh              # defaults to claude-screen.local
+./buildAndOTAUpdate.sh my-screen.local
+```
 
 ### Option B — FTDI serial adapter (if stock OTA isn't available)
 
@@ -107,7 +126,13 @@ Replace `/dev/ttyUSB0` with your actual serial port (`/dev/ttyACM0`, `COM3`, etc
 ### Option C — OTA after first flash
 
 Once the custom firmware is running, subsequent updates go through the built-in
-ElegantOTA page at `http://<device>.local/update`. No cables needed.
+updater at `http://<device>.local:81/update` (the `/update` URL on port 80
+redirects there). No cables needed. The updater runs on a synchronous web
+server on port 81 because the async stack on port 80 is not reliable for
+large uploads on the ESP8266.
+
+For development, `./buildAndOTAUpdate.sh <device>` builds and flashes in one
+step using the same endpoint.
 
 ## First-time setup
 

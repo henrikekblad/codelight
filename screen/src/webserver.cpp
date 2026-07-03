@@ -2,8 +2,8 @@
 #include "config.h"
 #include "display.h"
 #include <ArduinoJson.h>
-#include <ElegantOTA.h>
 #include <time.h>
+#include "syncota.h"
 
 // ── Debug log buffer ──────────────────────────────────────────────────────────
 #define DBG_LINES    20
@@ -51,6 +51,11 @@ static const char INDEX_HTML[] PROGMEM = R"rawhtml(<!DOCTYPE html>
   button[type=submit]{background:#238636;border:none;color:#fff;padding:.55rem 1.2rem;border-radius:6px;cursor:pointer;font-size:.9rem;margin-top:.8rem}
   button[type=submit]:hover{background:#2ea043}
   .chk{display:flex;align-items:center;gap:.5rem;color:#c9d1d9;font-size:.85rem;margin-bottom:.4rem;cursor:pointer}
+  #fw{display:flex;gap:.5rem;align-items:center;margin-bottom:.4rem}
+  #fw input[type=file]{flex:1;color:#8b949e;font-size:.8rem}
+  #fw button{background:#21262d;border:1px solid #30363d;color:#c9d1d9;border-radius:6px;padding:.45rem .8rem;cursor:pointer;font-size:.85rem;white-space:nowrap}
+  #fw button:hover{background:#30363d}
+  .hint{color:#8b949e;font-size:.75rem;margin-bottom:.6rem}
   #msg{margin-top:.8rem;font-size:.85rem;color:#3fb950;min-height:1.2rem}
   a.ota{display:inline-block;margin-top:1.2rem;color:#58a6ff;font-size:.85rem;text-decoration:none}
   a.ota:hover{text-decoration:underline}
@@ -86,10 +91,20 @@ static const char INDEX_HTML[] PROGMEM = R"rawhtml(<!DOCTYPE html>
   <div id="msg"></div>
 </form>
 
-<a class="ota" href="/update">Firmware update (OTA) &#x2192;</a>
+<h2>Firmware update</h2>
+<form id="fw" method="POST" enctype="multipart/form-data">
+  <input type="file" name="firmware" accept=".bin,.bin.gz" required>
+  <button type="submit">Upload &amp; flash</button>
+</form>
+<div class="hint">The device flashes and reboots after upload &mdash; takes about 20 seconds.</div>
+
 <a class="ota" href="/debug">Debug log &#x2192;</a>
 
 <script>
+// The updater lives on the synchronous :81 server; a plain form POST across
+// ports needs no CORS.
+document.getElementById('fw').action = 'http://' + location.hostname + ':81/update';
+
 const list = document.getElementById('wifi-list');
 
 function addNetRow(ssid='', password='') {
@@ -311,7 +326,7 @@ static void handlePostConfig(AsyncWebServerRequest* req, uint8_t* data, size_t l
 
 void webserverInit(AsyncWebServer& server) {
     server.on("/", HTTP_GET, [](AsyncWebServerRequest* req) {
-        req->send_P(200, "text/html", INDEX_HTML);
+            req->send_P(200, "text/html", INDEX_HTML);
     });
 
     server.on("/api/config", HTTP_GET, handleGetConfig);
@@ -322,10 +337,17 @@ void webserverInit(AsyncWebServer& server) {
         handlePostConfig);
 
     server.on("/debug", HTTP_GET, [](AsyncWebServerRequest* req) {
-        req->send_P(200, "text/html", DEBUG_HTML);
+            req->send_P(200, "text/html", DEBUG_HTML);
     });
 
     server.on("/api/debug/log", HTTP_GET, handleDebugLog);
+
+    // Remote reboot (dev aid — e.g. clearing a wedged OTA session)
+    server.on("/api/debug/reboot", HTTP_POST, [](AsyncWebServerRequest* req) {
+        dbgLog(F("[debug] reboot requested"));
+        req->send(200, "text/plain", "rebooting");
+        ESP.restart();
+    });
 
     // Toggle the sleep screen (testing aid on the debug page)
     server.on("/api/debug/sleep", HTTP_POST, [](AsyncWebServerRequest* req) {
@@ -341,11 +363,20 @@ void webserverInit(AsyncWebServer& server) {
     });
 
     server.on("/screendump", HTTP_GET, [](AsyncWebServerRequest* req) {
-        req->send(200, "image/svg+xml", generateScreenSvg());
+            req->send(200, "image/svg+xml", generateScreenSvg());
     });
 
-    // ElegantOTA mounts /update (GET = page, POST = upload)
-    ElegantOTA.begin(&server);
+    // Firmware updates live on the synchronous :81 server (see syncota.h);
+    // keep the old URL working for browsers and bookmarks
+    server.on("/update", HTTP_GET, [](AsyncWebServerRequest* req) {
+        req->redirect("http://" + req->host() + ":81/update");
+    });
 
     server.begin();
+
+    syncOtaInit();
+}
+
+void webserverLoop() {
+    syncOtaLoop();
 }
