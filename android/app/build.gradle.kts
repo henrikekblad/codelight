@@ -11,8 +11,8 @@ android {
         applicationId  = "se.sensnology.codelight"
         minSdk         = 26
         targetSdk      = 35
-        versionCode    = 7
-        versionName    = "1.0.9"
+        versionCode    = 8
+        versionName    = "1.0.10"
     }
 
     signingConfigs {
