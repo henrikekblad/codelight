@@ -24,6 +24,12 @@ static unsigned long wsLastDiscoverMs = 0;
 static unsigned long lastClockMs = 0;
 static bool          displayReady = false;
 
+// Sleep screen triggers (both individually configurable on the config page)
+static unsigned long lastCompanionMs = 0;   // last time a companion connection was up
+static unsigned long lastActiveMs    = 0;   // last time status was working/waiting
+#define SLEEP_AFTER_MS      (10UL * 60UL * 1000UL)   // disconnected
+#define IDLE_SLEEP_AFTER_MS (60UL * 60UL * 1000UL)   // connected but idle
+
 static const char* ntpServer = "pool.ntp.org";
 
 // RTC memory slot 0: crash-guard for displayInit().
@@ -52,7 +58,13 @@ static void applyStatus(uint8_t* payload, size_t length) {
            " session=" + String((int)(displayData.sessionPct * 100)) + "%" +
            " weekly="  + String((int)(displayData.weeklyPct  * 100)) + "%");
 
-    if (displayReady) displayUpdate();
+    if (displayData.status != STATUS_INACTIVE) lastActiveMs = millis();
+
+    if (displayReady) {
+        // Activity wakes the sleep screen; idle broadcasts (usage polls) don't
+        if (displayData.status != STATUS_INACTIVE) displayWake();
+        displayUpdate();
+    }
 }
 
 static void wsEvent(WStype_t type, uint8_t* payload, size_t length) {
@@ -73,6 +85,7 @@ static void wsEvent(WStype_t type, uint8_t* payload, size_t length) {
             if (wsAuthFailed) {
                 displayData.status = STATUS_AUTH_FAILED;
             }
+            lastCompanionMs = millis();
             if (displayReady) displayUpdate();
             break;
 
@@ -81,6 +94,8 @@ static void wsEvent(WStype_t type, uint8_t* payload, size_t length) {
             wsConnected = true;
             wsAuthFailed = false;
             displayData.authFailed = false;
+            lastActiveMs = millis();
+            if (displayReady) displayWake();
             if (cfg.companionSecret.length() > 0) {
                 String auth = "{\"auth\":\"" + cfg.companionSecret + "\"}";
                 wsClient.sendTXT(auth);
@@ -333,6 +348,8 @@ void setup() {
     }
 
     lastClockMs = millis();
+    lastCompanionMs = millis();
+    lastActiveMs = millis();
     Serial.println(F("=== setup complete ==="));
     Serial.flush();
 }
@@ -346,6 +363,19 @@ void loop() {
     if (displayReady && now - lastClockMs >= 1000) {
         lastClockMs = now;
         displayUpdateClock();
+    }
+
+    if (displayReady) {
+        if (!displaySleeping()) {
+            bool discSleep = cfg.sleepOnDisconnect
+                && !displayData.connected && !displayData.authFailed
+                && now - lastCompanionMs >= SLEEP_AFTER_MS;
+            bool idleSleep = cfg.sleepOnIdle
+                && displayData.connected && displayData.status == STATUS_INACTIVE
+                && now - lastActiveMs >= IDLE_SLEEP_AFTER_MS;
+            if (discSleep || idleSleep) displaySleepStart();
+        }
+        displaySleepTick(now);
     }
 
     if (WiFi.status() == WL_CONNECTED) {

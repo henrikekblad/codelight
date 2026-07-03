@@ -18,6 +18,8 @@ struct Config {
     String companionName;    // mDNS instance name to connect to (e.g. "henrik-laptop"); blank = first found
     String companionHost;    // direct IP or hostname, bypasses mDNS when set
     String companionSecret;  // optional shared secret for WebSocket auth
+    bool sleepOnDisconnect;  // sleep screen after 10 min without companion
+    bool sleepOnIdle;        // sleep screen after 1 h of idle status
 };
 
 extern Config cfg;

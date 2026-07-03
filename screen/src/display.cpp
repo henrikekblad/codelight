@@ -1,4 +1,5 @@
 #include "display.h"
+#include "logo.h"
 
 TFT_eSPI tft = TFT_eSPI();
 DisplayData displayData = {0, 0, "--", "--", 0, STATUS_OFFLINE, false, false};
@@ -14,6 +15,7 @@ DisplayData displayData = {0, 0, "--", "--", 0, STATUS_OFFLINE, false, false};
 #define COL_ORANGE   0xFC40   // #FF8C00
 #define COL_RED      0xF840   // #FF2200
 #define COL_OFFLINE  0x4208   // dim grey
+#define COL_LOGO     0xDB8A   // #DE7356 Claude terracotta
 
 // Linearly interpolate between two RGB565 colours (t in 0..1).
 static uint16_t lerpColor565(uint16_t c0, uint16_t c1, float t) {
@@ -116,15 +118,8 @@ static void drawStatusBox(ClaudeStatus status, bool connected, bool authFailed) 
     tft.print(label);
 }
 
-void displayInit() {
-    tft.init();
-    tft.setRotation(0);
-    tft.setSwapBytes(true);
-    tft.fillScreen(COL_BG);
-    pinMode(TFT_BL, OUTPUT);
-    digitalWrite(TFT_BL, LOW);   // active LOW = backlight on
-
-    // Static elements — drawn once, never change
+// Static elements — drawn on init and after waking from the sleep screen
+static void drawChrome() {
     tft.setTextFont(2);
     tft.setTextSize(1);
     tft.setTextColor(COL_TITLE, COL_BG);
@@ -133,8 +128,24 @@ void displayInit() {
     tft.drawFastHLine(0, Y_DIVIDER, 240, COL_BAR_BG);
 }
 
+static bool displayUsable = false;   // displayInit() completed (not crash-guard skipped)
+
+void displayInit() {
+    tft.init();
+    tft.setRotation(0);
+    tft.setSwapBytes(true);
+    tft.fillScreen(COL_BG);
+    pinMode(TFT_BL, OUTPUT);
+    digitalWrite(TFT_BL, LOW);   // active LOW = backlight on
+
+    drawChrome();
+    displayUsable = true;
+}
+
+static DisplayData prev = {-1.0f, -1.0f, "", "", -1, (ClaudeStatus)-1, false, false};
+
 void displayUpdate() {
-    static DisplayData prev = {-1.0f, -1.0f, "", "", -1, (ClaudeStatus)-1, false, false};
+    if (displaySleeping()) return;
 
     if (displayData.weeklyPct != prev.weeklyPct || displayData.weeklyReset != prev.weeklyReset)
         drawMeterBlock(Y_WMETER, "Weekly", displayData.weeklyPct, displayData.weeklyReset);
@@ -224,12 +235,20 @@ static void svgMeter(String& s, int labelY, const char* label, float pct,
     svgText(s, 234, barY + 14, "#ffffff", 13, "end", buf);
 }
 
+static void appendSleepSvg(String& s);   // defined with the sleep-screen state below
+
 String generateScreenSvg() {
     String s;
     s.reserve(1500);
 
     s  = "<svg xmlns='http://www.w3.org/2000/svg' width='240' height='240'>";
     s += "<rect width='240' height='240' fill='#000'/>";
+
+    if (displaySleeping()) {
+        appendSleepSvg(s);
+        s += "</svg>";
+        return s;
+    }
 
     // Title + clock
     svgText(s, X_MARGIN, Y_TITLE + 13, "#ffffff", 13, nullptr, "codelight");
@@ -277,6 +296,8 @@ String generateScreenSvg() {
 }
 
 void displayUpdateClock() {
+    if (displaySleeping()) return;
+
     time_t now = time(nullptr);
     struct tm* t = localtime(&now);
 
@@ -289,4 +310,146 @@ void displayUpdateClock() {
     int tw = tft.textWidth(buf);
     tft.setCursor(240 - X_MARGIN - tw, Y_TITLE);
     tft.print(buf);
+}
+
+// ── Sleep screen: bouncing logo ───────────────────────────────────────────────
+//
+// Two 1-bit sprites (colors applied at push time via setBitmapColor): the logo
+// slides 2px per frame DVD-style, the clock sits in a fixed corner and is
+// repainted whenever the logo passes over it. Backlight is PWM-dimmed.
+
+#define SLEEP_FRAME_MS  40    // 25 fps
+#define SLEEP_STEP      2     // px per frame; logo sprite has this much margin
+#define SLEEP_BL_LEVEL  50    // backlight duty while asleep (0-255)
+#define FLASH_FRAMES    12    // corner-hit flash duration
+
+#define CLK_W  60
+#define CLK_H  16
+#define CLK_X  (240 - CLK_W - 8)
+#define CLK_Y  (240 - CLK_H - 6)
+
+static TFT_eSprite logoSpr(&tft);
+static TFT_eSprite clkSpr(&tft);
+static bool sleeping   = false;
+static bool sleepAnim  = false;   // sprites allocated, animation running
+static int  lx, ly, ldx, ldy;
+static uint8_t flashLeft = 0;
+static unsigned long lastFrameMs = 0;
+static int lastClkMin = -1;
+
+bool displaySleeping() { return sleeping; }
+
+static void drawSleepClock() {
+    time_t now = time(nullptr);
+    struct tm* t = localtime(&now);
+    lastClkMin = t->tm_min;
+
+    char buf[8];
+    snprintf(buf, sizeof(buf), "%02d:%02d", t->tm_hour, t->tm_min);
+
+    clkSpr.fillSprite(0);
+    clkSpr.setTextFont(2);
+    clkSpr.setTextSize(1);
+    clkSpr.setTextColor(1);
+    clkSpr.setCursor(CLK_W - clkSpr.textWidth(buf), 0);
+    clkSpr.print(buf);
+    clkSpr.pushSprite(CLK_X, CLK_Y);
+}
+
+void displaySleepStart() {
+    if (sleeping || !displayUsable) return;
+    sleeping = true;
+
+    tft.fillScreen(COL_BG);
+    analogWriteRange(255);
+    analogWrite(TFT_BL, 255 - SLEEP_BL_LEVEL);   // active LOW
+
+    lx = (240 - LOGO_W) / 2;   // fallback/preview position until animated
+    ly = (240 - LOGO_H) / 2;
+
+    logoSpr.setColorDepth(1);
+    clkSpr.setColorDepth(1);
+    sleepAnim = logoSpr.createSprite(LOGO_W + 2 * SLEEP_STEP, LOGO_H + 2 * SLEEP_STEP) != nullptr
+             && clkSpr.createSprite(CLK_W, CLK_H) != nullptr;
+
+    if (!sleepAnim) {   // heap too tight for sprites: static logo instead
+        logoSpr.deleteSprite();
+        clkSpr.deleteSprite();
+        tft.drawBitmap((240 - LOGO_W) / 2, (240 - LOGO_H) / 2,
+                       LOGO_BITS, LOGO_W, LOGO_H, COL_LOGO);
+        return;
+    }
+
+    logoSpr.setBitmapColor(COL_LOGO, COL_BG);
+    clkSpr.setBitmapColor(COL_RESET, COL_BG);
+
+    // 45° diagonal seeded by uptime
+    ldx = (millis() & 1) ? SLEEP_STEP : -SLEEP_STEP;
+    ldy = (millis() & 2) ? SLEEP_STEP : -SLEEP_STEP;
+    flashLeft   = 0;
+    lastFrameMs = 0;
+    drawSleepClock();
+}
+
+void displaySleepTick(unsigned long now) {
+    if (!sleeping || !sleepAnim || now - lastFrameMs < SLEEP_FRAME_MS) return;
+    lastFrameMs = now;
+
+    lx += ldx;
+    ly += ldy;
+    bool hitX = false, hitY = false;
+    if (lx <= 0 || lx >= 240 - LOGO_W) { ldx = -ldx; hitX = true; }
+    if (ly <= 0 || ly >= 240 - LOGO_H) { ldy = -ldy; hitY = true; }
+    lx = constrain(lx, 0, 240 - LOGO_W);
+    ly = constrain(ly, 0, 240 - LOGO_H);
+    if (hitX && hitY) flashLeft = FLASH_FRAMES;   // corner!
+
+    if (flashLeft > 0) {
+        flashLeft--;
+        logoSpr.setBitmapColor(COL_GREEN, COL_BG);
+    } else {
+        logoSpr.setBitmapColor(COL_LOGO, COL_BG);
+    }
+
+    // Sprite margin covers the previous position, so one push erases and draws
+    logoSpr.fillSprite(0);
+    logoSpr.drawBitmap(SLEEP_STEP, SLEEP_STEP, LOGO_BITS, LOGO_W, LOGO_H, 1);
+    logoSpr.pushSprite(lx - SLEEP_STEP, ly - SLEEP_STEP);
+
+    time_t tnow = time(nullptr);
+    struct tm* t = localtime(&tnow);
+    bool overClock = lx + LOGO_W > CLK_X - SLEEP_STEP && ly + LOGO_H > CLK_Y - SLEEP_STEP;
+    if (t->tm_min != lastClkMin || overClock) drawSleepClock();
+}
+
+static void appendSleepSvg(String& s) {
+    s.reserve(s.length() + 1400);
+    s += "<path transform='translate("; s += lx; s += ","; s += ly;
+    s += ") scale(0.96)' fill='";
+    s += (flashLeft > 0) ? "#00c800" : "#DE7356";
+    s += "' d='"; s += FPSTR(LOGO_PATH); s += "'/>";
+
+    time_t now = time(nullptr);
+    struct tm* t = localtime(&now);
+    char buf[8];
+    snprintf(buf, sizeof(buf), "%02d:%02d", t->tm_hour, t->tm_min);
+    svgText(s, CLK_X + CLK_W, CLK_Y + 13, "#808080", 13, "end", buf);
+}
+
+void displayWake() {
+    if (!sleeping) return;
+    sleeping = false;
+
+    if (sleepAnim) {
+        logoSpr.deleteSprite();
+        clkSpr.deleteSprite();
+        sleepAnim = false;
+    }
+
+    analogWrite(TFT_BL, 0);      // constant LOW = backlight fully on
+    tft.fillScreen(COL_BG);
+    drawChrome();
+    prev = {-1.0f, -1.0f, "", "", -1, (ClaudeStatus)-1, false, false};
+    displayUpdate();
+    displayUpdateClock();
 }

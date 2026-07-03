@@ -50,6 +50,7 @@ static const char INDEX_HTML[] PROGMEM = R"rawhtml(<!DOCTYPE html>
   #add-net:hover{background:#161b22}
   button[type=submit]{background:#238636;border:none;color:#fff;padding:.55rem 1.2rem;border-radius:6px;cursor:pointer;font-size:.9rem;margin-top:.8rem}
   button[type=submit]:hover{background:#2ea043}
+  .chk{display:flex;align-items:center;gap:.5rem;color:#c9d1d9;font-size:.85rem;margin-bottom:.4rem;cursor:pointer}
   #msg{margin-top:.8rem;font-size:.85rem;color:#3fb950;min-height:1.2rem}
   a.ota{display:inline-block;margin-top:1.2rem;color:#58a6ff;font-size:.85rem;text-decoration:none}
   a.ota:hover{text-decoration:underline}
@@ -71,6 +72,10 @@ static const char INDEX_HTML[] PROGMEM = R"rawhtml(<!DOCTYPE html>
 
   <label>Companion secret <span style="color:#8b949e;font-size:.8rem">(optional – match --secret in codelight.py)</span></label>
   <input type="password" id="companionSecret" placeholder="leave blank to disable auth">
+
+  <h2>Display</h2>
+  <label class="chk"><input type="checkbox" id="sleepOnDisconnect"> Sleep after 10 minutes when disconnected</label>
+  <label class="chk"><input type="checkbox" id="sleepOnIdle"> Sleep after 1 hour of idle</label>
 
   <h2>WiFi networks <span style="color:#8b949e;font-size:.8rem">(up to 3, tried in order)</span></h2>
   <div id="wifi-list"></div>
@@ -106,6 +111,8 @@ fetch('/api/config').then(r=>r.json()).then(cfg => {
   document.getElementById('deviceName').value    = cfg.deviceName    || '';
   document.getElementById('companionName').value = cfg.companionName || '';
   document.getElementById('companionHost').value = cfg.companionHost || '';
+  document.getElementById('sleepOnDisconnect').checked = cfg.sleepOnDisconnect !== false;
+  document.getElementById('sleepOnIdle').checked       = cfg.sleepOnIdle !== false;
   const nets = cfg.wifi || [];
   nets.forEach(n => addNetRow(n.ssid, ''));
   if (nets.length === 0) addNetRow();
@@ -129,6 +136,8 @@ document.getElementById('cfg').onsubmit = async (e) => {
     companionName:   document.getElementById('companionName').value.trim(),
     companionHost:   document.getElementById('companionHost').value.trim(),
     companionSecret: document.getElementById('companionSecret').value,
+    sleepOnDisconnect: document.getElementById('sleepOnDisconnect').checked,
+    sleepOnIdle:       document.getElementById('sleepOnIdle').checked,
     wifi,
   };
 
@@ -159,17 +168,22 @@ static const char DEBUG_HTML[] PROGMEM = R"rawhtml(<!DOCTYPE html>
 *{box-sizing:border-box;margin:0;padding:0}
 body{font-family:monospace;background:#0d1117;color:#3fb950;padding:12px;height:100vh;display:flex;flex-direction:column}
 h1{font-size:.85rem;color:#58a6ff;margin-bottom:8px;flex-shrink:0}
+#slp{margin-left:12px;background:#21262d;border:1px solid #30363d;color:#c9d1d9;border-radius:4px;padding:2px 8px;cursor:pointer;font-family:monospace;font-size:.78rem}
+#slp:hover{background:#30363d}
 #log{flex:1;overflow-y:auto;font-size:.78rem;line-height:1.5;white-space:pre-wrap;word-break:break-all}
 .err{color:#f85149}
 #screen{position:fixed;top:8px;right:8px;width:160px;height:160px;border:1px solid #30363d;border-radius:4px;background:#000}
 </style>
 </head>
 <body>
-<h1>codelight debug &mdash; <span id="st">connecting&hellip;</span></h1>
+<h1>codelight debug &mdash; <span id="st">connecting&hellip;</span><button id="slp">sleep</button></h1>
 <img id="screen" src="/screendump" alt="screen">
 <div id="log"></div>
 <script>
 let seq=0,el=document.getElementById('log'),st=document.getElementById('st'),sc=document.getElementById('screen');
+let slp=document.getElementById('slp');
+slp.onclick=()=>fetch('/api/debug/sleep',{method:'POST'})
+  .then(r=>r.text()).then(t=>{slp.textContent=t==='sleeping'?'wake':'sleep';});
 function poll(){
   fetch('/api/debug/log?from='+seq)
     .then(r=>r.json())
@@ -218,6 +232,8 @@ static void handleGetConfig(AsyncWebServerRequest* req) {
     doc["companionHost"]   = cfg.companionHost;
     doc["wifiCount"]       = cfg.wifiCount;
     doc["hasSecret"]       = cfg.companionSecret.length() > 0;
+    doc["sleepOnDisconnect"] = cfg.sleepOnDisconnect;
+    doc["sleepOnIdle"]       = cfg.sleepOnIdle;
     JsonArray nets = doc["wifi"].to<JsonArray>();
     for (int i = 0; i < cfg.wifiCount; i++) {
         JsonObject n = nets.add<JsonObject>();
@@ -263,6 +279,10 @@ static void handlePostConfig(AsyncWebServerRequest* req, uint8_t* data, size_t l
         cfg.companionHost = doc["companionHost"].as<String>();
     if (doc["companionSecret"].is<String>())
         cfg.companionSecret = doc["companionSecret"].as<String>();
+    if (doc["sleepOnDisconnect"].is<bool>())
+        cfg.sleepOnDisconnect = doc["sleepOnDisconnect"].as<bool>();
+    if (doc["sleepOnIdle"].is<bool>())
+        cfg.sleepOnIdle = doc["sleepOnIdle"].as<bool>();
 
     // Replace wifi list if provided
     if (doc["wifi"].is<JsonArray>()) {
@@ -306,6 +326,19 @@ void webserverInit(AsyncWebServer& server) {
     });
 
     server.on("/api/debug/log", HTTP_GET, handleDebugLog);
+
+    // Toggle the sleep screen (testing aid on the debug page)
+    server.on("/api/debug/sleep", HTTP_POST, [](AsyncWebServerRequest* req) {
+        if (displaySleeping()) {
+            displayWake();
+            dbgLog(F("[debug] wake triggered"));
+            req->send(200, "text/plain", "awake");
+        } else {
+            displaySleepStart();
+            dbgLog(F("[debug] sleep triggered"));
+            req->send(200, "text/plain", displaySleeping() ? "sleeping" : "no display");
+        }
+    });
 
     server.on("/screendump", HTTP_GET, [](AsyncWebServerRequest* req) {
         req->send(200, "image/svg+xml", generateScreenSvg());
