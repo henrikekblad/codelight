@@ -7,6 +7,7 @@ import android.content.Intent
 import android.net.ConnectivityManager
 import android.net.Network
 import android.net.NetworkCapabilities
+import android.net.NetworkRequest
 import android.net.wifi.WifiInfo
 import android.net.nsd.NsdManager
 import android.net.nsd.NsdServiceInfo
@@ -61,6 +62,7 @@ class CodelightService : LifecycleService() {
         private const val ALERT_CHANNEL_ID  = "codelight_alerts"
         private const val SVC_NOTIF_ID      = 1
         private const val SVC_CHANNEL_ID    = "codelight_service"
+        private const val PAUSED_CHANNEL_ID = "codelight_paused"
         private const val SERVICE_TYPE      = "_codelight._tcp"
     }
 
@@ -69,6 +71,11 @@ class CodelightService : LifecycleService() {
     private lateinit var nsdManager: NsdManager
     private var discoveryListener: NsdManager.DiscoveryListener? = null
     private var networkCallback: ConnectivityManager.NetworkCallback? = null
+    private var wifiCallback: ConnectivityManager.NetworkCallback? = null
+
+    // Wi-Fi SSID filter: paused while not on an allowed network (see evaluateDormancy)
+    private var currentSsid: String? = null
+    private var dormant = false
 
     // Resolve one at a time via a queue (old NSD API limitation)
     private val resolveQueue = ArrayBlockingQueue<NsdServiceInfo>(32)
@@ -83,6 +90,7 @@ class CodelightService : LifecycleService() {
     private var reconnectJob: kotlinx.coroutines.Job? = null
     private var notifJob:     kotlinx.coroutines.Job? = null
     private var lastStatus = ""
+    private var connectedName: String? = null   // mDNS name of the connected companion
 
     override fun onCreate() {
         super.onCreate()
@@ -126,7 +134,7 @@ class CodelightService : LifecycleService() {
         val manualPort = settings.getInt(KEY_PORT, 0)
 
         if (!manualHost.isNullOrBlank() && manualPort > 0) {
-            connectWebSocket(manualHost, manualPort)
+            connectWebSocket(manualHost, manualPort, null)
             return
         }
 
@@ -190,7 +198,7 @@ class CodelightService : LifecycleService() {
         val selected = getSharedPreferences(SETTINGS_PREFS, MODE_PRIVATE)
             .getString(KEY_SELECTED_NAME, null)
         if (selected == null || selected == name) {
-            connectWebSocket(host, port)
+            connectWebSocket(host, port, name)
         }
     }
 
@@ -222,8 +230,9 @@ class CodelightService : LifecycleService() {
         discoveryListener = null
     }
 
-    private fun connectWebSocket(host: String, port: Int) {
-        Log.d("Codelight", "Connecting to ws://$host:$port")
+    private fun connectWebSocket(host: String, port: Int, name: String?) {
+        Log.d("Codelight", "Connecting to ws://$host:$port ($name)")
+        connectedName = name
         val secret  = getSharedPreferences(SETTINGS_PREFS, MODE_PRIVATE).getString(KEY_SECRET, "") ?: ""
         val request = Request.Builder().url("ws://$host:$port").build()
 
@@ -314,9 +323,9 @@ class CodelightService : LifecycleService() {
 
     private fun sendAlertNotification(status: String) {
         val text = when (status) {
-            "waiting"  -> "Waiting for your input"
-            "idle" -> "Session ended (IDLE)"
-            else       -> return
+            "waiting" -> "Claude is waiting for your input"
+            "idle"    -> "Claude is idle — session ended"
+            else      -> return
         }
         val pi = PendingIntent.getActivity(
             this, 0, Intent(this, SettingsActivity::class.java),
@@ -350,7 +359,7 @@ class CodelightService : LifecycleService() {
     }
 
     private fun setConnected(connected: Boolean, host: String = "", port: Int = 0) {
-        Log.i("Codelight", "setConnected: connected=$connected host=$host port=$port")
+        Log.i("Codelight", "setConnected: connected=$connected host=$host port=$port dormant=$dormant")
         val edit = getSharedPreferences(STATE_PREFS, MODE_PRIVATE).edit()
             .putBoolean(KEY_CONNECTED, connected)
         if (connected) {
@@ -359,9 +368,23 @@ class CodelightService : LifecycleService() {
             edit.remove(KEY_CONNECTED_HOST).remove(KEY_CONNECTED_PORT)
         }
         edit.apply()
-        val text = if (connected) "Connected to $host:$port" else "Searching…"
-        getSystemService(NotificationManager::class.java)
-            .notify(SVC_NOTIF_ID, buildServiceNotification(text))
+        if (!connected) {
+            connectedName = null
+            // A posted alert can't be trusted once we lose sight of the companion
+            notifJob?.cancel()
+            getSystemService(NotificationManager::class.java).cancel(ALERT_NOTIF_ID)
+        }
+        val selected = getSharedPreferences(SETTINGS_PREFS, MODE_PRIVATE)
+            .getString(KEY_SELECTED_NAME, null)
+        val nm = getSystemService(NotificationManager::class.java)
+        when {
+            connected -> nm.notify(SVC_NOTIF_ID,
+                buildServiceNotification("Connected to ${connectedName ?: selected ?: "codelight"}"))
+            dormant   -> nm.notify(SVC_NOTIF_ID,
+                buildServiceNotification("Paused — waiting for home Wi-Fi", PAUSED_CHANNEL_ID))
+            else      -> nm.notify(SVC_NOTIF_ID,
+                buildServiceNotification("Searching for ${selected ?: "codelight"}…"))
+        }
         pushWidgetUpdate()
     }
 
@@ -396,27 +419,16 @@ class CodelightService : LifecycleService() {
     }
 
     private fun registerNetworkCallback() {
+        val cm = getSystemService(CONNECTIVITY_SERVICE) as ConnectivityManager
+
         val cb = object : ConnectivityManager.NetworkCallback() {
             override fun onAvailable(network: Network) {
                 // Only restart if we have no live connection — otherwise a secondary
                 // network becoming available (mobile data, VPN, etc.) would tear down
                 // a perfectly good WiFi WebSocket every 5 seconds.
-                if (webSocket == null) {
+                if (webSocket == null && !dormant) {
                     Log.d("Codelight", "Default network available, restarting discovery")
                     scheduleReconnect()
-                }
-            }
-
-            @Suppress("NewApi")
-            override fun onCapabilitiesChanged(network: Network, capabilities: NetworkCapabilities) {
-                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S &&
-                    capabilities.hasTransport(NetworkCapabilities.TRANSPORT_WIFI)) {
-                    val wifiInfo = capabilities.transportInfo as? WifiInfo
-                    val ssid = wifiInfo?.ssid?.removeSurrounding("\"")
-                    if (!ssid.isNullOrBlank() && ssid != "<unknown ssid>" && !isSsidAllowed(ssid)) {
-                        Log.i("Codelight", "SSID '$ssid' not in allowlist — stopping service")
-                        stopSelf()
-                    }
                 }
             }
 
@@ -427,22 +439,75 @@ class CodelightService : LifecycleService() {
                 webSocket?.cancel()
             }
         }
-        (getSystemService(CONNECTIVITY_SERVICE) as ConnectivityManager)
-            .registerDefaultNetworkCallback(cb)
+        cm.registerDefaultNetworkCallback(cb)
         networkCallback = cb
+
+        // Track the phone's WiFi network (not the default network: with a VPN up
+        // the default is the tunnel and its capabilities hide the SSID) so the
+        // SSID filter can pause the service whenever we're not on an allowed
+        // network — foreign WiFi, cellular, or VPN-only.
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+            val req = NetworkRequest.Builder()
+                .addTransportType(NetworkCapabilities.TRANSPORT_WIFI)
+                .build()
+            val wcb = object : ConnectivityManager.NetworkCallback(FLAG_INCLUDE_LOCATION_INFO) {
+                override fun onCapabilitiesChanged(network: Network, capabilities: NetworkCapabilities) {
+                    currentSsid = (capabilities.transportInfo as? WifiInfo)
+                        ?.ssid?.removeSurrounding("\"")
+                    evaluateDormancy()
+                }
+
+                override fun onLost(network: Network) {
+                    currentSsid = null
+                    evaluateDormancy()
+                }
+            }
+            cm.registerNetworkCallback(req, wcb)
+            wifiCallback = wcb
+        }
     }
 
     private fun unregisterNetworkCallback() {
-        networkCallback?.let {
-            try {
-                (getSystemService(CONNECTIVITY_SERVICE) as ConnectivityManager)
-                    .unregisterNetworkCallback(it)
-            } catch (_: Exception) {}
-        }
+        val cm = getSystemService(CONNECTIVITY_SERVICE) as ConnectivityManager
+        networkCallback?.let { try { cm.unregisterNetworkCallback(it) } catch (_: Exception) {} }
         networkCallback = null
+        wifiCallback?.let { try { cm.unregisterNetworkCallback(it) } catch (_: Exception) {} }
+        wifiCallback = null
+    }
+
+    private fun evaluateDormancy() {
+        val allowed = getSharedPreferences(SETTINGS_PREFS, MODE_PRIVATE)
+            .getStringSet(KEY_ALLOWED_SSIDS, emptySet()) ?: emptySet()
+        if (allowed.isEmpty()) { exitDormant(); return }   // filter disabled
+
+        val ssid = currentSsid
+        // Fail open when on WiFi but the SSID is unreadable (missing permission)
+        val active = ssid != null && (ssid == "<unknown ssid>" || ssid in allowed)
+        if (active) exitDormant() else enterDormant()
+    }
+
+    private fun enterDormant() {
+        if (dormant) return
+        dormant = true
+        Log.i("Codelight", "Not on an allowed WiFi (ssid=$currentSsid) — pausing")
+        reconnectJob?.cancel()
+        reconnectJob = null
+        stopDiscovery()
+        webSocket?.cancel()
+        webSocket = null
+        setConnected(false)
+    }
+
+    private fun exitDormant() {
+        if (!dormant) return
+        dormant = false
+        Log.i("Codelight", "Allowed WiFi '$currentSsid' available — resuming")
+        setConnected(false)   // restores the normal "Searching…" notification
+        scheduleReconnect()
     }
 
     private fun scheduleReconnect() {
+        if (dormant) return
         Log.i("Codelight", "scheduleReconnect (reconnecting in 5 s)")
         reconnectJob?.cancel()
         reconnectJob = lifecycleScope.launch {
@@ -454,8 +519,8 @@ class CodelightService : LifecycleService() {
         }
     }
 
-    private fun buildServiceNotification(text: String) =
-        NotificationCompat.Builder(this, SVC_CHANNEL_ID)
+    private fun buildServiceNotification(text: String, channel: String = SVC_CHANNEL_ID) =
+        NotificationCompat.Builder(this, channel)
             .setSmallIcon(android.R.drawable.stat_notify_sync)
             .setContentTitle("codelight")
             .setContentText(text)
@@ -478,6 +543,11 @@ class CodelightService : LifecycleService() {
         nm.createNotificationChannel(
             NotificationChannel(ALERT_CHANNEL_ID, "codelight alerts", NotificationManager.IMPORTANCE_HIGH)
                 .apply { enableVibration(true); enableLights(true) }
+        )
+        // MIN importance: no status-bar icon, collapsed at the bottom of the shade
+        nm.createNotificationChannel(
+            NotificationChannel(PAUSED_CHANNEL_ID, "codelight paused", NotificationManager.IMPORTANCE_MIN)
+                .apply { setShowBadge(false) }
         )
     }
 }

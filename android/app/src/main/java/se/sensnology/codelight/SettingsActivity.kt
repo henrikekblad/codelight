@@ -291,7 +291,8 @@ private fun SettingsScreen() {
             // ── Wi-Fi SSID filter ─────────────────────────────────────────────
             SettingsCard(card, muted, label = "Wi-Fi SSID filter") {
                 Text(
-                    "Service stops automatically when connected to a Wi-Fi network not in this list. " +
+                    "Service pauses (no connection, no notifications) while not on a Wi-Fi network " +
+                    "in this list — including on mobile data or VPN. It resumes automatically. " +
                     "Leave empty to run on any network.",
                     style = TextStyle(color = muted, fontSize = 11.sp),
                 )
