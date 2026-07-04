@@ -10,14 +10,18 @@ Usage:
 import argparse
 import asyncio
 import collections
+import hashlib
+import hmac
 import json
 import os
+import secrets
 import shutil
 import signal
 import socket
 import sys
 import threading
 import time
+import uuid
 import urllib.request
 import urllib.error
 from datetime import datetime, timezone
@@ -62,12 +66,21 @@ _sessions: dict[str, dict] = {}
 _usage_cache: dict = {
     "session_pct": 0.0, "weekly_pct": 0.0,
     "session_reset": "--", "weekly_reset": "--",
+    "session_reset_at": 0, "weekly_reset_at": 0,
 }
 
 _ws_loop:    asyncio.AbstractEventLoop | None = None
 _ws_clients: set = set()
 _last_ws_status: str = "idle"   # updated by _broadcast; watched by timeout-watchdog
 _dbus_iface: object | None = None   # CodelightDbusInterface instance when D-Bus is available
+
+# Remote permission approval (armed via --remote-permissions, requires --secret)
+_remote_permissions: bool = False
+_permission_timeout: int  = 60
+# request_id → {"conn", "id", "session_id", "tool_name", "summary", "tool_input",
+#               "cwd", "event", "decision", "by", "expires"}
+_pending_perms: dict[str, dict] = {}
+_perm_clients: set = set()   # WS clients that subscribed to permission events
 
 _log_lines:       collections.deque = collections.deque(maxlen=10)
 _last_payload:    dict | None = None
@@ -107,6 +120,16 @@ def _format_countdown(diff_secs: int) -> str:
     if hours > 0:
         return f"{hours}h {mins}m"
     return f"{mins}m"
+
+
+def _epoch(iso_ts: str) -> int:
+    """ISO-8601 timestamp → epoch seconds (0 if unparseable)."""
+    if not iso_ts:
+        return 0
+    try:
+        return int(datetime.fromisoformat(iso_ts.replace("Z", "+00:00")).timestamp())
+    except Exception:
+        return 0
 
 
 def _format_iso_countdown(iso_ts: str) -> str:
@@ -172,10 +195,14 @@ def _overall_status() -> tuple[int, str]:
     active  = 0
     overall = "idle"
     with _lock:
+        # Sessions with a pending remote permission request stay alive — the
+        # 30 s waiting window would otherwise drop them mid-approval
+        pending_sids = {p["session_id"] for p in _pending_perms.values()}
         stale = [sid for sid, info in _sessions.items()
-                 if now - info["time"] > (IDLE_WINDOW_WAITING
-                                          if info["state"] == "waiting"
-                                          else IDLE_WINDOW)]
+                 if sid not in pending_sids
+                 and now - info["time"] > (IDLE_WINDOW_WAITING
+                                           if info["state"] == "waiting"
+                                           else IDLE_WINDOW)]
         for sid in stale:
             del _sessions[sid]
         for info in _sessions.values():
@@ -204,12 +231,165 @@ if _have_dbus:
                 usage = dict(_usage_cache)
             return json.dumps({**usage, 'sessions': sessions, 'status': status})
 
+        @_dbus_signal()
+        def PermissionRequest(self, request_json: str) -> 's':  # type: ignore[return]
+            return request_json
+
+        @_dbus_signal()
+        def PermissionResolved(self, resolved_json: str) -> 's':  # type: ignore[return]
+            return resolved_json
+
+        @_dbus_method()
+        def RespondPermission(self, request_id: 's', decision: 's') -> 'b':  # type: ignore[return]
+            # Session bus = same local user → inside the trust boundary
+            return _resolve_permission(request_id, decision, 'gnome')
+
+# ── Remote permission approval ────────────────────────────────────────────────
+#
+# Flow: the PermissionRequest hook (--hook permission) blocks on the Unix
+# socket; the daemon forwards the request to subscribed WS clients + D-Bus,
+# and whoever answers first (VSCode / Android / GNOME) decides. On timeout the
+# hook prints nothing and Claude Code falls back to its built-in prompt.
+# Permission messages are only sent to clients that subscribed — old clients
+# (ESP32 screen, older apps) never see them.
+
+def _broadcast_permission(payload: dict, kind: str) -> None:
+    """Send a permission event to subscribed WS clients and the D-Bus signal."""
+    if _ws_loop is None:
+        return
+    msg = json.dumps(payload)
+
+    async def _send() -> None:
+        if _perm_clients:
+            await asyncio.gather(
+                *[c.send(msg) for c in list(_perm_clients)],
+                return_exceptions=True,
+            )
+        if _dbus_iface is not None:
+            try:
+                if kind == "request":
+                    _dbus_iface.PermissionRequest(msg)   # type: ignore[union-attr]
+                else:
+                    _dbus_iface.PermissionResolved(msg)  # type: ignore[union-attr]
+            except Exception:
+                pass
+
+    asyncio.run_coroutine_threadsafe(_send(), _ws_loop)
+
+
+def _perm_request_payload(entry: dict) -> dict:
+    return {
+        "type":       "permission_request",
+        "id":         entry["id"],
+        "tool_name":  entry["tool_name"],
+        "summary":    entry["summary"],
+        "tool_input": entry["tool_input"],
+        "session_id": entry["session_id"],
+        "cwd":        entry["cwd"],
+        "expires_at": int(entry["expires"]),
+    }
+
+
+def _resolve_permission(request_id: str, decision: str, by: str) -> bool:
+    """Record a decision for a pending request. First response wins."""
+    if decision not in ("allow", "deny"):
+        return False
+    with _lock:
+        entry = _pending_perms.get(request_id)
+        if entry is None or entry["decision"] is not None or entry["by"] is not None:
+            return False
+        entry["decision"] = decision
+        entry["by"] = by
+    entry["event"].set()
+    return True
+
+
+def _cancel_permissions_for(session_id: str) -> None:
+    """Session ended — wake up its pending requests without a decision."""
+    with _lock:
+        entries = [e for e in _pending_perms.values()
+                   if e["session_id"] == session_id and e["decision"] is None]
+        for e in entries:
+            e["by"] = "cancelled"
+    for e in entries:
+        e["event"].set()
+
+
+def _permission_waiter(entry: dict) -> None:
+    """Per-request thread: wait for a decision (or timeout), reply to the
+    blocked hook on its held connection, and notify clients."""
+    entry["event"].wait(max(0.0, entry["expires"] - time.time()))
+    with _lock:
+        _pending_perms.pop(entry["id"], None)
+        decision = entry["decision"]
+        by       = entry["by"]
+
+    try:
+        entry["conn"].sendall((json.dumps({"decision": decision}) + "\n").encode())
+    except Exception:
+        pass
+    try:
+        entry["conn"].close()
+    except Exception:
+        pass
+
+    outcome = decision or ("cancelled" if by == "cancelled" else "timeout")
+    _log(f"[perm] {entry['summary'][:60]} → {outcome}"
+         + (f" (by {by})" if decision else ""))
+    _broadcast_permission({
+        "type": "permission_resolved",
+        "id": entry["id"],
+        "decision": outcome,
+        "by": by or "",
+    }, "resolved")
+    _push()
+
+
+def _register_permission(conn, msg: dict) -> None:
+    """Take ownership of the hook's socket connection and start the approval
+    round-trip. Called from the socket thread; must not block it."""
+    if not _remote_permissions:
+        # Feature off (e.g. stale hook entry) — release the hook immediately
+        try:
+            conn.sendall(b'{"decision": null}\n')
+        except Exception:
+            pass
+        conn.close()
+        return
+
+    rid = str(msg.get("prompt_id") or "") or uuid.uuid4().hex
+    sid = msg.get("session_id", "unknown")
+    entry = {
+        "conn":       conn,
+        "id":         rid,
+        "session_id": sid,
+        "tool_name":  msg.get("tool_name", "?"),
+        "summary":    msg.get("summary", "") or msg.get("tool_name", "?"),
+        "tool_input": msg.get("tool_input", {}),
+        "cwd":        msg.get("cwd", ""),
+        "event":      threading.Event(),
+        "decision":   None,
+        "by":         None,
+        "expires":    time.time() + _permission_timeout,
+    }
+    with _lock:
+        _pending_perms[rid] = entry
+    _update_session(sid, "waiting")
+    _log(f"[perm] request: {entry['summary'][:60]}")
+    _push()
+    _broadcast_permission(_perm_request_payload(entry), "request")
+    threading.Thread(target=_permission_waiter, args=(entry,), daemon=True).start()
+
+
 # ── Hook installation ─────────────────────────────────────────────────────────
 
-def install_hooks(script_path: str) -> None:
+def install_hooks(script_path: str, remote_permissions: bool = False,
+                  permission_timeout: int = 60) -> None:
     """
     Ensure ~/.claude/settings.json has the monitor hooks pointing to this script.
     Idempotent: safe to call on every startup. Preserves all non-monitor hooks.
+    With remote_permissions the PermissionRequest hook becomes a blocking
+    decision hook; without it, the plain fire-and-forget status hook.
     """
     settings_path = os.path.expanduser("~/.claude/settings.json")
 
@@ -224,14 +404,23 @@ def install_hooks(script_path: str) -> None:
         return
 
     cmd_base = f"python3 {script_path} --hook"
+    if remote_permissions:
+        # Hook-side wait is permission_timeout; give Claude Code's own hook
+        # timeout headroom above that so it never kills a deciding hook.
+        perm_hook = {"type": "command",
+                     "command": f"{cmd_base} permission --permission-timeout {permission_timeout}",
+                     "timeout": permission_timeout + 15}
+    else:
+        perm_hook = {"type": "command", "command": f"{cmd_base} waiting"}
+
     desired = {
-        "PreToolUse":       f"{cmd_base} working",
-        "PostToolUse":      f"{cmd_base} working",
-        "UserPromptSubmit": f"{cmd_base} working",
-        "PermissionRequest": f"{cmd_base} waiting",
-        "PermissionDenied":  f"{cmd_base} working",
-        "Stop":              f"{cmd_base} ended",
-        "SessionEnd":        f"{cmd_base} ended",
+        "PreToolUse":        {"type": "command", "command": f"{cmd_base} working"},
+        "PostToolUse":       {"type": "command", "command": f"{cmd_base} working"},
+        "UserPromptSubmit":  {"type": "command", "command": f"{cmd_base} working"},
+        "PermissionRequest": perm_hook,
+        "PermissionDenied":  {"type": "command", "command": f"{cmd_base} working"},
+        "Stop":              {"type": "command", "command": f"{cmd_base} ended"},
+        "SessionEnd":        {"type": "command", "command": f"{cmd_base} ended"},
     }
 
     def is_monitor_cmd(cmd: str) -> bool:
@@ -241,11 +430,11 @@ def install_hooks(script_path: str) -> None:
     hooks = settings.get("hooks", {})
     changed = False
 
-    for event, full_cmd in desired.items():
+    for event, hook_dict in desired.items():
         existing = hooks.get(event, [])
         already = any(
             isinstance(entry, dict) and
-            any(isinstance(c, dict) and c.get("command") == full_cmd
+            any(isinstance(c, dict) and c == hook_dict
                 for c in entry.get("hooks", []))
             for entry in existing
         )
@@ -259,7 +448,7 @@ def install_hooks(script_path: str) -> None:
                      if not (isinstance(c, dict) and is_monitor_cmd(c.get("command", "")))]
             if inner:
                 cleaned.append({**entry, "hooks": inner})
-        cleaned.append({"matcher": "", "hooks": [{"type": "command", "command": full_cmd}]})
+        cleaned.append({"matcher": "", "hooks": [hook_dict]})
         hooks[event] = cleaned
         changed = True
 
@@ -342,6 +531,120 @@ def run_hook(state: str) -> None:
     except Exception:
         pass
 
+
+def _truncate_tool_input(tool_input, max_str: int = 500, max_total: int = 3000):
+    """Bound tool_input for transport: long strings clipped, payload capped."""
+    def clip(v, depth=0):
+        if isinstance(v, str):
+            return v if len(v) <= max_str else v[:max_str] + "…"
+        if isinstance(v, dict) and depth < 4:
+            return {k: clip(x, depth + 1) for k, x in list(v.items())[:20]}
+        if isinstance(v, list) and depth < 4:
+            return [clip(x, depth + 1) for x in v[:10]]
+        return v
+
+    out = clip(tool_input)
+    try:
+        if len(json.dumps(out)) > max_total:
+            return {"_truncated": json.dumps(out)[:max_total] + "…"}
+    except Exception:
+        return {}
+    return out
+
+
+def _tool_summary(tool_name: str, tool_input: dict) -> str:
+    """One-line human summary of what Claude wants to do."""
+    if tool_name == "Bash":
+        detail = tool_input.get("command", "")
+    elif tool_name in ("Edit", "Write", "Read", "NotebookEdit"):
+        detail = tool_input.get("file_path", "")
+    elif tool_name in ("WebFetch", "WebSearch"):
+        detail = tool_input.get("url", "") or tool_input.get("query", "")
+    else:
+        try:
+            detail = json.dumps(tool_input)
+        except Exception:
+            detail = ""
+    detail = " ".join(str(detail).split())
+    if len(detail) > 200:
+        detail = detail[:200] + "…"
+    return f"{tool_name}: {detail}" if detail else tool_name
+
+
+def run_permission_hook(wait_secs: int) -> None:
+    """
+    PermissionRequest hook mode (--hook permission): forward the prompt to the
+    daemon and block until someone approves/denies remotely or the daemon
+    times out. Prints the Claude Code decision JSON on allow/deny; prints
+    nothing otherwise, which makes Claude Code show its normal built-in prompt.
+    """
+    raw = ""
+    try:
+        raw = sys.stdin.read()
+        data = json.loads(raw) if raw.strip() else {}
+    except Exception:
+        data = {}
+
+    session_id = (data.get("session_id") or data.get("sessionId") or "unknown")
+    tool_name  = data.get("tool_name") or "?"
+    tool_input = data.get("tool_input") or {}
+
+    # Tools whose real interaction is answered locally (a multiple-choice / free
+    # text answer, not an allow/deny) can't be handled remotely — the hook can
+    # only allow/deny. (Verified: neither exit-2+stderr nor a JSON deny+reason
+    # feeds the chosen answer back to Claude.) Let them fall straight through to
+    # Claude Code's own UI instead of raising a useless "Allow?" prompt.
+    if tool_name in ("AskUserQuestion",):
+        return
+
+    request = {
+        "type":       "permission_request",
+        "session_id": session_id,
+        "prompt_id":  data.get("prompt_id") or uuid.uuid4().hex,
+        "tool_name":  tool_name,
+        "summary":    _tool_summary(tool_name, tool_input),
+        "tool_input": _truncate_tool_input(tool_input),
+        "cwd":        data.get("cwd", ""),
+    }
+
+    try:
+        sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        sock.settimeout(2.0)
+        sock.connect(SOCKET_PATH)
+        sock.sendall((json.dumps(request) + "\n").encode())
+
+        # The daemon always replies (decision or null at its own timeout);
+        # the extra headroom only matters if the daemon misbehaves.
+        sock.settimeout(wait_secs + 10)
+        buf = b""
+        while b"\n" not in buf and len(buf) < 4096:
+            chunk = sock.recv(4096)
+            if not chunk:
+                break
+            buf += chunk
+        sock.close()
+
+        decision = json.loads(buf.decode()).get("decision") if buf.strip() else None
+        if decision in ("allow", "deny"):
+            print(json.dumps({
+                "hookSpecificOutput": {
+                    "hookEventName": "PermissionRequest",
+                    "decision": {"behavior": decision},
+                }
+            }))
+        return
+    except Exception:
+        pass
+
+    # Daemon unreachable: behave like the plain status hook so the session
+    # still shows as waiting, and let Claude Code prompt normally.
+    try:
+        os.makedirs(MONITOR_STATE_DIR, exist_ok=True)
+        with open(os.path.join(MONITOR_STATE_DIR, f"{session_id}.json"), "w") as f:
+            json.dump({"state": "waiting", "time": time.time(), "session_id": session_id}, f)
+    except Exception:
+        pass
+
 # ── Usage API ─────────────────────────────────────────────────────────────────
 # Credentials are read fresh each poll so token rotations are picked up automatically.
 
@@ -395,6 +698,10 @@ def get_usage() -> dict | None:
         "weekly_pct":    weekly_pct,
         "session_reset": session_reset,
         "weekly_reset":  weekly_reset,
+        # Absolute reset instants (epoch seconds) so offline clients can keep
+        # counting down and zero the bar once the window has passed.
+        "session_reset_at": _epoch(session.get("resets_at", "")),
+        "weekly_reset_at":  _epoch(weekly.get("resets_at",  "")),
     }
 
 # ── Payload helpers ───────────────────────────────────────────────────────────
@@ -488,9 +795,24 @@ def _ws_thread(port: int, secret: str) -> None:
 
     async def handler(ws, *_) -> None:
         if secret:
+            # Challenge-response: the client proves it knows the secret by
+            # returning HMAC-SHA256(secret, nonce), so the secret itself never
+            # crosses the (plaintext ws://) wire. Legacy clients that send the
+            # secret directly are still accepted during the transition.
             try:
+                nonce = secrets.token_hex(16)
+                await ws.send(json.dumps({"type": "challenge", "nonce": nonce}))
                 msg = await asyncio.wait_for(ws.recv(), timeout=5.0)
-                if json.loads(msg).get("auth") != secret:
+                data = json.loads(msg)
+                expected = hmac.new(secret.encode(), nonce.encode(),
+                                    hashlib.sha256).hexdigest()
+                if "auth_hmac" in data:
+                    ok = hmac.compare_digest(str(data.get("auth_hmac", "")), expected)
+                elif "auth" in data:
+                    ok = hmac.compare_digest(str(data.get("auth", "")), secret)  # legacy
+                else:
+                    ok = False
+                if not ok:
                     _log(f"[ws] auth failed from {ws.remote_address}")
                     try:
                         await ws.send(json.dumps({"error": "unauthorized", "message": "Wrong password"}))
@@ -519,12 +841,38 @@ def _ws_thread(port: int, secret: str) -> None:
             with _lock:
                 usage = dict(_usage_cache)
             await ws.send(json.dumps({**usage, "sessions": sessions, "status": status}))
+
+            client_name = "ws"
             try:
-                await ws.wait_closed()
+                async for raw in ws:
+                    try:
+                        m = json.loads(raw)
+                    except Exception:
+                        continue
+                    mtype = m.get("type")
+
+                    if mtype == "subscribe":
+                        client_name = str(m.get("client") or "ws")
+                        if "permissions" in (m.get("features") or []) and _remote_permissions:
+                            _perm_clients.add(ws)
+                            _log(f"[ws] permission subscriber: {client_name}")
+                            # Replay pending requests so reconnecting clients catch up
+                            with _lock:
+                                pending = [_perm_request_payload(e)
+                                           for e in _pending_perms.values()]
+                            for p in pending:
+                                await ws.send(json.dumps(p))
+
+                    elif mtype == "permission_response":
+                        rid      = str(m.get("id", ""))
+                        decision = str(m.get("decision", ""))
+                        if _resolve_permission(rid, decision, client_name):
+                            _log(f"[perm] {decision} by {client_name}")
             except Exception:
                 pass  # connection reset without close frame — normal on app restart
         finally:
             _ws_clients.discard(ws)
+            _perm_clients.discard(ws)
             _log(f"[ws] client disconnected ({len(_ws_clients)} remaining)")
 
     async def serve() -> None:
@@ -688,19 +1036,38 @@ def _socket_thread() -> None:
             except socket.timeout:
                 continue
             try:
-                raw      = conn.recv(4096).decode()
-                msg      = json.loads(raw)
+                conn.settimeout(2.0)
+                raw = b""
+                while b"\n" not in raw and len(raw) < 8192:
+                    chunk = conn.recv(4096)
+                    if not chunk:
+                        break
+                    raw += chunk
+                msg = json.loads(raw.decode())
+
+                if msg.get("type") == "permission_request":
+                    _register_permission(conn, msg)   # takes ownership of conn
+                    conn = None
+                    continue
+
                 sid   = msg.get("session_id", "unknown")
                 state = msg.get("state", "")
 
                 if state:
                     _update_session(sid, state)
+                    # Any post-request activity in the session (PostToolUse or
+                    # PermissionDenied → "working", SessionEnd → "ended") means
+                    # the prompt was answered in Claude Code's own dialog —
+                    # resolve our pending request so remote prompts dismiss.
+                    if state in ("working", "ended"):
+                        _cancel_permissions_for(sid)
                     vprint(f"[socket] {sid[:8]}… → {state}")
                     _push()
             except Exception as e:
                 vprint(f"[socket] error: {e}")
             finally:
-                conn.close()
+                if conn is not None:
+                    conn.close()
     finally:
         srv.close()
         try:
@@ -793,12 +1160,159 @@ def uninstall() -> None:
         subprocess.run(["systemctl", "--user", "daemon-reload"], capture_output=True)
         print(f"[uninstall] removed {service_path}")
 
+    uninstall_vscode_extension()
+
     print("[uninstall] done")
 
 
 # ── Systemd service install ───────────────────────────────────────────────────
 
-def install_service(name: str, secret: str, ws_port: int, verbose: bool) -> None:
+# CLI name → user settings.json path (Linux)
+_VSCODE_FLAVORS = [
+    ("code",          "~/.config/Code/User/settings.json"),
+    ("code-insiders", "~/.config/Code - Insiders/User/settings.json"),
+    ("codium",        "~/.config/VSCodium/User/settings.json"),
+]
+_VSCODE_EXT_ID = "sensnology.codelight"
+
+
+def _find_vscode_cli() -> tuple[str, str] | None:
+    """Return (cli_path, settings_path) for the first VSCode flavor found."""
+    for cli, settings in _VSCODE_FLAVORS:
+        exe = shutil.which(cli)
+        if exe:
+            return exe, os.path.expanduser(settings)
+    return None
+
+
+def _configure_vscode_settings(settings_path: str, secret: str, ws_port: int) -> None:
+    """Write codelight.* keys into the VSCode user settings. VSCode reloads
+    settings.json live, so the extension picks this up without a restart."""
+    settings = {}
+    try:
+        with open(settings_path) as f:
+            settings = json.load(f)
+    except FileNotFoundError:
+        pass
+    except Exception:
+        # settings.json may legally contain comments (JSONC) — never risk
+        # clobbering a file we can't round-trip
+        print(f"[vscode] could not parse {settings_path} (comments?) — set "
+              f"codelight.secret = {secret!r} manually", file=sys.stderr)
+        return
+
+    desired = {"codelight.secret": secret}
+    if ws_port != 8765:
+        desired["codelight.port"] = ws_port
+    if all(settings.get(k) == v for k, v in desired.items()):
+        return
+    settings.update(desired)
+
+    os.makedirs(os.path.dirname(settings_path), exist_ok=True)
+    with open(settings_path, "w") as f:
+        json.dump(settings, f, indent=4)
+        f.write("\n")
+    print(f"[vscode] configured codelight.secret in {settings_path}")
+
+
+def _find_local_vsix() -> str | None:
+    """A repo checkout with a freshly built .vsix beats downloading."""
+    import glob
+    ext_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                           "..", "vscode-extension")
+    candidates = sorted(glob.glob(os.path.join(ext_dir, "codelight-*.vsix")),
+                        key=os.path.getmtime)
+    return candidates[-1] if candidates else None
+
+
+def install_vscode_extension(secret: str = "", ws_port: int = 8765) -> None:
+    """Install the codelight VSCode extension (local build or latest GitHub
+    release) and configure its settings to match this daemon."""
+    import subprocess
+
+    found = _find_vscode_cli()
+    release_url = "https://github.com/henrikekblad/codelight/releases"
+    if found is None:
+        print("[vscode] 'code' CLI not found — install the extension manually:",
+              file=sys.stderr)
+        print(f"[vscode]   download codelight-*.vsix from {release_url}", file=sys.stderr)
+        print("[vscode]   then: code --install-extension <file.vsix>", file=sys.stderr)
+        return
+    code, settings_path = found
+
+    vsix_path = _find_local_vsix()
+    if vsix_path:
+        print(f"[vscode] using local build {os.path.basename(vsix_path)}")
+    else:
+        try:
+            api = "https://api.github.com/repos/henrikekblad/codelight/releases/latest"
+            with urllib.request.urlopen(api, timeout=15) as r:
+                release = json.load(r)
+            asset = next((a for a in release.get("assets", [])
+                          if a.get("name", "").endswith(".vsix")), None)
+            if asset is None:
+                print(f"[vscode] no .vsix asset in the latest release — see {release_url}",
+                      file=sys.stderr)
+                return
+            cache = os.path.expanduser("~/.cache/codelight")
+            os.makedirs(cache, exist_ok=True)
+            vsix_path = os.path.join(cache, asset["name"])
+            print(f"[vscode] downloading {asset['name']}…")
+            urllib.request.urlretrieve(asset["browser_download_url"], vsix_path)
+        except Exception as e:
+            print(f"[vscode] could not download extension: {e}", file=sys.stderr)
+            return
+
+    try:
+        result = subprocess.run([code, "--install-extension", vsix_path, "--force"],
+                                capture_output=True, text=True)
+        if result.returncode != 0:
+            print(f"[vscode] install failed: {result.stderr.strip()}", file=sys.stderr)
+            return
+        print(f"[vscode] extension installed ({os.path.basename(vsix_path)})")
+    except Exception as e:
+        print(f"[vscode] could not install extension: {e}", file=sys.stderr)
+        return
+
+    if secret:
+        _configure_vscode_settings(settings_path, secret, ws_port)
+
+
+def uninstall_vscode_extension() -> None:
+    """Remove the extension and its settings from every VSCode flavor present."""
+    import subprocess
+
+    for cli, settings in _VSCODE_FLAVORS:
+        exe = shutil.which(cli)
+        if not exe:
+            continue
+        try:
+            listed = subprocess.run([exe, "--list-extensions"],
+                                    capture_output=True, text=True)
+            if _VSCODE_EXT_ID in listed.stdout:
+                subprocess.run([exe, "--uninstall-extension", _VSCODE_EXT_ID],
+                               capture_output=True, text=True)
+                print(f"[vscode] extension removed from {cli}")
+        except Exception:
+            pass
+
+        settings_path = os.path.expanduser(settings)
+        try:
+            with open(settings_path) as f:
+                data = json.load(f)
+            cleaned = {k: v for k, v in data.items() if not k.startswith("codelight.")}
+            if cleaned != data:
+                with open(settings_path, "w") as f:
+                    json.dump(cleaned, f, indent=4)
+                    f.write("\n")
+                print(f"[vscode] settings cleaned in {settings_path}")
+        except Exception:
+            pass
+
+
+def install_service(name: str, secret: str, ws_port: int, verbose: bool,
+                    remote_permissions: bool = False,
+                    permission_timeout: int = 60) -> None:
     """Write ~/.config/systemd/user/codelight.service and enable it."""
     import subprocess
 
@@ -812,6 +1326,10 @@ def install_service(name: str, secret: str, ws_port: int, verbose: bool) -> None
         args_line += f" --ws-port {ws_port}"
     if verbose:
         args_line += " --verbose"
+    if remote_permissions:
+        args_line += " --remote-permissions"
+        if permission_timeout != 60:
+            args_line += f" --permission-timeout {permission_timeout}"
 
     unit = f"""\
 [Unit]
@@ -872,6 +1390,15 @@ def main():
                         help="mDNS service name visible to clients (required)")
     parser.add_argument("--secret", default="",
                         help="Shared secret for WebSocket auth (match in screen config)")
+    parser.add_argument("--remote-permissions", action="store_true",
+                        help="Let clients (VSCode/Android/GNOME) approve Claude Code "
+                             "permission prompts remotely. Requires --secret.")
+    parser.add_argument("--permission-timeout", type=int, default=60,
+                        help="Seconds to wait for a remote decision before falling "
+                             "back to Claude Code's built-in prompt (default: 60)")
+    parser.add_argument("--vscode", action="store_true",
+                        help="With --install: also install the codelight VSCode "
+                             "extension from the latest GitHub release")
     args = parser.parse_args()
 
     if args.uninstall:
@@ -881,9 +1408,18 @@ def main():
     if args.install:
         if args.name is None:
             parser.error("--name is required with --install")
-        install_service(args.name, args.secret, args.ws_port, args.verbose)
+        if args.remote_permissions and not args.secret:
+            parser.error("--remote-permissions requires --secret (a remote approval "
+                         "is code-execution capability and must not be open to the LAN)")
+        install_service(args.name, args.secret, args.ws_port, args.verbose,
+                        args.remote_permissions, args.permission_timeout)
+        if args.vscode:
+            install_vscode_extension(args.secret, args.ws_port)
         return
 
+    if args.hook == "permission":
+        run_permission_hook(args.permission_timeout)
+        return
     if args.hook:
         run_hook(args.hook)
         return
@@ -894,7 +1430,15 @@ def main():
 
     _verbose = args.verbose
 
-    install_hooks(os.path.abspath(__file__))
+    global _remote_permissions, _permission_timeout
+    _permission_timeout = args.permission_timeout
+    _remote_permissions = args.remote_permissions
+    if _remote_permissions and not args.secret:
+        print("[perm] --remote-permissions requires --secret — feature disabled",
+              file=sys.stderr, flush=True)
+        _remote_permissions = False
+
+    install_hooks(os.path.abspath(__file__), _remote_permissions, _permission_timeout)
 
     print(f"codelight  [ws://0.0.0.0:{args.ws_port}]  (Ctrl-C to stop)", flush=True)
 

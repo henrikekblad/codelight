@@ -69,6 +69,42 @@ systemctl --user restart codelight  # restart after config change
 systemctl --user disable --now codelight  # disable
 ```
 
+## Remote permission approval
+
+With `--remote-permissions` the companion takes over Claude Code's permission
+prompts: the request is pushed to connected clients — the **Android app** and
+the **GNOME extension** — and whoever answers first decides. Works for both the
+`claude` CLI and the Claude Code VSCode plugin, which share the same hook
+configuration. (In the VSCode window itself you just answer Claude Code's own
+native dialog; the codelight VSCode extension only shows status. Remote
+approval is for when you're away from the computer.)
+
+```bash
+python3 companion/codelight.py --install --name henrik-laptop \
+    --secret mypassword --remote-permissions --vscode
+```
+
+- `--remote-permissions` **requires `--secret`** — an approval is code-execution
+  capability and must not be open to anyone on the LAN. Only authenticated
+  clients that explicitly subscribe receive permission requests; the ESP8266
+  screen and older apps never see them.
+- `--vscode` (with `--install`) installs the codelight VSCode status-bar
+  extension — from a locally built `.vsix` if you have a repo checkout,
+  otherwise downloaded from the latest GitHub release — and writes
+  `codelight.secret` into your VSCode user settings automatically. VSCode picks
+  the setting up live: no restart needed. `--uninstall` removes the extension
+  and its settings again.
+- If nobody answers within `--permission-timeout` seconds (default 60), Claude
+  Code falls back to its normal built-in prompt — you lose nothing by having
+  the feature on. Answering the built-in dialog also dismisses the remote
+  prompts.
+- Toggle prompts per client: the Android app's *Permission prompts* checkbox
+  and the GNOME extension's preferences switch (both default on).
+
+Under the hood this uses Claude Code's `PermissionRequest` hook, which fires
+only when an interactive prompt would appear — normal auto-allowed tool calls
+are unaffected. Headless `claude -p` runs never trigger it.
+
 ## Multiple companions on the same network
 
 Each person runs their own daemon with a distinct `--name`:
@@ -125,24 +161,25 @@ service is installed it stops, disables, and removes it.
 
 ## How it works
 
-```
-Claude Code               codelight.py (daemon)
-───────────────           ─────────────────────
-                          Unix socket thread
-hooks fire on  ────────►  receives event         broadcast
-tool use /      --hook    updates state          ────────►  GeekMagic Ultra (WebSocket)
-messages        mode                             ────────►  Android widget  (WebSocket)
-                                                 ────────►  GNOME extension (D-Bus signal)
-                          Usage poller thread
-                          fetches claude.ai API   push on
-                          every 60 s              each poll
+```mermaid
+flowchart LR
+    CC["Claude Code"] -->|--hook mode<br/>on tool use / messages| SOCK
 
-                          WebSocket server (:8765)
-                          clients connect in ◄───  screen discovers daemon via mDNS
-                                             ◄───  Android discovers daemon via mDNS
+    subgraph D["codelight.py daemon"]
+        SOCK["Unix socket thread<br/>receives event, updates state"]
+        USAGE["Usage poller<br/>claude.ai API, every 60s"]
+        WS["WebSocket server :8765"]
+        DBUS["D-Bus service (session bus)<br/>se.sensnology.codelight"]
+    end
 
-                          D-Bus service (session bus)
-                          se.sensnology.codelight ◄─── GNOME extension auto-discovers
+    SOCK -.->|broadcast| WS
+    USAGE -.->|push on each poll| WS
+    SOCK -.-> DBUS
+
+    WS -->|WebSocket| SCREEN["GeekMagic Ultra<br/>discovers via mDNS"]
+    WS -->|WebSocket| ANDROID["Android widget<br/>discovers via mDNS"]
+    WS -->|WebSocket status| VSCODE["VSCode extension"]
+    DBUS -->|D-Bus signal| GNOME["GNOME extension<br/>auto-discovers"]
 ```
 
 Status updates reach clients the moment a Claude Code hook fires — there is no
