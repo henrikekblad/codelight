@@ -2,5 +2,11 @@
 <schemalist>
   <schema id="org.gnome.shell.extensions.codelight"
           path="/org/gnome/shell/extensions/codelight-sensnology-se/">
+    <key name="permission-prompts" type="b">
+      <default>true</default>
+      <summary>Show permission prompts</summary>
+      <description>Show Claude Code permission requests as desktop notifications
+        with Allow/Deny buttons (companion must run with --remote-permissions).</description>
+    </key>
   </schema>
 </schemalist>

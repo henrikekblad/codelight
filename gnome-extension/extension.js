@@ -5,6 +5,7 @@ import Clutter from 'gi://Clutter';
 import * as Main from 'resource:///org/gnome/shell/ui/main.js';
 import * as PanelMenu from 'resource:///org/gnome/shell/ui/panelMenu.js';
 import * as PopupMenu from 'resource:///org/gnome/shell/ui/popupMenu.js';
+import * as MessageTray from 'resource:///org/gnome/shell/ui/messageTray.js';
 import {Extension} from 'resource:///org/gnome/shell/extensions/extension.js';
 
 const DBUS_NAME  = 'se.sensnology.codelight';
@@ -16,8 +17,19 @@ const IFACE_XML = `<node>
     <signal name="StatusChanged">
       <arg type="s" name="status_json"/>
     </signal>
+    <signal name="PermissionRequest">
+      <arg type="s" name="request_json"/>
+    </signal>
+    <signal name="PermissionResolved">
+      <arg type="s" name="resolved_json"/>
+    </signal>
     <method name="GetStatus">
       <arg direction="out" type="s"/>
+    </method>
+    <method name="RespondPermission">
+      <arg direction="in" type="s" name="request_id"/>
+      <arg direction="in" type="s" name="decision"/>
+      <arg direction="out" type="b"/>
     </method>
   </interface>
 </node>`;
@@ -132,6 +144,10 @@ export default class CodelightExtension extends Extension {
         this._proxy    = null;
         this._signalId = null;
         this._watchId  = null;
+        this._settings = this.getSettings();
+        this._permSignalIds = [];
+        this._permNotifs    = new Map();   // request id → MessageTray.Notification
+        this._notifSource   = null;
         this._indicator = new PanelMenu.Button(0.0, 'Codelight', false);
 
         // ── Panel button ────────────────────────────────────────────────────
@@ -199,6 +215,10 @@ export default class CodelightExtension extends Extension {
                     this._handleMessage(data);
                 } catch (_) {}
             });
+            this._permSignalIds.push(this._proxy.connectSignal('PermissionRequest',
+                (_proxy, _sender, [json]) => this._onPermissionRequest(json)));
+            this._permSignalIds.push(this._proxy.connectSignal('PermissionResolved',
+                (_proxy, _sender, [json]) => this._onPermissionResolved(json)));
             // Fetch current state immediately so the panel isn't blank on connect
             try {
                 const result = this._proxy.call_sync('GetStatus', null, Gio.DBusCallFlags.NONE, -1, null);
@@ -212,12 +232,101 @@ export default class CodelightExtension extends Extension {
     }
 
     _onDaemonVanished() {
-        if (this._signalId !== null && this._proxy !== null) {
-            this._proxy.disconnectSignal(this._signalId);
-            this._signalId = null;
-        }
-        this._proxy = null;
+        this._disconnectProxy();
+        this._destroyAllPermNotifs();
         this._setOffline();
+    }
+
+    _disconnectProxy() {
+        if (this._proxy !== null) {
+            if (this._signalId !== null)
+                this._proxy.disconnectSignal(this._signalId);
+            for (const id of this._permSignalIds)
+                this._proxy.disconnectSignal(id);
+        }
+        this._signalId = null;
+        this._permSignalIds = [];
+        this._proxy = null;
+    }
+
+    // ── Permission approval ──────────────────────────────────────────────────
+
+    _getNotifSource() {
+        if (this._notifSource) return this._notifSource;
+        let source;
+        try {
+            source = new MessageTray.Source({
+                title: 'Claude Code',
+                iconName: 'dialog-question-symbolic',
+            });
+        } catch (_) {
+            // GNOME 45 positional constructor
+            source = new MessageTray.Source('Claude Code', 'dialog-question-symbolic');
+        }
+        source.connect('destroy', () => { this._notifSource = null; });
+        Main.messageTray.add(source);
+        this._notifSource = source;
+        return source;
+    }
+
+    _onPermissionRequest(json) {
+        let req;
+        try { req = JSON.parse(json); } catch (_) { return; }
+        if (!req?.id || this._permNotifs.has(req.id)) return;
+        if (!this._settings.get_boolean('permission-prompts')) return;
+
+        const source = this._getNotifSource();
+        const body   = req.summary || req.tool_name || 'tool use';
+        let n;
+        try {
+            n = new MessageTray.Notification({
+                source,
+                title: 'Claude Code asks',
+                body,
+                urgency: MessageTray.Urgency.CRITICAL,   // stays until answered
+            });
+        } catch (_) {
+            // GNOME 45 positional constructor
+            n = new MessageTray.Notification(source, 'Claude Code asks', body);
+            n.setUrgency?.(MessageTray.Urgency.CRITICAL);
+        }
+        n.addAction('Allow', () => this._respondPermission(req.id, 'allow'));
+        n.addAction('Deny',  () => this._respondPermission(req.id, 'deny'));
+        n.connect('destroy', () => this._permNotifs.delete(req.id));
+        this._permNotifs.set(req.id, n);
+        if (source.addNotification)
+            source.addNotification(n);
+        else
+            source.showNotification(n);   // GNOME 45
+    }
+
+    _respondPermission(id, decision) {
+        try {
+            this._proxy?.call_sync('RespondPermission',
+                new GLib.Variant('(ss)', [id, decision]),
+                Gio.DBusCallFlags.NONE, -1, null);
+        } catch (e) {
+            logError(e, 'codelight RespondPermission failed');
+        }
+        this._destroyPermNotif(id);
+    }
+
+    _onPermissionResolved(json) {
+        try {
+            this._destroyPermNotif(JSON.parse(json)?.id);
+        } catch (_) {}
+    }
+
+    _destroyPermNotif(id) {
+        const n = this._permNotifs.get(id);
+        if (!n) return;
+        this._permNotifs.delete(id);
+        n.destroy();
+    }
+
+    _destroyAllPermNotifs() {
+        for (const id of [...this._permNotifs.keys()])
+            this._destroyPermNotif(id);
     }
 
     _handleMessage(data) {
@@ -266,11 +375,11 @@ export default class CodelightExtension extends Extension {
             Gio.bus_unwatch_name(this._watchId);
             this._watchId = null;
         }
-        if (this._signalId !== null && this._proxy !== null) {
-            this._proxy.disconnectSignal(this._signalId);
-            this._signalId = null;
-        }
-        this._proxy = null;
+        this._disconnectProxy();
+        this._destroyAllPermNotifs();
+        this._notifSource?.destroy();
+        this._notifSource = null;
+        this._settings = null;
         this._indicator?.destroy();
         this._indicator = null;
     }
