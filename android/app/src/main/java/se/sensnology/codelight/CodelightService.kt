@@ -34,6 +34,8 @@ import androidx.glance.state.PreferencesGlanceStateDefinition
 import java.util.concurrent.ArrayBlockingQueue
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
+import javax.crypto.Mac
+import javax.crypto.spec.SecretKeySpec
 
 class CodelightService : LifecycleService() {
 
@@ -44,6 +46,8 @@ class CodelightService : LifecycleService() {
         const val KEY_WEEKLY_PCT     = "weekly_pct"
         const val KEY_SESSION_RESET  = "session_reset"
         const val KEY_WEEKLY_RESET   = "weekly_reset"
+        const val KEY_SESSION_RESET_AT = "session_reset_at"   // epoch seconds
+        const val KEY_WEEKLY_RESET_AT  = "weekly_reset_at"
         const val KEY_STATUS          = "status"
         const val KEY_CONNECTED       = "connected"
         const val KEY_CONNECTED_HOST  = "connected_host"
@@ -57,13 +61,19 @@ class CodelightService : LifecycleService() {
         const val KEY_NOTIFY_ON_WAITING = "notify_waiting"
         const val KEY_NOTIFY_DELAY_SECS = "notify_delay"
         const val KEY_ALLOWED_SSIDS     = "allowed_ssids"
+        const val KEY_PERMISSION_PROMPTS = "permission_prompts"
 
         private const val ALERT_NOTIF_ID    = 2
         private const val ALERT_CHANNEL_ID  = "codelight_alerts"
         private const val SVC_NOTIF_ID      = 1
         private const val SVC_CHANNEL_ID    = "codelight_service"
         private const val PAUSED_CHANNEL_ID = "codelight_paused"
+        private const val PERM_CHANNEL_ID   = "codelight_permissions"
         private const val SERVICE_TYPE      = "_codelight._tcp"
+
+        private const val ACTION_PERMISSION_RESPONSE = "se.sensnology.codelight.PERMISSION_RESPONSE"
+        private const val EXTRA_REQUEST_ID = "request_id"
+        private const val EXTRA_DECISION   = "decision"
     }
 
     data class DiscoveredService(val name: String, val host: String, val port: Int)
@@ -89,8 +99,13 @@ class CodelightService : LifecycleService() {
 
     private var reconnectJob: kotlinx.coroutines.Job? = null
     private var notifJob:     kotlinx.coroutines.Job? = null
+    private var tickJob:      kotlinx.coroutines.Job? = null
     private var lastStatus = ""
     private var connectedName: String? = null   // mDNS name of the connected companion
+
+    // Pending permission requests: request id → notification id
+    private val permNotifIds = mutableMapOf<String, Int>()
+    private var nextPermNotifId = 1000
 
     override fun onCreate() {
         super.onCreate()
@@ -109,10 +124,25 @@ class CodelightService : LifecycleService() {
         nsdManager = getSystemService(NSD_SERVICE) as NsdManager
         registerNetworkCallback()
         startDiscovery()
+
+        // Refresh the widget every minute so the reset countdown stays live and
+        // the bars zero out once a usage window has passed — even with no
+        // connection, since the widget extrapolates from the stored reset time.
+        tickJob = lifecycleScope.launch {
+            while (true) {
+                kotlinx.coroutines.delay(60_000)
+                pushWidgetUpdate()
+            }
+        }
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         super.onStartCommand(intent, flags, startId)
+        if (intent?.action == ACTION_PERMISSION_RESPONSE) {
+            val id       = intent.getStringExtra(EXTRA_REQUEST_ID)
+            val decision = intent.getStringExtra(EXTRA_DECISION)
+            if (id != null && decision != null) sendPermissionResponse(id, decision)
+        }
         return START_STICKY
     }
 
@@ -122,6 +152,7 @@ class CodelightService : LifecycleService() {
         stopDiscovery()
         reconnectJob?.cancel()
         notifJob?.cancel()
+        tickJob?.cancel()
         webSocket?.close(1000, "Service stopped")
         // Do NOT shut down httpClient.dispatcher.executorService here — doing so after
         // webSocket.close() causes any in-flight OkHttp callback that tries to reconnect
@@ -238,9 +269,10 @@ class CodelightService : LifecycleService() {
 
         webSocket = httpClient.newWebSocket(request, object : WebSocketListener() {
             override fun onOpen(webSocket: WebSocket, response: Response) {
-                val authing = secret.isNotBlank()
-                if (authing) webSocket.send("""{"auth":"$secret"}""")
-                Log.i("Codelight", "WS onOpen host=$host port=$port auth=$authing")
+                // With a secret the daemon sends a challenge first and we reply
+                // with an HMAC (see parseAndStore); without one, subscribe now.
+                if (secret.isBlank()) subscribe(webSocket)
+                Log.i("Codelight", "WS onOpen host=$host port=$port auth=${secret.isNotBlank()}")
                 reconnectJob?.cancel()
                 reconnectJob = null
                 setConnected(true, host, port)
@@ -272,15 +304,40 @@ class CodelightService : LifecycleService() {
         })
     }
 
+    private fun subscribe(ws: WebSocket) {
+        if (getSharedPreferences(SETTINGS_PREFS, MODE_PRIVATE)
+                .getBoolean(KEY_PERMISSION_PROMPTS, true)) {
+            ws.send("""{"type":"subscribe","features":["permissions"],"client":"android"}""")
+        }
+    }
+
+    /** Prove knowledge of the secret without sending it: HMAC-SHA256(secret, nonce). */
+    private fun respondChallenge(nonce: String) {
+        val secret = getSharedPreferences(SETTINGS_PREFS, MODE_PRIVATE).getString(KEY_SECRET, "") ?: ""
+        val ws = webSocket ?: return
+        val mac = Mac.getInstance("HmacSHA256")
+        mac.init(SecretKeySpec(secret.toByteArray(), "HmacSHA256"))
+        val proof = mac.doFinal(nonce.toByteArray()).joinToString("") { "%02x".format(it) }
+        ws.send("""{"auth_hmac":"$proof"}""")
+        subscribe(ws)
+    }
+
     private fun parseAndStore(json: String) {
         try {
             val obj  = JSONObject(json)
-            if (obj.optString("type") == "config") return
+            when (obj.optString("type")) {
+                "config"              -> return
+                "challenge"           -> { respondChallenge(obj.optString("nonce")); return }
+                "permission_request"  -> { showPermissionNotification(obj); return }
+                "permission_resolved" -> { cancelPermissionNotification(obj.optString("id")); return }
+            }
             val edit = getSharedPreferences(STATE_PREFS, MODE_PRIVATE).edit()
             if (obj.has("session_pct"))   edit.putFloat(KEY_SESSION_PCT,   obj.getDouble("session_pct").toFloat())
             if (obj.has("weekly_pct"))    edit.putFloat(KEY_WEEKLY_PCT,    obj.getDouble("weekly_pct").toFloat())
             if (obj.has("session_reset")) edit.putString(KEY_SESSION_RESET, obj.getString("session_reset"))
             if (obj.has("weekly_reset"))  edit.putString(KEY_WEEKLY_RESET,  obj.getString("weekly_reset"))
+            if (obj.has("session_reset_at")) edit.putLong(KEY_SESSION_RESET_AT, obj.getLong("session_reset_at"))
+            if (obj.has("weekly_reset_at"))  edit.putLong(KEY_WEEKLY_RESET_AT,  obj.getLong("weekly_reset_at"))
             if (obj.has("status")) {
                 // companions < 1.0.9 send "inactive" for what is now "idle"
                 val newStatus = obj.getString("status").let { if (it == "inactive") "idle" else it }
@@ -308,9 +365,11 @@ class CodelightService : LifecycleService() {
         val notifyWaiting = prefs.getBoolean(KEY_NOTIFY_ON_WAITING, false)
         val delaySecs     = prefs.getInt(KEY_NOTIFY_DELAY_SECS, 30).toLong()
 
+        // A pending permission request already shows its own notification —
+        // don't also raise the generic "waiting for input" alert.
         val shouldNotify = when (status) {
             "idle" -> notifyIdle
-            "waiting"  -> notifyWaiting
+            "waiting"  -> notifyWaiting && permNotifIds.isEmpty()
             else       -> false
         }
         if (!shouldNotify) return
@@ -340,6 +399,66 @@ class CodelightService : LifecycleService() {
             .setAutoCancel(true)
             .build()
         getSystemService(NotificationManager::class.java).notify(ALERT_NOTIF_ID, notif)
+    }
+
+    // ── Remote permission approval ────────────────────────────────────────────
+
+    private fun showPermissionNotification(obj: JSONObject) {
+        val id = obj.optString("id")
+        if (id.isEmpty() || permNotifIds.containsKey(id)) return   // duplicate/replay
+        if (!getSharedPreferences(SETTINGS_PREFS, MODE_PRIVATE)
+                .getBoolean(KEY_PERMISSION_PROMPTS, true)) return
+
+        // The "waiting" status broadcast arrives just before this and may have
+        // scheduled/shown the generic waiting alert — supersede it.
+        notifJob?.cancel()
+        getSystemService(NotificationManager::class.java).cancel(ALERT_NOTIF_ID)
+
+        val notifId = nextPermNotifId++
+        permNotifIds[id] = notifId
+
+        fun actionIntent(decision: String, requestCode: Int): PendingIntent {
+            val intent = Intent(this, CodelightService::class.java)
+                .setAction(ACTION_PERMISSION_RESPONSE)
+                .putExtra(EXTRA_REQUEST_ID, id)
+                .putExtra(EXTRA_DECISION, decision)
+            return PendingIntent.getService(
+                this, requestCode, intent,
+                PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT,
+            )
+        }
+
+        val summary   = obj.optString("summary", obj.optString("tool_name", "tool use"))
+        val expiresAt = obj.optLong("expires_at", 0)
+        val builder = NotificationCompat.Builder(this, PERM_CHANNEL_ID)
+            .setSmallIcon(android.R.drawable.stat_sys_warning)
+            .setContentTitle("Claude Code asks")
+            .setContentText(summary)
+            .setStyle(NotificationCompat.BigTextStyle().bigText(summary))
+            .addAction(0, "Allow", actionIntent("allow", notifId * 2))
+            .addAction(0, "Deny",  actionIntent("deny",  notifId * 2 + 1))
+            .setDefaults(NotificationCompat.DEFAULT_ALL)
+            .setCategory(NotificationCompat.CATEGORY_CALL)
+            .setOngoing(true)
+        if (expiresAt > 0) {
+            val ttl = expiresAt * 1000 - System.currentTimeMillis()
+            if (ttl > 0) builder.setTimeoutAfter(ttl)   // auto-dismiss at daemon timeout
+        }
+        getSystemService(NotificationManager::class.java).notify(notifId, builder.build())
+    }
+
+    private fun cancelPermissionNotification(id: String) {
+        permNotifIds.remove(id)?.let {
+            getSystemService(NotificationManager::class.java).cancel(it)
+        }
+    }
+
+    private fun sendPermissionResponse(id: String, decision: String) {
+        val sent = webSocket?.send(
+            """{"type":"permission_response","id":"$id","decision":"$decision"}"""
+        ) ?: false
+        Log.i("Codelight", "permission $decision for $id (sent=$sent)")
+        cancelPermissionNotification(id)
     }
 
     private fun sendAuthFailedNotification() {
@@ -548,6 +667,11 @@ class CodelightService : LifecycleService() {
         nm.createNotificationChannel(
             NotificationChannel(PAUSED_CHANNEL_ID, "codelight paused", NotificationManager.IMPORTANCE_MIN)
                 .apply { setShowBadge(false) }
+        )
+        nm.createNotificationChannel(
+            NotificationChannel(PERM_CHANNEL_ID, "codelight permission requests",
+                NotificationManager.IMPORTANCE_HIGH)
+                .apply { enableVibration(true); enableLights(true) }
         )
     }
 }

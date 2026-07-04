@@ -42,10 +42,21 @@ class CodelightWidget : GlanceAppWidget() {
         // Glance re-executes it whenever the tick changes.
         currentState<Preferences>()[KEY_TICK]
         val prefs = context.getSharedPreferences(CodelightService.STATE_PREFS, Context.MODE_PRIVATE)
-        val sessionPct   = prefs.getFloat(CodelightService.KEY_SESSION_PCT, 0f)
-        val weeklyPct    = prefs.getFloat(CodelightService.KEY_WEEKLY_PCT, 0f)
-        val sessionReset = prefs.getString(CodelightService.KEY_SESSION_RESET, "--") ?: "--"
-        val weeklyReset  = prefs.getString(CodelightService.KEY_WEEKLY_RESET, "--") ?: "--"
+        val now          = System.currentTimeMillis() / 1000
+        val sessionResetAt = prefs.getLong(CodelightService.KEY_SESSION_RESET_AT, 0)
+        val weeklyResetAt  = prefs.getLong(CodelightService.KEY_WEEKLY_RESET_AT, 0)
+        // Once a usage window's reset time has passed, the limit has been
+        // restored — show 0% even while offline so you know you can resume.
+        val sessionPct   = if (sessionResetAt in 1 until now) 0f
+                           else prefs.getFloat(CodelightService.KEY_SESSION_PCT, 0f)
+        val weeklyPct    = if (weeklyResetAt in 1 until now) 0f
+                           else prefs.getFloat(CodelightService.KEY_WEEKLY_PCT, 0f)
+        // Count down live from the absolute reset time; fall back to the
+        // daemon's snapshot string for pre-timestamp payloads.
+        val sessionReset = countdown(sessionResetAt, now)
+            ?: prefs.getString(CodelightService.KEY_SESSION_RESET, "--") ?: "--"
+        val weeklyReset  = countdown(weeklyResetAt, now)
+            ?: prefs.getString(CodelightService.KEY_WEEKLY_RESET, "--") ?: "--"
         val status       = prefs.getString(CodelightService.KEY_STATUS, "idle") ?: "idle"
         val connected    = prefs.getBoolean(CodelightService.KEY_CONNECTED, false)
         Log.d("Codelight", "WidgetContent render: connected=$connected status=$status session=${(sessionPct*100).toInt()}% weekly=${(weeklyPct*100).toInt()}%")
@@ -113,6 +124,22 @@ class CodelightWidget : GlanceAppWidget() {
                     )
                 }
             }
+        }
+    }
+
+    /** Live countdown to an epoch-seconds reset time (e.g. "3h 45m", "now").
+     *  Returns null when no timestamp is available (older daemon). */
+    private fun countdown(resetAt: Long, now: Long): String? {
+        if (resetAt <= 0) return null
+        val diff = resetAt - now
+        if (diff <= 0) return "now"
+        val days = diff / 86400
+        val hours = (diff % 86400) / 3600
+        val mins = (diff % 3600) / 60
+        return when {
+            days > 0  -> "${days}d ${hours}h"
+            hours > 0 -> "${hours}h ${mins}m"
+            else      -> "${mins}m"
         }
     }
 

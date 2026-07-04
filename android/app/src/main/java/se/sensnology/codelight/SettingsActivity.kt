@@ -82,6 +82,7 @@ private fun SettingsScreen() {
     var notifyIdle     by remember { mutableStateOf(settings.getBoolean(CodelightService.KEY_NOTIFY_ON_IDLE,    false)) }
     var notifyWaiting  by remember { mutableStateOf(settings.getBoolean(CodelightService.KEY_NOTIFY_ON_WAITING, false)) }
     var notifyDelay    by remember { mutableStateOf(settings.getInt(CodelightService.KEY_NOTIFY_DELAY_SECS, 30).toString()) }
+    var permPrompts    by remember { mutableStateOf(settings.getBoolean(CodelightService.KEY_PERMISSION_PROMPTS, true)) }
     var allowedSsids   by remember { mutableStateOf(
         (settings.getStringSet(CodelightService.KEY_ALLOWED_SSIDS, emptySet()) ?: emptySet())
             .sorted().joinToString(", ")
@@ -120,6 +121,7 @@ private fun SettingsScreen() {
             .putBoolean(CodelightService.KEY_NOTIFY_ON_IDLE,    notifyIdle)
             .putBoolean(CodelightService.KEY_NOTIFY_ON_WAITING, notifyWaiting)
             .putInt(CodelightService.KEY_NOTIFY_DELAY_SECS,     notifyDelay.toIntOrNull() ?: 30)
+            .putBoolean(CodelightService.KEY_PERMISSION_PROMPTS, permPrompts)
             .putStringSet(CodelightService.KEY_ALLOWED_SSIDS,   ssids)
             .apply {
                 if (selectedName != null) putString(CodelightService.KEY_SELECTED_NAME, selectedName)
@@ -285,6 +287,11 @@ private fun SettingsScreen() {
                     modifier      = Modifier.width(110.dp),
                 )
                 Text("Useful if you're at the computer and about to type.",
+                     style = TextStyle(color = muted, fontSize = 10.sp))
+                Spacer(Modifier.height(8.dp))
+                CheckRow("Permission prompts", permPrompts, accent, text) { permPrompts = it }
+                Text("Approve Claude Code permission requests from the phone. " +
+                     "Requires the companion to run with --remote-permissions.",
                      style = TextStyle(color = muted, fontSize = 10.sp))
             }
 
