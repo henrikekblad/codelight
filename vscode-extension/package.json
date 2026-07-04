@@ -1,0 +1,65 @@
+{
+  "name": "codelight",
+  "displayName": "codelight",
+  "description": "Claude Code status in the VSCode status bar, from the codelight companion daemon",
+  "version": "1.0.12",
+  "publisher": "sensnology",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/henrikekblad/codelight"
+  },
+  "engines": {
+    "vscode": "^1.85.0"
+  },
+  "categories": [
+    "Other"
+  ],
+  "activationEvents": [
+    "onStartupFinished"
+  ],
+  "main": "./dist/extension.js",
+  "contributes": {
+    "configuration": {
+      "title": "codelight",
+      "properties": {
+        "codelight.enabled": {
+          "type": "boolean",
+          "default": true,
+          "description": "Connect to the codelight companion daemon"
+        },
+        "codelight.host": {
+          "type": "string",
+          "default": "127.0.0.1",
+          "description": "Companion daemon host"
+        },
+        "codelight.port": {
+          "type": "number",
+          "default": 8765,
+          "description": "Companion daemon WebSocket port"
+        },
+        "codelight.secret": {
+          "type": "string",
+          "default": "",
+          "description": "Shared secret (must match the daemon's --secret)"
+        }
+      }
+    }
+  },
+  "scripts": {
+    "build": "esbuild src/extension.ts --bundle --outfile=dist/extension.js --external:vscode --format=cjs --platform=node --minify",
+    "vscode:prepublish": "npm run build",
+    "package": "vsce package"
+  },
+  "dependencies": {
+    "ws": "^8.17.0"
+  },
+  "devDependencies": {
+    "@types/node": "^20.0.0",
+    "@types/vscode": "^1.85.0",
+    "@types/ws": "^8.5.0",
+    "@vscode/vsce": "^3.0.0",
+    "esbuild": "^0.24.0",
+    "typescript": "^5.4.0"
+  }
+}
