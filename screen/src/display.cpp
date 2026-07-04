@@ -315,13 +315,18 @@ void displayUpdateClock() {
 // ── Sleep screen: bouncing logo ───────────────────────────────────────────────
 //
 // Two 1-bit sprites (colors applied at push time via setBitmapColor): the logo
-// slides 2px per frame DVD-style, the clock sits in a fixed corner and is
-// repainted whenever the logo passes over it. Backlight is PWM-dimmed.
+// drifts DVD-style, the clock sits in a fixed corner and is repainted whenever
+// the logo passes over it. Backlight is PWM-dimmed.
+//
+// Velocity is a float vector at a random angle, re-jittered on every wall
+// bounce — with a fixed ±step the path is locked to 45° diagonals and traces
+// the same square lattice forever.
 
-#define SLEEP_FRAME_MS  40    // 25 fps
-#define SLEEP_STEP      2     // px per frame; logo sprite has this much margin
-#define SLEEP_BL_LEVEL  50    // backlight duty while asleep (0-255)
-#define FLASH_FRAMES    12    // corner-hit flash duration
+#define SLEEP_FRAME_MS  40      // 25 fps
+#define SLEEP_SPEED     2.4f    // px per frame
+#define SLEEP_STEP      3       // sprite margin; must cover ceil(SLEEP_SPEED)
+#define SLEEP_BL_LEVEL  50      // backlight duty while asleep (0-255)
+#define FLASH_FRAMES    12      // corner-hit flash duration
 
 #define CLK_W  60
 #define CLK_H  16
@@ -332,12 +337,21 @@ static TFT_eSprite logoSpr(&tft);
 static TFT_eSprite clkSpr(&tft);
 static bool sleeping   = false;
 static bool sleepAnim  = false;   // sprites allocated, animation running
-static int  lx, ly, ldx, ldy;
+static int  lx, ly;               // integer draw position (also used by the SVG preview)
+static float fx, fy, vx, vy;      // exact position / velocity
 static uint8_t flashLeft = 0;
 static unsigned long lastFrameMs = 0;
 static int lastClkMin = -1;
 
 bool displaySleeping() { return sleeping; }
+
+// Pick a fresh speed at a random 25°–65° angle, keeping the current direction
+// signs — steep/shallow extremes (edge-scrubbing, pure diagonals) are excluded
+static void sleepRandomizeVelocity() {
+    float ang = (25.0f + (int)(RANDOM_REG32 % 41)) * (PI / 180.0f);
+    vx = (vx < 0 ? -1.0f : 1.0f) * SLEEP_SPEED * cosf(ang);
+    vy = (vy < 0 ? -1.0f : 1.0f) * SLEEP_SPEED * sinf(ang);
+}
 
 static void drawSleepClock() {
     time_t now = time(nullptr);
@@ -364,10 +378,14 @@ void displaySleepStart() {
     analogWriteRange(255);
     analogWrite(TFT_BL, 255 - SLEEP_BL_LEVEL);   // active LOW
 
-    // Random start position — a centered start on a 45° diagonal would
-    // ping-pong along the top-left↔bottom-right diagonal forever
-    lx = SLEEP_STEP + (int)(millis()       % (240 - LOGO_W - 2 * SLEEP_STEP));
-    ly = SLEEP_STEP + (int)((millis() / 3) % (240 - LOGO_H - 2 * SLEEP_STEP));
+    // Random start position and direction (hardware RNG)
+    fx = (float)(SLEEP_STEP + (int)(RANDOM_REG32 % (240 - LOGO_W - 2 * SLEEP_STEP)));
+    fy = (float)(SLEEP_STEP + (int)(RANDOM_REG32 % (240 - LOGO_H - 2 * SLEEP_STEP)));
+    vx = (RANDOM_REG32 & 1) ? 1.0f : -1.0f;
+    vy = (RANDOM_REG32 & 1) ? 1.0f : -1.0f;
+    sleepRandomizeVelocity();
+    lx = (int)fx;
+    ly = (int)fy;
 
     logoSpr.setColorDepth(1);
     clkSpr.setColorDepth(1);
@@ -384,9 +402,6 @@ void displaySleepStart() {
     logoSpr.setBitmapColor(COL_LOGO, COL_BG);
     clkSpr.setBitmapColor(COL_RESET, COL_BG);
 
-    // 45° diagonal seeded by uptime
-    ldx = (millis() & 1) ? SLEEP_STEP : -SLEEP_STEP;
-    ldy = (millis() & 2) ? SLEEP_STEP : -SLEEP_STEP;
     flashLeft   = 0;
     lastFrameMs = 0;
     drawSleepClock();
@@ -396,14 +411,17 @@ void displaySleepTick(unsigned long now) {
     if (!sleeping || !sleepAnim || now - lastFrameMs < SLEEP_FRAME_MS) return;
     lastFrameMs = now;
 
-    lx += ldx;
-    ly += ldy;
+    fx += vx;
+    fy += vy;
     bool hitX = false, hitY = false;
-    if (lx <= 0 || lx >= 240 - LOGO_W) { ldx = -ldx; hitX = true; }
-    if (ly <= 0 || ly >= 240 - LOGO_H) { ldy = -ldy; hitY = true; }
-    lx = constrain(lx, 0, 240 - LOGO_W);
-    ly = constrain(ly, 0, 240 - LOGO_H);
+    if (fx <= 0.0f)                { fx = 0.0f;                vx =  fabsf(vx); hitX = true; }
+    else if (fx >= 240 - LOGO_W)   { fx = 240 - LOGO_W;        vx = -fabsf(vx); hitX = true; }
+    if (fy <= 0.0f)                { fy = 0.0f;                vy =  fabsf(vy); hitY = true; }
+    else if (fy >= 240 - LOGO_H)   { fy = 240 - LOGO_H;        vy = -fabsf(vy); hitY = true; }
+    if (hitX || hitY) sleepRandomizeVelocity();   // never settle into an orbit
     if (hitX && hitY) flashLeft = FLASH_FRAMES;   // corner!
+    lx = (int)fx;
+    ly = (int)fy;
 
     if (flashLeft > 0) {
         flashLeft--;

@@ -25,9 +25,15 @@ for _ in 1 2 3; do
 done
 if [ -n "$sync_ok" ]; then
     echo "── Synchronous updater found on :81"
-    resp=$(curl -s --max-time 300 -F "firmware=@$BIN" "http://$HOST:81/update") || true
-    if ! grep -qi "Update Success" <<<"$resp"; then
-        echo "error: unexpected response: ${resp:-connection dropped}" >&2
+    ok=""
+    for attempt in 1 2 3; do
+        resp=$(curl -s --max-time 300 -F "firmware=@$BIN" "http://$HOST:81/update") || true
+        if grep -qi "Update Success" <<<"$resp"; then ok=1; break; fi
+        echo "   attempt $attempt: ${resp:-connection dropped}" >&2
+        sleep 3
+    done
+    if [ -z "$ok" ]; then
+        echo "error: giving up after 3 attempts" >&2
         exit 1
     fi
     echo "── Uploaded $(stat -c %s "$BIN") bytes, device is rebooting"
