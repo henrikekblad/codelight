@@ -4,6 +4,7 @@
 #include <ESPAsyncWebServer.h>
 #include <WebSocketsClient.h>
 #include <ArduinoJson.h>
+#include <Crypto.h>
 #include <time.h>
 #include "config.h"
 #include "display.h"
@@ -35,6 +36,22 @@ static const char* ntpServer = "pool.ntp.org";
 // If displayInit() crashes, next boot sees DISPLAY_TRYING and skips it.
 #define DISPLAY_OK     0x12345678u
 #define DISPLAY_TRYING 0xDEADBEEFu
+
+// HMAC-SHA256(secret, nonce) as lowercase hex — proves knowledge of the
+// secret to the daemon without ever transmitting it.
+static String hmacHex(const String& secret, const String& nonce) {
+    uint8_t out[32];
+    experimental::crypto::SHA256::hmac(nonce.c_str(), nonce.length(),
+                                       secret.c_str(), secret.length(), out, sizeof(out));
+    String hex;
+    hex.reserve(64);
+    char b[3];
+    for (size_t i = 0; i < sizeof(out); i++) {
+        snprintf(b, sizeof(b), "%02x", out[i]);
+        hex += b;
+    }
+    return hex;
+}
 
 static void applyStatus(uint8_t* payload, size_t length) {
     JsonDocument doc;
@@ -99,10 +116,8 @@ static void wsEvent(WStype_t type, uint8_t* payload, size_t length) {
             displayData.authFailed = false;
             lastActiveMs = millis();
             if (displayReady) displayWake();
-            if (cfg.companionSecret.length() > 0) {
-                String auth = "{\"auth\":\"" + cfg.companionSecret + "\"}";
-                wsClient.sendTXT(auth);
-            }
+            // Auth happens via the daemon's challenge (see WStype_TEXT) so the
+            // secret never crosses the wire — nothing to send on connect.
             break;
 
         case WStype_TEXT:
@@ -122,6 +137,16 @@ static void wsEvent(WStype_t type, uint8_t* payload, size_t length) {
                     break;
                 }
 
+                if (strcmp(doc["type"] | "", "challenge") == 0) {
+                    if (cfg.companionSecret.length() > 0) {
+                        String nonce = doc["nonce"] | "";
+                        String proof = hmacHex(cfg.companionSecret, nonce);
+                        String reply = "{\"auth_hmac\":\"" + proof + "\"}";
+                        wsClient.sendTXT(reply);
+                    }
+                    break;
+                }
+
                 if (strcmp(doc["type"] | "", "config") == 0) {
                     if (doc["utc_offset"].is<long>()) {
                         long off = doc["utc_offset"].as<long>();
@@ -130,6 +155,10 @@ static void wsEvent(WStype_t type, uint8_t* payload, size_t length) {
                     }
                     break;
                 }
+
+                // Any other typed frame (e.g. permission events for subscribed
+                // clients) is not a status payload — never feed it to the display
+                if (strlen(doc["type"] | "") > 0) break;
 
                 applyStatus(payload, length);
             }
