@@ -1,6 +1,6 @@
 # codelight — Claude Code status display
 
-Live Claude Code dashboard built with four components. Pick and choose whatever suits your needs:
+Live Claude Code dashboard built with five components. Pick and choose whatever suits your needs:
 
 | Component | Description | Example
 |---|---|---|
@@ -8,6 +8,13 @@ Live Claude Code dashboard built with four components. Pick and choose whatever 
 | [**screen/**](screen/README.md) | ESP8266 firmware for the GeekMagic Ultra — renders usage bars and status | <img src="assets/demo.jpg" width="600" alt="GeekMagic Ultra showing the codelight IDLE screen"> |
 | [**android/**](android/README.md) | Android home-screen widget showing the same data via WebSocket | <img src="assets/android.jpg" width="360" alt="codelight Android widget"> |
 | [**gnome-extension/**](gnome-extension/README.md) | GNOME Shell status-bar extension | <img src="assets/gnome-extension.png" width="600" alt="codelight GNOME Shell extension">|
+| [**vscode-extension/**](vscode-extension/README.md) | VSCode status-bar extension showing Claude status | |
+
+**Remote permission approval:** with the companion's `--remote-permissions`
+flag, Claude Code permission prompts can be approved remotely from the phone
+or a GNOME notification — bypassing the built-in dialog (in VSCode you answer
+Claude Code's own native dialog). See
+[companion/README.md](companion/README.md#remote-permission-approval).
 
 The different UI variants shows basically the same information.
 <table border="1" padding="3"><tr>
@@ -20,28 +27,32 @@ The different UI variants shows basically the same information.
 
 ## Architecture
 
+```mermaid
+flowchart LR
+    CC["Claude Code<br/>(CLI + VSCode plugin)"] -->|hooks fire on<br/>tool use / messages| D
+
+    subgraph D["codelight.py daemon"]
+        SOCK["Unix socket thread<br/>receives hook events"]
+        USAGE["Usage poller<br/>claude.ai API every 60s"]
+        WS["WebSocket server :8765"]
+        DBUS["D-Bus service<br/>se.sensnology.codelight"]
+    end
+
+    WS -->|status broadcast| SCREEN["GeekMagic Ultra<br/>(mDNS)"]
+    WS -->|status broadcast| ANDROID["Android widget<br/>(mDNS)"]
+    WS -->|status| VSCODE["VSCode extension"]
+    DBUS -->|status + permissions| GNOME["GNOME extension"]
+
+    USAGE -.-> WS
+    SOCK -.-> WS
+    SOCK -.-> DBUS
 ```
-Claude Code               codelight.py (daemon)
-───────────────           ─────────────────────
-                          Unix socket thread
-hooks fire on  ────────►  receives event         broadcast
-tool use /      --hook    updates state          ────────►  GeekMagic Ultra (WebSocket)
-messages        mode                             ────────►  Android widget  (WebSocket)
-                                                 ────────►  GNOME extension (D-Bus signal)
-                          Usage poller thread
-                          fetches claude.ai API   push on
-                          every 60 s              each poll
 
-                          WebSocket server (:8765)
-                          clients connect in ◄───  screen discovers companion via mDNS
-                                             ◄───  Android discovers companion via mDNS
-
-                          D-Bus service (session bus)
-                          se.sensnology.codelight ◄─── GNOME extension auto-discovers
-```
-
-The ESP8266 screen and Android widget use WebSocket (discovered via mDNS). The GNOME
-extension uses D-Bus on the session bus — no network socket or configuration needed.
+The ESP8266 screen and Android widget use WebSocket (discovered via mDNS). The
+GNOME extension uses D-Bus on the session bus — no network socket or
+configuration needed. With `--remote-permissions`, permission prompts are also
+pushed to the GNOME extension and the Android app for remote approval (see
+[companion/README.md](companion/README.md#remote-permission-approval)).
 
 ## Quick start
 

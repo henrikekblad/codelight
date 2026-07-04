@@ -57,6 +57,32 @@ jobs:
           files: android/app/build/outputs/apk/release/codelight-${{ github.ref_name }}.apk
           fail_on_unmatched_files: true
 
+  build-vscode:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Build and package extension
+        working-directory: vscode-extension
+        run: |
+          npm install
+          npx vsce package --out codelight-${{ github.ref_name }}.vsix
+
+      - name: Upload to release
+        uses: softprops/action-gh-release@v2
+        with:
+          name: codelight ${{ github.ref_name }}
+          generate_release_notes: true
+          files: vscode-extension/codelight-${{ github.ref_name }}.vsix
+          fail_on_unmatched_files: true
+
   build-and-release:
     runs-on: ubuntu-latest
     permissions:
@@ -100,6 +126,7 @@ jobs:
             | `codelight-${{ github.ref_name }}.bin` | ESP8266 firmware for GeekMagic Ultra |
             | `codelight-${{ github.ref_name }}.bin.gz` | Same firmware, for flashing from the stock GeekMagic firmware |
             | `codelight-${{ github.ref_name }}.apk` | Android home-screen widget |
+            | `codelight-${{ github.ref_name }}.vsix` | VSCode extension (status bar + remote permission approval) |
 
             See the [README](https://github.com/${{ github.repository }}/blob/main/README.md) for full setup instructions.
 
