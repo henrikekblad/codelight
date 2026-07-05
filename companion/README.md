@@ -1,8 +1,10 @@
 # codelight companion
 
 The Python daemon `codelight.py` runs on your computer and pushes Claude Code
-status to all connected clients — the GeekMagic Ultra screen, Android widget,
-and GNOME extension.
+status to all connected clients — the GeekMagic Ultra screen, Android app,
+GNOME extension, and VSCode extension. With `--remote-control` it also brokers
+Claude Code's interactive prompts to those clients so you can approve
+permissions and answer questions remotely (see [Remote control](#remote-control)).
 
 When run in a terminal it shows a live dashboard. When run as a systemd service
 it is silent (key events are logged to the journal via stdout).
@@ -69,41 +71,53 @@ systemctl --user restart codelight  # restart after config change
 systemctl --user disable --now codelight  # disable
 ```
 
-## Remote permission approval
+## Remote control
 
-With `--remote-permissions` the companion takes over Claude Code's permission
-prompts: the request is pushed to connected clients — the **Android app** and
-the **GNOME extension** — and whoever answers first decides. Works for both the
-`claude` CLI and the Claude Code VSCode plugin, which share the same hook
-configuration. (In the VSCode window itself you just answer Claude Code's own
-native dialog; the codelight VSCode extension only shows status. Remote
-approval is for when you're away from the computer.)
+With `--remote-control` the companion takes over Claude Code's interactive
+prompts and pushes them to connected clients, where whoever answers first
+decides. Two kinds of prompt are handled:
+
+- **Permission prompts** (Allow / Deny) — answer from the **Android app** or the
+  **GNOME extension**.
+- **AskUserQuestion** (Claude's multiple-choice + free-text questions) — answer
+  from the **Android app**, the **GNOME extension**, or **VSCode** (a themed
+  WebView in the editor).
+
+Works for both the `claude` CLI and the Claude Code VSCode plugin, which share
+the same hook configuration. (Inside the VSCode window, permission prompts are
+left to Claude Code's own native dialog — only AskUserQuestion is answered by
+the codelight extension. Remote *permission* approval is for when you're away
+from the computer.)
 
 ```bash
 python3 companion/codelight.py --install --name henrik-laptop \
-    --secret mypassword --remote-permissions --vscode
+    --secret mypassword --remote-control --vscode
 ```
 
-- `--remote-permissions` **requires `--secret`** — an approval is code-execution
-  capability and must not be open to anyone on the LAN. Only authenticated
-  clients that explicitly subscribe receive permission requests; the ESP8266
-  screen and older apps never see them.
-- `--vscode` (with `--install`) installs the codelight VSCode status-bar
-  extension — from a locally built `.vsix` if you have a repo checkout,
-  otherwise downloaded from the latest GitHub release — and writes
-  `codelight.secret` into your VSCode user settings automatically. VSCode picks
-  the setting up live: no restart needed. `--uninstall` removes the extension
-  and its settings again.
-- If nobody answers within `--permission-timeout` seconds (default 60), Claude
-  Code falls back to its normal built-in prompt — you lose nothing by having
-  the feature on. Answering the built-in dialog also dismisses the remote
-  prompts.
-- Toggle prompts per client: the Android app's *Permission prompts* checkbox
-  and the GNOME extension's preferences switch (both default on).
+- `--remote-control` **requires `--secret`** — answering a prompt is
+  code-execution capability and must not be open to anyone on the LAN. Only
+  authenticated clients that explicitly subscribe receive the prompts; the
+  ESP8266 screen and older apps never see them. (`--remote-permissions` is kept
+  as a deprecated alias.)
+- `--vscode` (with `--install`) installs the codelight VSCode extension — from a
+  locally built `.vsix` if you have a repo checkout, otherwise downloaded from
+  the latest GitHub release — and writes `codelight.secret` into your VSCode
+  user settings automatically. VSCode picks the setting up live: no restart
+  needed. `--uninstall` removes the extension and its settings again.
+- If no client that can answer is connected, the prompt falls through to Claude
+  Code's built-in dialog **immediately** — you're never stuck waiting on a
+  device that isn't there. A briefly reconnecting client (e.g. VSCode
+  restarting) is not mistaken for "nobody home". Otherwise, if nobody answers
+  within `--permission-timeout` seconds (default 60), it also falls back.
+  Answering the built-in dialog dismisses the remote prompts.
+- Toggle prompts per client: the Android app's *Permission prompts* /
+  *Question prompts* checkboxes, the GNOME extension's preferences switches, and
+  the VSCode `codelight.questionPrompts` setting (all default on).
 
-Under the hood this uses Claude Code's `PermissionRequest` hook, which fires
+Under the hood this uses Claude Code's `PermissionRequest` hook (for Allow/Deny)
+and a `PreToolUse` hook matching `AskUserQuestion` (for questions). Both fire
 only when an interactive prompt would appear — normal auto-allowed tool calls
-are unaffected. Headless `claude -p` runs never trigger it.
+are unaffected. Headless `claude -p` runs never trigger them.
 
 ## Multiple companions on the same network
 
@@ -176,10 +190,10 @@ flowchart LR
     USAGE -.->|push on each poll| WS
     SOCK -.-> DBUS
 
-    WS -->|WebSocket| SCREEN["GeekMagic Ultra<br/>discovers via mDNS"]
-    WS -->|WebSocket| ANDROID["Android widget<br/>discovers via mDNS"]
-    WS -->|WebSocket status| VSCODE["VSCode extension"]
-    DBUS -->|D-Bus signal| GNOME["GNOME extension<br/>auto-discovers"]
+    WS -->|status| SCREEN["GeekMagic Ultra<br/>discovers via mDNS"]
+    WS -->|status + remote control| ANDROID["Android app<br/>discovers via mDNS"]
+    WS -->|status + questions| VSCODE["VSCode extension"]
+    DBUS -->|status + remote control| GNOME["GNOME extension<br/>auto-discovers"]
 ```
 
 Status updates reach clients the moment a Claude Code hook fires — there is no

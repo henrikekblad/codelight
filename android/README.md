@@ -1,8 +1,10 @@
-# codelight — Android widget
+# codelight — Android app
 
 A home-screen widget that shows weekly and session token usage bars plus the
-current Claude Code status. Updates instantly via WebSocket whenever the
-companion daemon sends new data.
+current Claude Code status, updated instantly via WebSocket. When the companion
+runs with `--remote-control`, the app also becomes a small **control surface**:
+approve permission prompts, answer Claude's questions, and follow the live
+conversation — all from your phone.
 
 <img src="../assets/android.jpg" width="360" alt="codelight Android widget">
 
@@ -29,6 +31,26 @@ companion daemon sends new data.
    Leave it blank if you did not set `--secret`.
 
 The widget connects automatically and stays updated in the background.
+
+## Remote control
+
+When the companion runs with `--remote-control` (and you've set the matching
+password), the app opens onto a bottom tab bar:
+
+- **Conversation** — the last N lines of the active session (configurable),
+  with tool calls and output; read-only.
+- **Request** — appears when Claude is waiting on you: **Allow / Deny** for a
+  permission, or the options + an "Other…" free-text field for an
+  AskUserQuestion. Whoever answers first (phone, GNOME, or VSCode) wins.
+- **Settings** — everything below.
+
+A request also raises a notification; tapping it opens the Request tab. Enable
+**Auto-open on request** (Settings) to have the app pop open by itself when a
+prompt arrives — this needs the "draw over other apps" permission, which the
+app will prompt for. Toggle **Permission prompts** / **Question prompts** to
+choose which kinds you want to handle on the phone.
+
+Without `--remote-control` the app is just the Settings screen (and the widget).
 
 ## Hiding the persistent notification
 

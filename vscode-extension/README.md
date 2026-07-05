@@ -2,13 +2,24 @@
 
 Shows the Claude Code status (working / waiting for input / idle, plus usage
 %) from the [codelight companion daemon](../companion/) in the VSCode status
-bar.
+bar — and, when the daemon runs with `--remote-control`, **answers Claude's
+AskUserQuestion prompts right in the editor**.
 
-Permission approval is intentionally **not** shown in VSCode — inside the
-editor you answer Claude Code's own native permission dialog. codelight's
-remote approval (`--remote-permissions`) is for when you're away from the
-computer: the Android app and the GNOME notification. See
-[companion/README.md](../companion/README.md#remote-permission-approval).
+## Answering questions
+
+When Claude asks a multiple-choice question, a themed **WebView panel** opens
+beside your editor with the question(s), options (radio or checkboxes for
+multi-select), a free-text "Other…" field, and **Submit** / **Skip** buttons.
+The status-bar item turns into a `$(bell-dot) claude — question` you can click
+to reopen the panel if you dismiss it. Whoever answers first (VSCode, the phone,
+or GNOME) wins; the panel closes automatically if the question is answered
+elsewhere or times out.
+
+Permission prompts (Allow / Deny) are **not** shown in VSCode — inside the
+editor you answer Claude Code's own native permission dialog. codelight's remote
+*permission* approval is for when you're away from the computer (the Android app
+and the GNOME panel). See
+[companion/README.md](../companion/README.md#remote-control).
 
 ## Install
 
@@ -34,6 +45,11 @@ Manual: download `codelight-vX.Y.Z.vsix` from the
 | `codelight.host` | `127.0.0.1` | Daemon host |
 | `codelight.port` | `8765` | Daemon WebSocket port |
 | `codelight.secret` | `""` | Must match the daemon's `--secret` |
+| `codelight.questionPrompts` | `true` | Answer Claude's AskUserQuestion prompts in the editor |
+
+The extension also contributes a **codelight: Answer Claude's question** command
+(bound to the status-bar item) that reopens the question panel while one is
+pending.
 
 The extension authenticates with the daemon via an HMAC challenge-response, so
 the secret is never sent over the (plaintext `ws://`) connection.

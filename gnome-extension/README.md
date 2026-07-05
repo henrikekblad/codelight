@@ -9,6 +9,13 @@ Click it to see a popup with session and weekly token usage bars and the number 
 sessions. The extension connects to the companion daemon via **D-Bus** — no network socket
 or configuration needed.
 
+When the companion runs with `--remote-control`, the same popup also lets you
+answer Claude Code's prompts: **Allow / Deny** for a permission request, or the
+options + an "Other…" free-text field for an AskUserQuestion. Whoever answers
+first (GNOME, the phone, or VSCode) wins. Turn each kind on or off in the
+extension's preferences (*Permission prompts* / *Question prompts*, both default
+on).
+
 Requires **GNOME 45 or later** and the companion daemon from
 [companion/README.md](../companion/README.md) running on the same machine.
 
@@ -44,8 +51,11 @@ gnome-extensions enable "$UUID"
 
 The extension watches for the D-Bus name `se.sensnology.codelight` on the session bus.
 When `codelight.py` starts, the extension automatically connects, fetches the current
-status, and subscribes to live `StatusChanged` signals. When the daemon stops, the
-indicator shows **OFFLINE**.
+status, and subscribes to live `StatusChanged` signals (plus permission/question request
+signals when remote control is enabled). It also periodically *announces* itself to the
+daemon, so the daemon knows a desktop client is present and doesn't fall a question
+through to the local dialog while GNOME is available to answer it. When the daemon stops,
+the indicator shows **OFFLINE**.
 
 No host, port, or secret settings are needed — the session bus is user-private and only
 reachable by processes running as the same user.
