@@ -84,7 +84,7 @@ class CodelightWidget : GlanceAppWidget() {
         ) {
             // ── Top: meters ───────────────────────────────────────────────────
             Column(modifier = GlanceModifier.fillMaxWidth().padding(10.dp)
-                .clickable(actionStartActivity<SettingsActivity>())) {
+                .clickable(actionStartActivity<MainActivity>())) {
                 /* Row(
                     modifier = GlanceModifier.fillMaxWidth(),
                     verticalAlignment = Alignment.CenterVertically,
@@ -110,7 +110,7 @@ class CodelightWidget : GlanceAppWidget() {
                     .fillMaxWidth()
                     .defaultWeight()
                     .background(ColorProvider(statusColor))
-                    .clickable(actionStartActivity<SettingsActivity>()),
+                    .clickable(actionStartActivity<MainActivity>()),
                 contentAlignment = Alignment.Center,
             ) {
                 Column(horizontalAlignment = Alignment.CenterHorizontally) {

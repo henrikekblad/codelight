@@ -3,6 +3,7 @@ package se.sensnology.codelight
 import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.app.PendingIntent
+import android.app.Service
 import android.content.Intent
 import android.net.ConnectivityManager
 import android.net.Network
@@ -62,6 +63,12 @@ class CodelightService : LifecycleService() {
         const val KEY_NOTIFY_DELAY_SECS = "notify_delay"
         const val KEY_ALLOWED_SSIDS     = "allowed_ssids"
         const val KEY_PERMISSION_PROMPTS = "permission_prompts"
+        const val KEY_QUESTION_PROMPTS   = "question_prompts"
+        const val KEY_AUTO_OPEN          = "auto_open"          // full-screen intent
+        const val KEY_PENDING_REQUESTS   = "pending_requests"   // JSON {id → request}
+        const val KEY_CONV_LINES         = "conv_lines"         // how many lines to show
+        const val KEY_REMOTE_CONTROL     = "remote_control"     // companion arms tabs
+        const val KEY_CONVERSATION       = "conversation"       // JSON [{role,text}]
 
         private const val ALERT_NOTIF_ID    = 2
         private const val ALERT_CHANNEL_ID  = "codelight_alerts"
@@ -71,9 +78,13 @@ class CodelightService : LifecycleService() {
         private const val PERM_CHANNEL_ID   = "codelight_permissions"
         private const val SERVICE_TYPE      = "_codelight._tcp"
 
-        private const val ACTION_PERMISSION_RESPONSE = "se.sensnology.codelight.PERMISSION_RESPONSE"
-        private const val EXTRA_REQUEST_ID = "request_id"
-        private const val EXTRA_DECISION   = "decision"
+        const val ACTION_PERMISSION_RESPONSE = "se.sensnology.codelight.PERMISSION_RESPONSE"
+        const val ACTION_QUESTION_RESPONSE   = "se.sensnology.codelight.QUESTION_RESPONSE"
+        const val ACTION_EXTEND              = "se.sensnology.codelight.EXTEND"
+        const val EXTRA_REQUEST_ID = "request_id"
+        const val EXTRA_DECISION   = "decision"
+        const val EXTRA_ANSWERS    = "answers"   // JSON {question → answer}
+        const val EXTRA_TAB        = "tab"       // MainActivity initial tab
     }
 
     data class DiscoveredService(val name: String, val host: String, val port: Int)
@@ -138,10 +149,19 @@ class CodelightService : LifecycleService() {
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         super.onStartCommand(intent, flags, startId)
-        if (intent?.action == ACTION_PERMISSION_RESPONSE) {
-            val id       = intent.getStringExtra(EXTRA_REQUEST_ID)
-            val decision = intent.getStringExtra(EXTRA_DECISION)
-            if (id != null && decision != null) sendPermissionResponse(id, decision)
+        val id = intent?.getStringExtra(EXTRA_REQUEST_ID)
+        when (intent?.action) {
+            ACTION_PERMISSION_RESPONSE -> {
+                val decision = intent.getStringExtra(EXTRA_DECISION)
+                if (id != null && decision != null) sendPermissionResponse(id, decision)
+            }
+            ACTION_QUESTION_RESPONSE -> {
+                val answers = intent.getStringExtra(EXTRA_ANSWERS)   // JSON or null=skip
+                if (id != null) sendQuestionResponse(id, answers)
+            }
+            ACTION_EXTEND -> {
+                if (id != null) webSocket?.send("""{"type":"extend","id":"$id"}""")
+            }
         }
         return START_STICKY
     }
@@ -305,10 +325,14 @@ class CodelightService : LifecycleService() {
     }
 
     private fun subscribe(ws: WebSocket) {
-        if (getSharedPreferences(SETTINGS_PREFS, MODE_PRIVATE)
-                .getBoolean(KEY_PERMISSION_PROMPTS, true)) {
-            ws.send("""{"type":"subscribe","features":["permissions"],"client":"android"}""")
-        }
+        val prefs = getSharedPreferences(SETTINGS_PREFS, MODE_PRIVATE)
+        val features = mutableListOf<String>()
+        if (prefs.getBoolean(KEY_PERMISSION_PROMPTS, true)) features.add("\"permissions\"")
+        if (prefs.getBoolean(KEY_QUESTION_PROMPTS, true))   features.add("\"questions\"")
+        // Always request the conversation feed; the daemon only serves it when
+        // it runs with --remote-control, so this is a no-op otherwise.
+        features.add("\"conversation\"")
+        ws.send("""{"type":"subscribe","features":[${features.joinToString(",")}],"client":"android"}""")
     }
 
     /** Prove knowledge of the secret without sending it: HMAC-SHA256(secret, nonce). */
@@ -326,10 +350,18 @@ class CodelightService : LifecycleService() {
         try {
             val obj  = JSONObject(json)
             when (obj.optString("type")) {
-                "config"              -> return
+                "config"              -> {
+                    getSharedPreferences(STATE_PREFS, MODE_PRIVATE).edit()
+                        .putBoolean(KEY_REMOTE_CONTROL, obj.optBoolean("remote_control", false))
+                        .apply()
+                    return
+                }
                 "challenge"           -> { respondChallenge(obj.optString("nonce")); return }
-                "permission_request"  -> { showPermissionNotification(obj); return }
-                "permission_resolved" -> { cancelPermissionNotification(obj.optString("id")); return }
+                "permission_request"  -> { onRequest(obj, "permission"); return }
+                "question_request"    -> { onRequest(obj, "question"); return }
+                "permission_resolved",
+                "question_resolved"   -> { resolveRequest(obj.optString("id")); return }
+                "conversation"        -> { storeConversation(obj); return }
             }
             val edit = getSharedPreferences(STATE_PREFS, MODE_PRIVATE).edit()
             if (obj.has("session_pct"))   edit.putFloat(KEY_SESSION_PCT,   obj.getDouble("session_pct").toFloat())
@@ -365,11 +397,11 @@ class CodelightService : LifecycleService() {
         val notifyWaiting = prefs.getBoolean(KEY_NOTIFY_ON_WAITING, false)
         val delaySecs     = prefs.getInt(KEY_NOTIFY_DELAY_SECS, 30).toLong()
 
-        // A pending permission request already shows its own notification —
-        // don't also raise the generic "waiting for input" alert.
+        // A pending request already has its own screen/notification (or auto-
+        // opened) — don't also raise the generic "waiting for input" alert.
         val shouldNotify = when (status) {
             "idle" -> notifyIdle
-            "waiting"  -> notifyWaiting && permNotifIds.isEmpty()
+            "waiting"  -> notifyWaiting && permNotifIds.isEmpty() && !hasPendingRequests()
             else       -> false
         }
         if (!shouldNotify) return
@@ -387,7 +419,7 @@ class CodelightService : LifecycleService() {
             else      -> return
         }
         val pi = PendingIntent.getActivity(
-            this, 0, Intent(this, SettingsActivity::class.java),
+            this, 0, Intent(this, MainActivity::class.java),
             PendingIntent.FLAG_IMMUTABLE,
         )
         val notif = NotificationCompat.Builder(this, ALERT_CHANNEL_ID)
@@ -401,69 +433,124 @@ class CodelightService : LifecycleService() {
         getSystemService(NotificationManager::class.java).notify(ALERT_NOTIF_ID, notif)
     }
 
-    // ── Remote permission approval ────────────────────────────────────────────
+    // ── Remote requests (permission + question) ───────────────────────────────
+    // The notification is just a tap-target; the full request + controls live in
+    // RequestActivity so nothing is clipped and questions get rich controls.
 
-    private fun showPermissionNotification(obj: JSONObject) {
+    private fun onRequest(obj: JSONObject, kind: String) {
         val id = obj.optString("id")
-        if (id.isEmpty() || permNotifIds.containsKey(id)) return   // duplicate/replay
-        if (!getSharedPreferences(SETTINGS_PREFS, MODE_PRIVATE)
-                .getBoolean(KEY_PERMISSION_PROMPTS, true)) return
+        val prefs = getSharedPreferences(SETTINGS_PREFS, MODE_PRIVATE)
+        val enabled = if (kind == "question") prefs.getBoolean(KEY_QUESTION_PROMPTS, true)
+                      else prefs.getBoolean(KEY_PERMISSION_PROMPTS, true)
+        if (id.isEmpty() || permNotifIds.containsKey(id) || !enabled) return
 
-        // The "waiting" status broadcast arrives just before this and may have
-        // scheduled/shown the generic waiting alert — supersede it.
+        // A "waiting" status broadcast arrives just before this — supersede its alert.
         notifJob?.cancel()
         getSystemService(NotificationManager::class.java).cancel(ALERT_NOTIF_ID)
 
-        val notifId = nextPermNotifId++
-        permNotifIds[id] = notifId
+        obj.put("kind", kind)
+        putPendingRequest(id, obj)
 
-        fun actionIntent(decision: String, requestCode: Int): PendingIntent {
-            val intent = Intent(this, CodelightService::class.java)
-                .setAction(ACTION_PERMISSION_RESPONSE)
-                .putExtra(EXTRA_REQUEST_ID, id)
-                .putExtra(EXTRA_DECISION, decision)
-            return PendingIntent.getService(
-                this, requestCode, intent,
-                PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT,
-            )
+        val open = Intent(this, RequestActivity::class.java)
+            .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TOP)
+            .putExtra(EXTRA_REQUEST_ID, id)
+
+        // Auto-open: with the overlay permission we're exempt from background
+        // activity-launch limits, so pop the screen directly (works unlocked
+        // too). When it succeeds, skip the heads-up notification — it would just
+        // land on top of the request screen we just opened. Fall back to the
+        // notification only if the launch throws.
+        val autoOpen = prefs.getBoolean(KEY_AUTO_OPEN, false)
+        if (autoOpen && android.provider.Settings.canDrawOverlays(this)) {
+            try { startActivity(open); return } catch (_: Exception) {}
         }
 
-        val summary   = obj.optString("summary", obj.optString("tool_name", "tool use"))
-        val expiresAt = obj.optLong("expires_at", 0)
+        val notifId = nextPermNotifId++
+        permNotifIds[id] = notifId
+        val pi = PendingIntent.getActivity(this, notifId, open,
+            PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT)
+
+        val summary = if (kind == "question")
+            obj.optJSONArray("questions")?.optJSONObject(0)?.optString("question") ?: "Claude has a question"
+        else obj.optString("summary", obj.optString("tool_name", "tool use"))
         val builder = NotificationCompat.Builder(this, PERM_CHANNEL_ID)
             .setSmallIcon(android.R.drawable.stat_sys_warning)
-            .setContentTitle("Claude Code asks")
+            .setContentTitle(if (kind == "question") "Claude asks a question" else "Claude Code asks")
             .setContentText(summary)
             .setStyle(NotificationCompat.BigTextStyle().bigText(summary))
-            .addAction(0, "Allow", actionIntent("allow", notifId * 2))
-            .addAction(0, "Deny",  actionIntent("deny",  notifId * 2 + 1))
+            .setContentIntent(pi)
+            .setAutoCancel(true)
             .setDefaults(NotificationCompat.DEFAULT_ALL)
             .setCategory(NotificationCompat.CATEGORY_CALL)
             .setOngoing(true)
+        val expiresAt = obj.optLong("expires_at", 0)
         if (expiresAt > 0) {
             val ttl = expiresAt * 1000 - System.currentTimeMillis()
-            if (ttl > 0) builder.setTimeoutAfter(ttl)   // auto-dismiss at daemon timeout
+            if (ttl > 0) builder.setTimeoutAfter(ttl)
         }
         getSystemService(NotificationManager::class.java).notify(notifId, builder.build())
     }
 
-    private fun cancelPermissionNotification(id: String) {
+    private fun storeConversation(obj: JSONObject) {
+        // Mirror the companion's conversation feed to STATE_PREFS for the tab.
+        val lines = obj.optJSONArray("lines") ?: JSONArray()
+        getSharedPreferences(STATE_PREFS, MODE_PRIVATE).edit()
+            .putString(KEY_CONVERSATION, lines.toString())
+            .apply()
+    }
+
+    private fun resolveRequest(id: String) {
+        removePendingRequest(id)
         permNotifIds.remove(id)?.let {
             getSystemService(NotificationManager::class.java).cancel(it)
         }
     }
 
     private fun sendPermissionResponse(id: String, decision: String) {
-        val sent = webSocket?.send(
-            """{"type":"permission_response","id":"$id","decision":"$decision"}"""
-        ) ?: false
-        Log.i("Codelight", "permission $decision for $id (sent=$sent)")
-        cancelPermissionNotification(id)
+        webSocket?.send("""{"type":"permission_response","id":"$id","decision":"$decision"}""")
+        resolveRequest(id)
+    }
+
+    private fun sendQuestionResponse(id: String, answersJson: String?) {
+        // answersJson null/blank → skip (daemon replies null → local fall-through)
+        val answers = answersJson?.takeIf { it.isNotBlank() } ?: "{}"
+        webSocket?.send("""{"type":"question_response","id":"$id","answers":$answers}""")
+        resolveRequest(id)
+    }
+
+    // Pending requests are mirrored to STATE_PREFS so RequestActivity can render them.
+    private fun putPendingRequest(id: String, obj: JSONObject) {
+        val prefs = getSharedPreferences(STATE_PREFS, MODE_PRIVATE)
+        val all = try { JSONObject(prefs.getString(KEY_PENDING_REQUESTS, "{}") ?: "{}") } catch (_: Exception) { JSONObject() }
+        all.put(id, obj)
+        prefs.edit().putString(KEY_PENDING_REQUESTS, all.toString()).apply()
+    }
+
+    private fun hasPendingRequests(): Boolean {
+        val prefs = getSharedPreferences(STATE_PREFS, MODE_PRIVATE)
+        return try {
+            JSONObject(prefs.getString(KEY_PENDING_REQUESTS, "{}") ?: "{}").length() > 0
+        } catch (_: Exception) { false }
+    }
+
+    private fun removePendingRequest(id: String) {
+        val prefs = getSharedPreferences(STATE_PREFS, MODE_PRIVATE)
+        val all = try { JSONObject(prefs.getString(KEY_PENDING_REQUESTS, "{}") ?: "{}") } catch (_: Exception) { JSONObject() }
+        all.remove(id)
+        prefs.edit().putString(KEY_PENDING_REQUESTS, all.toString()).apply()
+    }
+
+    private fun clearAllPending() {
+        getSharedPreferences(STATE_PREFS, MODE_PRIVATE).edit()
+            .putString(KEY_PENDING_REQUESTS, "{}").apply()
+        val nm = getSystemService(NotificationManager::class.java)
+        permNotifIds.values.forEach { nm.cancel(it) }
+        permNotifIds.clear()
     }
 
     private fun sendAuthFailedNotification() {
         val pi = PendingIntent.getActivity(
-            this, 0, Intent(this, SettingsActivity::class.java),
+            this, 0, Intent(this, MainActivity::class.java),
             PendingIntent.FLAG_IMMUTABLE,
         )
         val notif = NotificationCompat.Builder(this, ALERT_CHANNEL_ID)
@@ -489,9 +576,11 @@ class CodelightService : LifecycleService() {
         edit.apply()
         if (!connected) {
             connectedName = null
-            // A posted alert can't be trusted once we lose sight of the companion
+            // A posted alert/request can't be trusted once we lose the companion;
+            // pending requests are replayed by the daemon on reconnect.
             notifJob?.cancel()
             getSystemService(NotificationManager::class.java).cancel(ALERT_NOTIF_ID)
+            clearAllPending()
         }
         val selected = getSharedPreferences(SETTINGS_PREFS, MODE_PRIVATE)
             .getString(KEY_SELECTED_NAME, null)
@@ -499,8 +588,9 @@ class CodelightService : LifecycleService() {
         when {
             connected -> nm.notify(SVC_NOTIF_ID,
                 buildServiceNotification("Connected to ${connectedName ?: selected ?: "codelight"}"))
-            dormant   -> nm.notify(SVC_NOTIF_ID,
-                buildServiceNotification("Paused — waiting for home Wi-Fi", PAUSED_CHANNEL_ID))
+            // While paused off the home network the notification is hidden
+            // entirely (stopForeground in enterDormant) — don't re-post it here.
+            dormant   -> { /* intentionally no notification while paused */ }
             else      -> nm.notify(SVC_NOTIF_ID,
                 buildServiceNotification("Searching for ${selected ?: "codelight"}…"))
         }
@@ -615,14 +705,28 @@ class CodelightService : LifecycleService() {
         webSocket?.cancel()
         webSocket = null
         setConnected(false)
+        // Drop the foreground notification while paused so nothing clutters the
+        // shade off the home network. The service keeps running (START_STICKY +
+        // the Wi-Fi network callback), and re-promotes to foreground on resume.
+        stopForeground(Service.STOP_FOREGROUND_REMOVE)
     }
 
     private fun exitDormant() {
         if (!dormant) return
         dormant = false
         Log.i("Codelight", "Allowed WiFi '$currentSsid' available — resuming")
-        setConnected(false)   // restores the normal "Searching…" notification
+        promoteForeground("Searching…")   // re-show the foreground notification
+        setConnected(false)               // restores the normal "Searching…" text
         scheduleReconnect()
+    }
+
+    private fun promoteForeground(text: String) {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            startForeground(SVC_NOTIF_ID, buildServiceNotification(text),
+                ServiceInfo.FOREGROUND_SERVICE_TYPE_CONNECTED_DEVICE)
+        } else {
+            startForeground(SVC_NOTIF_ID, buildServiceNotification(text))
+        }
     }
 
     private fun scheduleReconnect() {
@@ -647,7 +751,7 @@ class CodelightService : LifecycleService() {
             .setSilent(true)
             .setContentIntent(
                 PendingIntent.getActivity(
-                    this, 0, Intent(this, SettingsActivity::class.java),
+                    this, 0, Intent(this, MainActivity::class.java),
                     PendingIntent.FLAG_IMMUTABLE,
                 )
             )
