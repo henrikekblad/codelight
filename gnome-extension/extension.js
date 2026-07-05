@@ -2,10 +2,10 @@ import GLib from 'gi://GLib';
 import Gio from 'gi://Gio';
 import St from 'gi://St';
 import Clutter from 'gi://Clutter';
+import Pango from 'gi://Pango';
 import * as Main from 'resource:///org/gnome/shell/ui/main.js';
 import * as PanelMenu from 'resource:///org/gnome/shell/ui/panelMenu.js';
 import * as PopupMenu from 'resource:///org/gnome/shell/ui/popupMenu.js';
-import * as MessageTray from 'resource:///org/gnome/shell/ui/messageTray.js';
 import {Extension} from 'resource:///org/gnome/shell/extensions/extension.js';
 
 const DBUS_NAME  = 'se.sensnology.codelight';
@@ -29,6 +29,25 @@ const IFACE_XML = `<node>
     <method name="RespondPermission">
       <arg direction="in" type="s" name="request_id"/>
       <arg direction="in" type="s" name="decision"/>
+      <arg direction="out" type="b"/>
+    </method>
+    <signal name="QuestionRequest">
+      <arg type="s" name="request_json"/>
+    </signal>
+    <signal name="QuestionResolved">
+      <arg type="s" name="resolved_json"/>
+    </signal>
+    <method name="RespondQuestion">
+      <arg direction="in" type="s" name="request_id"/>
+      <arg direction="in" type="s" name="answers_json"/>
+      <arg direction="out" type="b"/>
+    </method>
+    <method name="ExtendRequest">
+      <arg direction="in" type="s" name="request_id"/>
+      <arg direction="out" type="b"/>
+    </method>
+    <method name="Announce">
+      <arg direction="in" type="s" name="features_json"/>
       <arg direction="out" type="b"/>
     </method>
   </interface>
@@ -139,15 +158,37 @@ function makeMeterItem(label) {
     return item;
 }
 
+// St.Label doesn't wrap by default — long question text gets clipped/ellipsized.
+function wrapLabel(text, style) {
+    const props = { text: text || '', x_expand: true };
+    if (style) props.style = style;   // St throws on style: undefined
+    const l = new St.Label(props);
+    l.clutter_text.line_wrap = true;
+    l.clutter_text.line_wrap_mode = Pango.WrapMode.WORD_CHAR;
+    l.clutter_text.ellipsize = Pango.EllipsizeMode.NONE;
+    return l;
+}
+
 export default class CodelightExtension extends Extension {
     enable() {
         this._proxy    = null;
         this._signalId = null;
         this._watchId  = null;
         this._settings = this.getSettings();
+        // Re-announce presence/features when the prompt toggles change.
+        this._settingsIds = [
+            this._settings.connect('changed::permission-prompts', () => this._announce()),
+            this._settings.connect('changed::question-prompts',   () => this._announce()),
+        ];
         this._permSignalIds = [];
-        this._permNotifs    = new Map();   // request id → MessageTray.Notification
-        this._notifSource   = null;
+        this._reqActiveId  = null;         // request id shown in the panel popup
+        this._reqKind      = null;         // 'permission' | 'question'
+        this._reqQueue     = [];           // requests waiting behind the active one
+        this._reqFinishing = false;        // guard so our own menu.close() isn't read as a dismiss
+        this._qState       = null;         // [{selected:Set, multi, entry}] for an active question
+        this._qQuestions   = null;
+        this._qKeepalive   = null;         // timer id: extends the daemon deadline while open
+        this._announceTimer = null;        // timer id: presence heartbeat to the daemon
         this._indicator = new PanelMenu.Button(0.0, 'Codelight', false);
 
         // ── Panel button ────────────────────────────────────────────────────
@@ -185,6 +226,23 @@ export default class CodelightExtension extends Extension {
         this._indicator.menu.addMenuItem(this._weeklyItem);
         this._indicator.menu.addMenuItem(this._sessionItem);
 
+        // Status/limits rows — hidden while a request is being answered so the
+        // popup shows only the question/permission.
+        this._statusItems = [hdrItem, this._weeklyItem, this._sessionItem];
+
+        // Question section (populated when Claude asks; empty otherwise)
+        this._qSection = new PopupMenu.PopupMenuSection();
+        this._indicator.menu.addMenuItem(this._qSection);
+        // Closing the popup does NOT discard a pending request — the section
+        // stays built so reopening the icon shows it again. Keepalive only runs
+        // while the popup is open; once closed, the daemon idle-times-out after
+        // ~60 s (falling through to Claude's own prompt) unless reopened.
+        this._indicator.menu.connect('open-state-changed', (_m, open) => {
+            if (!this._reqActiveId) return;
+            if (open) this._startKeepalive();
+            else this._stopKeepalive();
+        });
+
         Main.panel.addToStatusArea(this.uuid, this._indicator);
 
         this._setOffline();
@@ -219,6 +277,10 @@ export default class CodelightExtension extends Extension {
                 (_proxy, _sender, [json]) => this._onPermissionRequest(json)));
             this._permSignalIds.push(this._proxy.connectSignal('PermissionResolved',
                 (_proxy, _sender, [json]) => this._onPermissionResolved(json)));
+            this._permSignalIds.push(this._proxy.connectSignal('QuestionRequest',
+                (_proxy, _sender, [json]) => this._onQuestionRequest(json)));
+            this._permSignalIds.push(this._proxy.connectSignal('QuestionResolved',
+                (_proxy, _sender, [json]) => this._onQuestionResolved(json)));
             // Fetch current state immediately so the panel isn't blank on connect
             try {
                 const result = this._proxy.call_sync('GetStatus', null, Gio.DBusCallFlags.NONE, -1, null);
@@ -226,18 +288,52 @@ export default class CodelightExtension extends Extension {
                 const data = JSON.parse(json);
                 if (data?.type !== 'config') this._handleMessage(data);
             } catch (_) {}
+            // Announce presence now + on a heartbeat so the daemon knows this
+            // extension can answer, and won't fall AskUserQuestion through to the
+            // local dialog while we're listening.
+            this._announce();
+            this._startAnnounce();
         } catch (e) {
             logError(e, 'codelight D-Bus connect failed');
         }
     }
 
+    _announce() {
+        if (this._proxy === null || !this._settings) return;
+        const features = [];
+        if (this._settings.get_boolean('permission-prompts')) features.push('permissions');
+        if (this._settings.get_boolean('question-prompts'))   features.push('questions');
+        try {
+            this._proxy.call_sync('Announce',
+                new GLib.Variant('(s)', [JSON.stringify(features)]),
+                Gio.DBusCallFlags.NONE, -1, null);
+        } catch (_) {}
+    }
+
+    _startAnnounce() {
+        this._stopAnnounce();
+        // Shorter than the daemon's GNOME_PRESENCE_TTL (90 s) so presence never lapses.
+        this._announceTimer = GLib.timeout_add_seconds(GLib.PRIORITY_DEFAULT, 40, () => {
+            this._announce();
+            return GLib.SOURCE_CONTINUE;
+        });
+    }
+
+    _stopAnnounce() {
+        if (this._announceTimer) {
+            GLib.source_remove(this._announceTimer);
+            this._announceTimer = null;
+        }
+    }
+
     _onDaemonVanished() {
         this._disconnectProxy();
-        this._destroyAllPermNotifs();
+        this._clearAllRequests();
         this._setOffline();
     }
 
     _disconnectProxy() {
+        this._stopAnnounce();
         if (this._proxy !== null) {
             if (this._signalId !== null)
                 this._proxy.disconnectSignal(this._signalId);
@@ -249,84 +345,213 @@ export default class CodelightExtension extends Extension {
         this._proxy = null;
     }
 
-    // ── Permission approval ──────────────────────────────────────────────────
-
-    _getNotifSource() {
-        if (this._notifSource) return this._notifSource;
-        let source;
-        try {
-            source = new MessageTray.Source({
-                title: 'Claude Code',
-                iconName: 'dialog-question-symbolic',
-            });
-        } catch (_) {
-            // GNOME 45 positional constructor
-            source = new MessageTray.Source('Claude Code', 'dialog-question-symbolic');
-        }
-        source.connect('destroy', () => { this._notifSource = null; });
-        Main.messageTray.add(source);
-        this._notifSource = source;
-        return source;
-    }
+    // ── Remote requests (permission + question) in the panel popup ────────────
+    // Both surfaces share one section, opened from the panel icon (no focus
+    // grab). One request at a time; others queue behind it.
 
     _onPermissionRequest(json) {
         let req;
         try { req = JSON.parse(json); } catch (_) { return; }
-        if (!req?.id || this._permNotifs.has(req.id)) return;
+        if (!req?.id) return;
         if (!this._settings.get_boolean('permission-prompts')) return;
+        this._enqueueRequest({ ...req, kind: 'permission' });
+    }
 
-        const source = this._getNotifSource();
-        const body   = req.summary || req.tool_name || 'tool use';
-        let n;
-        try {
-            n = new MessageTray.Notification({
-                source,
-                title: 'Claude Code asks',
-                body,
-                urgency: MessageTray.Urgency.CRITICAL,   // stays until answered
-            });
-        } catch (_) {
-            // GNOME 45 positional constructor
-            n = new MessageTray.Notification(source, 'Claude Code asks', body);
-            n.setUrgency?.(MessageTray.Urgency.CRITICAL);
-        }
-        n.addAction('Allow', () => this._respondPermission(req.id, 'allow'));
-        n.addAction('Deny',  () => this._respondPermission(req.id, 'deny'));
-        n.connect('destroy', () => this._permNotifs.delete(req.id));
-        this._permNotifs.set(req.id, n);
-        if (source.addNotification)
-            source.addNotification(n);
+    _onQuestionRequest(json) {
+        let req;
+        try { req = JSON.parse(json); } catch (_) { return; }
+        if (!req?.id) return;
+        if (!this._settings.get_boolean('question-prompts')) return;
+        this._enqueueRequest({ ...req, kind: 'question' });
+    }
+
+    _enqueueRequest(req) {
+        if (this._reqActiveId === req.id || this._reqQueue.some(r => r.id === req.id)) return;
+        if (this._reqActiveId) { this._reqQueue.push(req); return; }   // one at a time
+        this._showRequest(req);
+    }
+
+    _showRequest(req) {
+        this._reqActiveId = req.id;
+        this._reqKind = req.kind;
+        this._qState = [];
+        this._qQuestions = req.questions || [];
+        this._qSection.removeAll();
+        this._statusItems?.forEach(i => { i.visible = false; });   // hide limits/status
+
+        const head = new PopupMenu.PopupBaseMenuItem({ reactive: false });
+        head.add_child(new St.Label({
+            text: 'Claude asks', style: 'font-weight: bold; color: #eeeeee;' }));
+        this._qSection.addMenuItem(head);
+
+        if (req.kind === 'permission')
+            this._buildPermission(req);
         else
-            source.showNotification(n);   // GNOME 45
+            this._buildQuestion(req);
+
+        this._indicator.menu.open(true);
+        this._startKeepalive();   // also (re)started by open-state-changed
     }
 
-    _respondPermission(id, decision) {
-        try {
-            this._proxy?.call_sync('RespondPermission',
-                new GLib.Variant('(ss)', [id, decision]),
-                Gio.DBusCallFlags.NONE, -1, null);
-        } catch (e) {
-            logError(e, 'codelight RespondPermission failed');
+    // Keepalive while the popup is open: push the daemon deadline out every 20 s
+    // (< the 60 s idle timeout) so it never times out mid-interaction.
+    _startKeepalive() {
+        this._stopKeepalive();
+        const id = this._reqActiveId;
+        if (!id) return;
+        this._qKeepalive = GLib.timeout_add_seconds(GLib.PRIORITY_DEFAULT, 20, () => {
+            try {
+                this._proxy?.call_sync('ExtendRequest',
+                    new GLib.Variant('(s)', [id]), Gio.DBusCallFlags.NONE, -1, null);
+            } catch (_) {}
+            return GLib.SOURCE_CONTINUE;
+        });
+    }
+
+    _stopKeepalive() {
+        if (this._qKeepalive) { GLib.source_remove(this._qKeepalive); this._qKeepalive = null; }
+    }
+
+    _buildPermission(req) {
+        const item = new PopupMenu.PopupBaseMenuItem({ reactive: false });
+        const box  = new St.BoxLayout({ vertical: true, x_expand: true, style: 'spacing: 8px; width: 380px;' });
+        box.add_child(wrapLabel(req.summary || req.tool_name || 'tool use',
+            'font-family: monospace; font-size: 11px; color: #c8c8c8;'));
+
+        const row = new St.BoxLayout({ x_expand: true, style: 'spacing: 8px; padding-top: 4px;' });
+        const allow = new St.Button({ x_expand: true, style: 'padding: 6px; border-radius: 6px; background-color: #238636; color: #fff;', child: new St.Label({ text: 'Allow' }) });
+        const deny  = new St.Button({ x_expand: true, style: 'padding: 6px; border-radius: 6px; background-color: #6e2b2b; color: #fff;', child: new St.Label({ text: 'Deny' }) });
+        allow.connect('clicked', () => this._finishRequest({ decision: 'allow' }));
+        deny.connect('clicked',  () => this._finishRequest({ decision: 'deny' }));
+        row.add_child(allow);
+        row.add_child(deny);
+        box.add_child(row);
+        item.add_child(box);
+        this._qSection.addMenuItem(item);
+    }
+
+    _buildQuestion(req) {
+        (req.questions || []).forEach((q) => {
+            const multi = !!q.multiSelect;
+            const st = { selected: new Set(), multi, entry: null, buttons: [] };
+            this._qState.push(st);
+
+            const qItem = new PopupMenu.PopupBaseMenuItem({ reactive: false });
+            const qBox  = new St.BoxLayout({ vertical: true, x_expand: true, style: 'spacing: 4px; max-width: 360px;' });
+            if (q.header) qBox.add_child(wrapLabel(q.header, 'font-size: 10px; color: #888888;'));
+            qBox.add_child(wrapLabel(q.question, 'font-size: 12px;'));
+
+            (q.options || []).forEach((opt) => {
+                const label = opt.label ?? String(opt);
+                const btn = new St.Button({ x_expand: true,
+                    child: wrapLabel(opt.description ? `${label} — ${opt.description}` : label) });
+                const setSel = (on) => btn.set_style(
+                    'padding: 6px 8px; border-radius: 6px; text-align: left; border: 1px solid ' +
+                    (on ? '#00C800; background-color: rgba(0,200,0,0.15);' : '#444;'));
+                setSel(false);
+                btn.connect('clicked', () => {
+                    if (multi) {
+                        if (st.selected.has(label)) { st.selected.delete(label); setSel(false); }
+                        else { st.selected.add(label); setSel(true); }
+                    } else {
+                        st.selected.clear();
+                        st.buttons.forEach(([, s]) => s(false));
+                        st.selected.add(label); setSel(true);
+                    }
+                });
+                st.buttons.push([label, setSel]);
+                qBox.add_child(btn);
+            });
+
+            st.entry = new St.Entry({ hint_text: 'Other…', can_focus: true, style: 'margin-top: 4px;' });
+            qBox.add_child(st.entry);
+            qItem.add_child(qBox);
+            this._qSection.addMenuItem(qItem);
+        });
+
+        const btnItem = new PopupMenu.PopupBaseMenuItem({ reactive: false });
+        const btnBox  = new St.BoxLayout({ x_expand: true, style: 'spacing: 8px; padding-top: 6px;' });
+        const submit  = new St.Button({ x_expand: true, style: 'padding: 6px; border-radius: 6px; background-color: #238636; color: #fff;', child: new St.Label({ text: 'Submit' }) });
+        const skip    = new St.Button({ style: 'padding: 6px 10px; border-radius: 6px; border: 1px solid #444;', child: new St.Label({ text: 'Skip' }) });
+        submit.connect('clicked', () => this._submitQuestion());
+        skip.connect('clicked', () => this._finishRequest({ skip: true }));
+        btnBox.add_child(submit);
+        btnBox.add_child(skip);
+        btnItem.add_child(btnBox);
+        this._qSection.addMenuItem(btnItem);
+    }
+
+    _submitQuestion() {
+        const answers = {};
+        for (let i = 0; i < this._qState.length; i++) {
+            const st = this._qState[i];
+            const parts = [...st.selected];
+            const other = st.entry?.get_text()?.trim();
+            if (other) parts.push(other);
+            if (!parts.length) return;   // unanswered → keep popup open
+            answers[this._qQuestions[i].question] = parts.join(', ');
         }
-        this._destroyPermNotif(id);
+        this._finishRequest({ answers });
     }
 
-    _onPermissionResolved(json) {
+    // opts: {decision} for permission, {answers}|{skip} for question,
+    // {} for a plain dismiss (leave pending → the hook times out to local UI).
+    _finishRequest(opts = {}) {
+        const id = this._reqActiveId;
+        const kind = this._reqKind;
+        if (!id) return;
+        this._reqFinishing = true;
         try {
-            this._destroyPermNotif(JSON.parse(json)?.id);
-        } catch (_) {}
+            if (kind === 'permission' && opts.decision) {
+                this._proxy?.call_sync('RespondPermission',
+                    new GLib.Variant('(ss)', [id, opts.decision]),
+                    Gio.DBusCallFlags.NONE, -1, null);
+            } else if (kind === 'question') {
+                // answers dict → answer; skip/dismiss → "{}" → daemon falls through
+                this._proxy?.call_sync('RespondQuestion',
+                    new GLib.Variant('(ss)', [id, JSON.stringify(opts.answers || {})]),
+                    Gio.DBusCallFlags.NONE, -1, null);
+            }
+            // permission dismiss (no decision): send nothing → hook times out → local prompt
+        } catch (e) {
+            logError(e, 'codelight respond failed');
+        }
+        this._clearRequest();
+        this._indicator.menu.close();
+        this._reqFinishing = false;
+        const next = this._reqQueue.shift();
+        if (next) this._showRequest(next);
     }
 
-    _destroyPermNotif(id) {
-        const n = this._permNotifs.get(id);
-        if (!n) return;
-        this._permNotifs.delete(id);
-        n.destroy();
+    _onPermissionResolved(json) { this._onResolved(json); }
+    _onQuestionResolved(json)   { this._onResolved(json); }
+
+    _onResolved(json) {
+        let id;
+        try { id = JSON.parse(json)?.id; } catch (_) { return; }
+        if (id && id === this._reqActiveId) {
+            this._clearRequest();
+            this._indicator.menu.close();
+            const next = this._reqQueue.shift();
+            if (next) this._showRequest(next);
+        } else if (id) {
+            this._reqQueue = this._reqQueue.filter(r => r.id !== id);
+        }
     }
 
-    _destroyAllPermNotifs() {
-        for (const id of [...this._permNotifs.keys()])
-            this._destroyPermNotif(id);
+    _clearRequest() {
+        this._stopKeepalive();
+        this._reqActiveId = null;
+        this._reqKind = null;
+        this._qState = null;
+        this._qQuestions = null;
+        this._qSection?.removeAll();
+        this._statusItems?.forEach(i => { i.visible = true; });   // restore limits/status
+    }
+
+    _clearAllRequests() {
+        this._reqQueue = [];
+        this._clearRequest();
     }
 
     _handleMessage(data) {
@@ -376,9 +601,11 @@ export default class CodelightExtension extends Extension {
             this._watchId = null;
         }
         this._disconnectProxy();
-        this._destroyAllPermNotifs();
-        this._notifSource?.destroy();
-        this._notifSource = null;
+        this._clearAllRequests();
+        if (this._settings && this._settingsIds) {
+            for (const id of this._settingsIds) this._settings.disconnect(id);
+        }
+        this._settingsIds = null;
         this._settings = null;
         this._indicator?.destroy();
         this._indicator = null;

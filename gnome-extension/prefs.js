@@ -13,10 +13,17 @@ export default class CodelightPreferences extends ExtensionPreferences {
 
         const permRow = new Adw.SwitchRow({
             title: 'Show permission prompts',
-            subtitle: 'Approve Claude Code permission requests from a desktop notification. Requires the companion to run with --remote-permissions.',
+            subtitle: 'Approve Claude Code permission requests from a desktop notification. Requires the companion to run with --remote-control.',
         });
         settings.bind('permission-prompts', permRow, 'active', 0 /* Gio.SettingsBindFlags.DEFAULT */);
         group.add(permRow);
+
+        const qRow = new Adw.SwitchRow({
+            title: 'Show question prompts',
+            subtitle: 'Answer Claude Code AskUserQuestion prompts from a dialog. Requires the companion to run with --remote-control.',
+        });
+        settings.bind('question-prompts', qRow, 'active', 0);
+        group.add(qRow);
 
         page.add(group);
         window.add(page);

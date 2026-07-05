@@ -6,7 +6,13 @@
       <default>true</default>
       <summary>Show permission prompts</summary>
       <description>Show Claude Code permission requests as desktop notifications
-        with Allow/Deny buttons (companion must run with --remote-permissions).</description>
+        with Allow/Deny buttons (companion must run with --remote-control).</description>
+    </key>
+    <key name="question-prompts" type="b">
+      <default>true</default>
+      <summary>Show question prompts</summary>
+      <description>Show Claude Code AskUserQuestion prompts as a dialog you can
+        answer (companion must run with --remote-control).</description>
     </key>
   </schema>
 </schemalist>
