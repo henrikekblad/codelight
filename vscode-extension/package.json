@@ -2,7 +2,7 @@
   "name": "codelight",
   "displayName": "codelight",
   "description": "Claude Code status in the VSCode status bar, from the codelight companion daemon",
-  "version": "1.1.0",
+  "version": "1.2.0",
   "publisher": "sensnology",
   "license": "MIT",
   "repository": {
@@ -42,9 +42,20 @@
           "type": "string",
           "default": "",
           "description": "Shared secret (must match the daemon's --secret)"
+        },
+        "codelight.questionPrompts": {
+          "type": "boolean",
+          "default": true,
+          "description": "Answer Claude Code's AskUserQuestion prompts in the editor (requires the companion to run with --remote-control)"
         }
       }
-    }
+    },
+    "commands": [
+      {
+        "command": "codelight.answerQuestion",
+        "title": "codelight: Answer Claude's question"
+      }
+    ]
   },
   "scripts": {
     "build": "esbuild src/extension.ts --bundle --outfile=dist/extension.js --external:vscode --format=cjs --platform=node --minify",
