@@ -105,13 +105,15 @@ jobs:
         working-directory: screen
         run: pio run
 
-      - name: Rename binary
+      - name: Rename binaries
         run: |
           cp screen/.pio/build/geekmagic_ultra/firmware.bin \
              screen/.pio/build/geekmagic_ultra/codelight-${{ github.ref_name }}.bin
-          # gzipped variant for flashing from the GeekMagic stock firmware, whose
+          # gzipped variant for flashing from the legacy GeekMagic stock firmware, whose
           # flash layout leaves too little OTA staging space for the plain bin
           gzip -9 -k screen/.pio/build/geekmagic_ultra/codelight-${{ github.ref_name }}.bin
+          cp screen/.pio/build/bootstrap/firmware.bin \
+             screen/.pio/build/bootstrap/codelight-bootstrap-${{ github.ref_name }}.bin
 
       - name: Create GitHub release
         uses: softprops/action-gh-release@v2
@@ -124,7 +126,8 @@ jobs:
             | File | Description |
             |------|-------------|
             | `codelight-${{ github.ref_name }}.bin` | ESP8266 firmware for GeekMagic Ultra |
-            | `codelight-${{ github.ref_name }}.bin.gz` | Same firmware, for flashing from the stock GeekMagic firmware |
+            | `codelight-${{ github.ref_name }}.bin.gz` | Same firmware, gzipped for legacy stock firmware OTA |
+            | `codelight-bootstrap-${{ github.ref_name }}.bin` | Bootstrap image for KR_SDP two-step install |
             | `codelight-${{ github.ref_name }}.apk` | Android home-screen widget |
             | `codelight-${{ github.ref_name }}.vsix` | VSCode extension (status bar + remote permission approval) |
 
@@ -133,11 +136,15 @@ jobs:
             ### Flash firmware (GeekMagic Ultra)
 
             **Stock OTA** (no disassembly — works on a fresh device):
-            1. Connect your computer to the device's WiFi AP
-            2. Open `http://192.168.4.1/update` in your browser
-            3. Upload `codelight-${{ github.ref_name }}.bin.gz` (the plain `.bin` is
-               too large for the stock firmware's OTA staging area)
-            4. After reboot, connect the device to your network via the setup page
+
+            The `buildAndOTAUpdate.sh` script handles both stock firmware variants automatically:
+            ```bash
+            ./screen/buildAndOTAUpdate.sh 192.168.4.1
+            ```
+            - **KR_SDP firmware** (most devices bought after mid-2024): flash `codelight-bootstrap-${{ github.ref_name }}.bin` via the stock `/update_ota` endpoint, then upload the main firmware via the bootstrap — the script does both steps automatically.
+            - **Legacy stock firmware**: upload `codelight-${{ github.ref_name }}.bin.gz` via `http://192.168.4.1/update` (the plain `.bin` exceeds the stock OTA staging area).
+
+            After flashing, connect the device to your network via the setup page at `http://192.168.4.1`.
 
             **Already running codelight:**
             - Open the device's settings page and use the *Firmware update* form
@@ -156,4 +163,5 @@ jobs:
           files: |
             screen/.pio/build/geekmagic_ultra/codelight-${{ github.ref_name }}.bin
             screen/.pio/build/geekmagic_ultra/codelight-${{ github.ref_name }}.bin.gz
+            screen/.pio/build/bootstrap/codelight-bootstrap-${{ github.ref_name }}.bin
           fail_on_unmatched_files: true

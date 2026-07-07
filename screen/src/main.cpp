@@ -207,7 +207,7 @@ static void connectWifi() {
 
     // No network reachable → AP mode
     WiFi.mode(WIFI_AP);
-    WiFi.softAP(AP_SSID);
+    WiFi.softAP(AP_SSID, nullptr, 6);  // ch 6: avoids ch 1/11 used by most home routers
     Serial.println(F("  AP: " AP_SSID " / 192.168.4.1"));
     Serial.flush();
 }
@@ -216,13 +216,16 @@ static void showWifiStatus() {
     if (!displayReady) return;
 
     if (WiFi.status() == WL_CONNECTED) {
-        tft.fillScreen(TFT_BLACK);
+        // Show mDNS name + IP as a brief splash — clear only what we draw
+        // so we don't wipe the chrome that displayInit() just established.
         tft.setTextFont(2);
         tft.setTextColor(TFT_WHITE, TFT_BLACK);
         tft.setCursor(6, 6);
         tft.print(mdnsName + ".local");
+        tft.fillRect(tft.getCursorX(), 6, 240 - tft.getCursorX(), 16, TFT_BLACK);
         tft.setCursor(6, 26);
         tft.print(WiFi.localIP().toString());
+        tft.fillRect(tft.getCursorX(), 26, 240 - tft.getCursorX(), 16, TFT_BLACK);
         delay(2000);
     } else {
         tft.fillScreen(TFT_NAVY);
@@ -316,6 +319,13 @@ static void tryDiscover() {
 }
 
 void setup() {
+    // Blank the display immediately — TFT_BL floats high-z after reset and
+    // the PCB pull defaults to ON, so the old display content is visible for
+    // the entire WiFi-init phase (~10 s) unless we kill it here first.
+    // displayInit() will re-enable the backlight once the screen is clean.
+    pinMode(TFT_BL, OUTPUT);
+    digitalWrite(TFT_BL, HIGH);  // active LOW — HIGH = off
+
     Serial.begin(115200);
     delay(200);
     Serial.println(F("\n\n=== codelight boot ==="));

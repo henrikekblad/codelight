@@ -76,7 +76,8 @@ static const char INDEX_HTML[] PROGMEM = R"rawhtml(<!DOCTYPE html>
   <input type="text" id="companionHost" placeholder="e.g. 192.168.1.100" maxlength="64">
 
   <label>Companion secret <span style="color:#8b949e;font-size:.8rem">(optional – match --secret in codelight.py)</span></label>
-  <input type="password" id="companionSecret" placeholder="leave blank to disable auth">
+  <input type="password" id="companionSecret" placeholder="(set – leave blank to keep)">
+  <label class="chk"><input type="checkbox" id="clearSecret"> Clear secret (remove authentication)</label>
 
   <h2>Display</h2>
   <label class="chk"><input type="checkbox" id="sleepOnDisconnect"> Sleep after 10 minutes when disconnected</label>
@@ -128,6 +129,8 @@ fetch('/api/config').then(r=>r.json()).then(cfg => {
   document.getElementById('companionHost').value = cfg.companionHost || '';
   document.getElementById('sleepOnDisconnect').checked = cfg.sleepOnDisconnect !== false;
   document.getElementById('sleepOnIdle').checked       = cfg.sleepOnIdle !== false;
+  document.getElementById('companionSecret').placeholder =
+    cfg.hasSecret ? '(set — leave blank to keep)' : 'leave blank to disable auth';
   const nets = cfg.wifi || [];
   nets.forEach(n => addNetRow(n.ssid, ''));
   if (nets.length === 0) addNetRow();
@@ -146,11 +149,15 @@ document.getElementById('cfg').onsubmit = async (e) => {
     return {ssid: s.value.trim(), password: p.value};
   }).filter(n => n.ssid.length > 0);
 
+  const secretVal   = document.getElementById('companionSecret').value;
+  const clearSecret = document.getElementById('clearSecret').checked;
   const body = {
     deviceName:      document.getElementById('deviceName').value.trim(),
     companionName:   document.getElementById('companionName').value.trim(),
     companionHost:   document.getElementById('companionHost').value.trim(),
-    companionSecret: document.getElementById('companionSecret').value,
+    // Empty field = keep existing secret; clearSecret checkbox = explicitly remove it
+    companionSecret: clearSecret ? '' : secretVal,
+    clearSecret,
     sleepOnDisconnect: document.getElementById('sleepOnDisconnect').checked,
     sleepOnIdle:       document.getElementById('sleepOnIdle').checked,
     wifi,
@@ -292,8 +299,13 @@ static void handlePostConfig(AsyncWebServerRequest* req, uint8_t* data, size_t l
         cfg.companionName = doc["companionName"].as<String>();
     if (doc["companionHost"].is<String>())
         cfg.companionHost = doc["companionHost"].as<String>();
-    if (doc["companionSecret"].is<String>())
-        cfg.companionSecret = doc["companionSecret"].as<String>();
+    if (doc["clearSecret"].is<bool>() && doc["clearSecret"].as<bool>()) {
+        cfg.companionSecret = "";  // user explicitly cleared it
+    } else if (doc["companionSecret"].is<String>()) {
+        String s = doc["companionSecret"].as<String>();
+        if (s.length() > 0)        // blank = keep existing
+            cfg.companionSecret = s;
+    }
     if (doc["sleepOnDisconnect"].is<bool>())
         cfg.sleepOnDisconnect = doc["sleepOnDisconnect"].as<bool>();
     if (doc["sleepOnIdle"].is<bool>())
@@ -341,6 +353,12 @@ void webserverInit(AsyncWebServer& server) {
     });
 
     server.on("/api/debug/log", HTTP_GET, handleDebugLog);
+
+    // Reboot endpoint — used by buildAndOTAUpdate.sh after pushing WiFi config
+    server.on("/api/reboot", HTTP_POST, [](AsyncWebServerRequest* req) {
+        req->send(200, "text/plain", "rebooting");
+        ESP.restart();
+    });
 
     // Remote reboot (dev aid — e.g. clearing a wedged OTA session)
     server.on("/api/debug/reboot", HTTP_POST, [](AsyncWebServerRequest* req) {

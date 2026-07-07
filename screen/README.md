@@ -7,12 +7,6 @@ Claude Code dashboard. The screen connects outbound to the companion daemon as a
 WebSocket client, discovers it automatically via mDNS, and re-renders on every
 push.
 
-> **Almost there.** The full stack — WiFi, companion discovery, WebSocket status
-> updates, web config/debug UI, sleep screen, and OTA updates — is verified on real
-> hardware. The one part not yet seen with human eyes is the panel itself (the flex
-> cable was ripped during an earlier disassembly), so rendering is verified via the
-> live `/screendump` preview only. A replacement screen is on its way.
-
 ## Hardware
 
 | | |
@@ -42,26 +36,26 @@ The firmware binary ends up at `.pio/build/geekmagic_ultra/firmware.bin`.
 
 ### Option A — Stock firmware OTA (easiest, no disassembly)
 
-The GeekMagic Ultra ships with a stock firmware that exposes a web OTA page
-(a plain ESP8266HTTPUpdateServer form on `/update`).
-
-1. Power on the device. It creates a WiFi AP — connect to it from your computer.
-2. Open the stock firmware's update page in a browser (usually `http://192.168.4.1/update`
-   or check the screen for the address).
-3. Upload a **gzipped** build: `gzip -9 -k firmware.bin`, then upload `firmware.bin.gz`.
-   The plain `.bin` is rejected with *"Not Enough Space"* — the stock flash layout
-   only leaves ~520 KB of OTA staging room, and the compressed image fits.
-4. The device reboots into the new firmware and shows a setup screen.
-
-Or skip the browser and use the helper script, which builds and flashes in one go:
+The helper script auto-detects which stock firmware is on the device and handles
+everything in one command:
 
 ```bash
 ./buildAndOTAUpdate.sh 192.168.4.1
 ```
 
-It auto-detects whether the device runs the stock updater or the codelight
-firmware, so the same command works for the first flash and for every
-development iteration after it:
+Two stock firmware variants exist:
+
+**KR_SDP** (most common on devices bought after mid-2024): the script does a
+two-step install — it flashes a small bootstrap image first, then uploads the
+full codelight firmware. No manual steps required; just make sure your computer
+is connected to the device's WiFi AP (`claude-screen-setup` or the stock AP).
+
+**Legacy stock** (older devices, `/update` page): the script uploads a gzipped
+binary directly. The stock flash layout only leaves ~520 KB of OTA staging room,
+which is why the compressed image is required; the plain `.bin` is rejected with
+*"Not Enough Space"*.
+
+Once codelight is running, the same command updates it over the network:
 
 ```bash
 ./buildAndOTAUpdate.sh              # defaults to claude-screen.local
@@ -90,7 +84,7 @@ directly over serial without any tools.
 
 | Device pad | FTDI pin |
 |---|---|
-| 1 GND | GND (black) | 
+| 1 GND | GND (black) |
 | 2 TXD0 | RX (green) |
 | 3 RXD0 | TX (white) |
 | 4 3V3 | 3V3 |
@@ -111,11 +105,8 @@ ESP8266 enters its serial bootloader when GPIO0 is held LOW at reset:
 #### Flash
 
 ```bash
-# Install esptool if needed
-python3 -m pip install esptool
-
-python3 -m esptool --port /dev/ttyUSB0 --baud 921600 \
-    write_flash 0x0 .pio/build/geekmagic_ultra/firmware.bin
+esptool --port /dev/ttyUSB0 --baud 460800 \
+    write-flash 0x0 .pio/build/geekmagic_ultra/firmware.bin
 ```
 
 Replace `/dev/ttyUSB0` with your actual serial port (`/dev/ttyACM0`, `COM3`, etc.).

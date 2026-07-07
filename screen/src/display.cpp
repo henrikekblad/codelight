@@ -131,21 +131,35 @@ static void drawChrome() {
 static bool displayUsable = false;   // displayInit() completed (not crash-guard skipped)
 
 void displayInit() {
+    pinMode(TFT_BL, OUTPUT);
+    digitalWrite(TFT_BL, HIGH);  // backlight OFF while we initialise (active LOW)
     tft.init();
     tft.setRotation(0);
     tft.setSwapBytes(true);
     tft.fillScreen(COL_BG);
-    pinMode(TFT_BL, OUTPUT);
-    digitalWrite(TFT_BL, LOW);   // active LOW = backlight on
+    digitalWrite(TFT_BL, LOW);   // backlight ON — screen is already black
 
     drawChrome();
     displayUsable = true;
 }
 
 static DisplayData prev = {-1.0f, -1.0f, "", "", -1, (ClaudeStatus)-1, false, false};
+static bool firstUpdate = true;
 
 void displayUpdate() {
     if (displaySleeping()) return;
+
+    // On the very first call, do a full clear to remove any residual content
+    // in the small gaps between drawn regions (margins, inter-row spacing).
+    // After that only dirty regions are redrawn so this never runs again.
+    if (firstUpdate) {
+        tft.fillScreen(COL_BG);
+        firstUpdate = false;
+    }
+
+    // Always redraw chrome — showWifiStatus() and sleep-wake both do a full
+    // fillScreen that erases the title and divider.
+    drawChrome();
 
     if (displayData.weeklyPct != prev.weeklyPct || displayData.weeklyReset != prev.weeklyReset)
         drawMeterBlock(Y_WMETER, "Weekly", displayData.weeklyPct, displayData.weeklyReset);
