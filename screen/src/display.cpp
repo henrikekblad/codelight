@@ -328,9 +328,9 @@ void displayUpdateClock() {
 
 // ── Sleep screen: bouncing logo ───────────────────────────────────────────────
 //
-// Two 1-bit sprites (colors applied at push time via setBitmapColor): the logo
-// drifts DVD-style, the clock sits in a fixed corner and is repainted whenever
-// the logo passes over it. Backlight is PWM-dimmed.
+// Two 1-bit sprites (colors applied at push time via setBitmapColor): logo and
+// clock both drift DVD-style, bounce on walls, and collide with each other.
+// Backlight is PWM-dimmed.
 //
 // Velocity is a float vector at a random angle, re-jittered on every wall
 // bounce — with a fixed ±step the path is locked to 45° diagonals and traces
@@ -340,12 +340,11 @@ void displayUpdateClock() {
 #define SLEEP_SPEED     2.4f    // px per frame
 #define SLEEP_STEP      3       // sprite margin; must cover ceil(SLEEP_SPEED)
 #define SLEEP_BL_LEVEL  50      // backlight duty while asleep (0-255)
-#define FLASH_FRAMES    12      // corner-hit flash duration
-
-#define CLK_W  60
-#define CLK_H  16
-#define CLK_X  (240 - CLK_W - 8)
-#define CLK_Y  (240 - CLK_H - 6)
+#define SLEEP_CLK_SCALE 3       // 3x the regular sleep clock size
+#define LOGO_COLLIDE_INSET_X 0  // tighter hitbox to match visible logo shape
+#define LOGO_COLLIDE_INSET_Y 0
+#define CLOCK_COLLIDE_INSET_X 2 // trim font-side padding from clock box
+#define CLOCK_COLLIDE_INSET_Y 2
 
 static TFT_eSprite logoSpr(&tft);
 static TFT_eSprite clkSpr(&tft);
@@ -353,7 +352,10 @@ static bool sleeping   = false;
 static bool sleepAnim  = false;   // sprites allocated, animation running
 static int  lx, ly;               // integer draw position (also used by the SVG preview)
 static float fx, fy, vx, vy;      // exact position / velocity
-static uint8_t flashLeft = 0;
+static int  cx, cy;               // clock integer draw position (also for SVG preview)
+static float cfx, cfy, cvx, cvy;  // clock exact position / velocity
+static int  clkW = 96;
+static int  clkH = 48;
 static unsigned long lastFrameMs = 0;
 static int lastClkMin = -1;
 
@@ -367,9 +369,21 @@ static void sleepRandomizeVelocity() {
     vy = (vy < 0 ? -1.0f : 1.0f) * SLEEP_SPEED * sinf(ang);
 }
 
-static void drawSleepClock() {
+static void sleepRandomizeVelocity(float& svx, float& svy) {
+    float ang = (25.0f + (int)(RANDOM_REG32 % 41)) * (PI / 180.0f);
+    svx = (svx < 0 ? -1.0f : 1.0f) * SLEEP_SPEED * cosf(ang);
+    svy = (svy < 0 ? -1.0f : 1.0f) * SLEEP_SPEED * sinf(ang);
+}
+
+static bool sleepOverlap(float ax, float ay, int aw, int ah,
+                         float bx, float by, int bw, int bh) {
+    return ax < bx + bw && ax + aw > bx && ay < by + bh && ay + ah > by;
+}
+
+static void renderSleepClock() {
     time_t now = time(nullptr);
     struct tm* t = localtime(&now);
+    if (t->tm_min == lastClkMin) return;
     lastClkMin = t->tm_min;
 
     char buf[8];
@@ -377,11 +391,15 @@ static void drawSleepClock() {
 
     clkSpr.fillSprite(0);
     clkSpr.setTextFont(2);
-    clkSpr.setTextSize(1);
+    clkSpr.setTextSize(SLEEP_CLK_SCALE);
+    clkSpr.setBitmapColor(COL_GREEN, COL_BG);
     clkSpr.setTextColor(1);
-    clkSpr.setCursor(CLK_W - clkSpr.textWidth(buf), 0);
+    int textW = clkSpr.textWidth(buf);
+    int textH = clkSpr.fontHeight(2);
+    int tx = SLEEP_STEP + (clkW - textW) / 2;
+    int ty = SLEEP_STEP + (clkH - textH) / 2;
+    clkSpr.setCursor(tx, ty);
     clkSpr.print(buf);
-    clkSpr.pushSprite(CLK_X, CLK_Y);
 }
 
 void displaySleepStart() {
@@ -398,13 +416,40 @@ void displaySleepStart() {
     vx = (RANDOM_REG32 & 1) ? 1.0f : -1.0f;
     vy = (RANDOM_REG32 & 1) ? 1.0f : -1.0f;
     sleepRandomizeVelocity();
+
+    // Derive the larger clock bounds from the active font metrics.
+    tft.setTextFont(2);
+    tft.setTextSize(SLEEP_CLK_SCALE);
+    clkW = tft.textWidth("00:00") + 4;
+    clkH = tft.fontHeight(2);
+
+    // Random clock position, avoiding immediate overlap with the logo.
+    bool placed = false;
+    for (int tries = 0; tries < 24; tries++) {
+        cfx = (float)(SLEEP_STEP + (int)(RANDOM_REG32 % (240 - clkW - 2 * SLEEP_STEP)));
+        cfy = (float)(SLEEP_STEP + (int)(RANDOM_REG32 % (240 - clkH - 2 * SLEEP_STEP)));
+        if (!sleepOverlap(fx, fy, LOGO_W, LOGO_H, cfx, cfy, clkW, clkH)) {
+            placed = true;
+            break;
+        }
+    }
+    if (!placed) {
+        cfx = (fx < 120.0f) ? (float)(240 - clkW - SLEEP_STEP) : (float)SLEEP_STEP;
+        cfy = (fy < 120.0f) ? (float)(240 - clkH - SLEEP_STEP) : (float)SLEEP_STEP;
+    }
+    cvx = (RANDOM_REG32 & 1) ? 1.0f : -1.0f;
+    cvy = (RANDOM_REG32 & 1) ? 1.0f : -1.0f;
+    sleepRandomizeVelocity(cvx, cvy);
+
     lx = (int)fx;
     ly = (int)fy;
+    cx = (int)cfx;
+    cy = (int)cfy;
 
     logoSpr.setColorDepth(1);
     clkSpr.setColorDepth(1);
     sleepAnim = logoSpr.createSprite(LOGO_W + 2 * SLEEP_STEP, LOGO_H + 2 * SLEEP_STEP) != nullptr
-             && clkSpr.createSprite(CLK_W, CLK_H) != nullptr;
+             && clkSpr.createSprite(clkW + 2 * SLEEP_STEP, clkH + 2 * SLEEP_STEP) != nullptr;
 
     if (!sleepAnim) {   // heap too tight for sprites: static logo instead
         logoSpr.deleteSprite();
@@ -414,59 +459,108 @@ void displaySleepStart() {
     }
 
     logoSpr.setBitmapColor(COL_LOGO, COL_BG);
-    clkSpr.setBitmapColor(COL_RESET, COL_BG);
+    clkSpr.setBitmapColor(COL_GREEN, COL_BG);
 
-    flashLeft   = 0;
     lastFrameMs = 0;
-    drawSleepClock();
+    lastClkMin  = -1;
+    renderSleepClock();
 }
 
 void displaySleepTick(unsigned long now) {
     if (!sleeping || !sleepAnim || now - lastFrameMs < SLEEP_FRAME_MS) return;
     lastFrameMs = now;
 
+    float prevFx = fx, prevFy = fy;
+    float prevCfx = cfx, prevCfy = cfy;
+
     fx += vx;
     fy += vy;
+    cfx += cvx;
+    cfy += cvy;
+
     bool hitX = false, hitY = false;
     if (fx <= 0.0f)                { fx = 0.0f;                vx =  fabsf(vx); hitX = true; }
     else if (fx >= 240 - LOGO_W)   { fx = 240 - LOGO_W;        vx = -fabsf(vx); hitX = true; }
     if (fy <= 0.0f)                { fy = 0.0f;                vy =  fabsf(vy); hitY = true; }
     else if (fy >= 240 - LOGO_H)   { fy = 240 - LOGO_H;        vy = -fabsf(vy); hitY = true; }
     if (hitX || hitY) sleepRandomizeVelocity();   // never settle into an orbit
-    if (hitX && hitY) flashLeft = FLASH_FRAMES;   // corner!
+
+    bool clkHitX = false, clkHitY = false;
+    if (cfx <= 0.0f)               { cfx = 0.0f;               cvx =  fabsf(cvx); clkHitX = true; }
+    else if (cfx >= 240 - clkW)    { cfx = 240 - clkW;         cvx = -fabsf(cvx); clkHitX = true; }
+    if (cfy <= 0.0f)               { cfy = 0.0f;               cvy =  fabsf(cvy); clkHitY = true; }
+    else if (cfy >= 240 - clkH)    { cfy = 240 - clkH;         cvy = -fabsf(cvy); clkHitY = true; }
+    if (clkHitX || clkHitY) sleepRandomizeVelocity(cvx, cvy);
+
+    const float lfx = fx + LOGO_COLLIDE_INSET_X;
+    const float lfy = fy + LOGO_COLLIDE_INSET_Y;
+    const int lfw = LOGO_W - 2 * LOGO_COLLIDE_INSET_X;
+    const int lfh = LOGO_H - 2 * LOGO_COLLIDE_INSET_Y;
+
+    const float cox = cfx + CLOCK_COLLIDE_INSET_X;
+    const float coy = cfy + CLOCK_COLLIDE_INSET_Y;
+    const int cow = clkW - 2 * CLOCK_COLLIDE_INSET_X;
+    const int coh = clkH - 2 * CLOCK_COLLIDE_INSET_Y;
+
+    if (sleepOverlap(lfx, lfy, lfw, lfh, cox, coy, cow, coh)) {
+        float ox = min(lfx + lfw, cox + cow) - max(lfx, cox);
+        float oy = min(lfy + lfh, coy + coh) - max(lfy, coy);
+        float dx = (lfx + lfw * 0.5f) - (cox + cow * 0.5f);
+        float dy = (lfy + lfh * 0.5f) - (coy + coh * 0.5f);
+        bool collideX = (ox < oy);
+        if (ox == oy) {
+            // Tie-break with dominant movement axis from this frame.
+            float mvx = fabsf((fx - prevFx) - (cfx - prevCfx));
+            float mvy = fabsf((fy - prevFy) - (cfy - prevCfy));
+            collideX = mvx >= mvy;
+        }
+
+        if (collideX) {
+            float push = (ox * 0.5f) + 0.1f;
+            if (dx < 0.0f) { fx -= push; cfx += push; }
+            else           { fx += push; cfx -= push; }
+            vx = -vx;
+            cvx = -cvx;
+        } else {
+            float push = (oy * 0.5f) + 0.1f;
+            if (dy < 0.0f) { fy -= push; cfy += push; }
+            else           { fy += push; cfy -= push; }
+            vy = -vy;
+            cvy = -cvy;
+        }
+
+        fx = constrain(fx, 0.0f, (float)(240 - LOGO_W));
+        fy = constrain(fy, 0.0f, (float)(240 - LOGO_H));
+        cfx = constrain(cfx, 0.0f, (float)(240 - clkW));
+        cfy = constrain(cfy, 0.0f, (float)(240 - clkH));
+    }
+
     lx = (int)fx;
     ly = (int)fy;
-
-    if (flashLeft > 0) {
-        flashLeft--;
-        logoSpr.setBitmapColor(COL_GREEN, COL_BG);
-    } else {
-        logoSpr.setBitmapColor(COL_LOGO, COL_BG);
-    }
+    cx = (int)cfx;
+    cy = (int)cfy;
 
     // Sprite margin covers the previous position, so one push erases and draws
     logoSpr.fillSprite(0);
+    logoSpr.setBitmapColor(COL_LOGO, COL_BG);
     logoSpr.drawBitmap(SLEEP_STEP, SLEEP_STEP, LOGO_BITS, LOGO_W, LOGO_H, 1);
     logoSpr.pushSprite(lx - SLEEP_STEP, ly - SLEEP_STEP);
 
-    time_t tnow = time(nullptr);
-    struct tm* t = localtime(&tnow);
-    bool overClock = lx + LOGO_W > CLK_X - SLEEP_STEP && ly + LOGO_H > CLK_Y - SLEEP_STEP;
-    if (t->tm_min != lastClkMin || overClock) drawSleepClock();
+    renderSleepClock();
+    clkSpr.setBitmapColor(COL_GREEN, COL_BG);
+    clkSpr.pushSprite(cx - SLEEP_STEP, cy - SLEEP_STEP);
 }
 
 static void appendSleepSvg(String& s) {
     s.reserve(s.length() + 1400);
     s += "<path transform='translate("; s += lx; s += ","; s += ly;
-    s += ") scale(0.96)' fill='";
-    s += (flashLeft > 0) ? "#00c800" : "#DE7356";
-    s += "' d='"; s += FPSTR(LOGO_PATH); s += "'/>";
+    s += ") scale(0.96)' fill='#DE7356' d='"; s += FPSTR(LOGO_PATH); s += "'/>";
 
     time_t now = time(nullptr);
     struct tm* t = localtime(&now);
     char buf[8];
     snprintf(buf, sizeof(buf), "%02d:%02d", t->tm_hour, t->tm_min);
-    svgText(s, CLK_X + CLK_W, CLK_Y + 13, "#808080", 13, "end", buf);
+    svgText(s, cx + (clkW / 2), cy + clkH - 6, "#00c800", 39, "middle", buf);
 }
 
 void displayWake() {
