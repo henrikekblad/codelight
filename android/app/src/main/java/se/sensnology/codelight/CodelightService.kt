@@ -93,9 +93,11 @@ class CodelightService : LifecycleService() {
     private var discoveryListener: NsdManager.DiscoveryListener? = null
     private var networkCallback: ConnectivityManager.NetworkCallback? = null
     private var wifiCallback: ConnectivityManager.NetworkCallback? = null
+    private var defaultNetwork: Network? = null   // current default network, to detect changes
 
     // Wi-Fi SSID filter: paused while not on an allowed network (see evaluateDormancy)
     private var currentSsid: String? = null
+    private var wifiAvailable = false   // is a Wi-Fi network currently up (SSID may be unknown)
     private var dormant = false
 
     // Resolve one at a time via a queue (old NSD API limitation)
@@ -632,20 +634,45 @@ class CodelightService : LifecycleService() {
 
         val cb = object : ConnectivityManager.NetworkCallback() {
             override fun onAvailable(network: Network) {
-                // Only restart if we have no live connection — otherwise a secondary
-                // network becoming available (mobile data, VPN, etc.) would tear down
-                // a perfectly good WiFi WebSocket every 5 seconds.
-                if (webSocket == null && !dormant) {
+                // A *changed* default network (Wi-Fi handoff home→work, docking, VPN)
+                // means any existing socket is bound to the old, now-dead network —
+                // OkHttp's ping-based failure detection is frozen in Doze so the
+                // socket never nulls itself, and a `webSocket == null` guard would
+                // skip the reconnect. So on a real change, drop the stale socket and
+                // reconnect. Network callbacks fire even in Doze, so this recovers
+                // without the user opening the app. (Same default network re-firing
+                // is ignored, so a stable connection never churns.)
+                val changed = defaultNetwork != null && network != defaultNetwork
+                defaultNetwork = network
+                if (dormant) {
+                    // If Wi-Fi just came back, re-check dormancy before early-returning.
+                    val caps = cm.getNetworkCapabilities(network)
+                    if (caps?.hasTransport(NetworkCapabilities.TRANSPORT_WIFI) == true) {
+                        wifiAvailable = true
+                    }
+                    evaluateDormancy()
+                    if (dormant) return
+                }
+                if (changed) {
+                    Log.d("Codelight", "Default network changed — forcing reconnect")
+                    webSocket?.cancel()
+                    webSocket = null
+                    scheduleReconnect()
+                } else if (webSocket == null) {
                     Log.d("Codelight", "Default network available, restarting discovery")
                     scheduleReconnect()
                 }
             }
 
             override fun onLost(network: Network) {
-                // Primary network lost — drop socket immediately so the reconnect
-                // timer starts now rather than waiting for the ping timeout.
+                // Primary network lost — drop the socket AND null it immediately (don't
+                // wait for OkHttp's onFailure, which is deferred in Doze) so the next
+                // onAvailable isn't blocked by a stale reference, and update the UI now.
                 Log.d("Codelight", "Default network lost, dropping connection")
+                if (network == defaultNetwork) defaultNetwork = null
                 webSocket?.cancel()
+                webSocket = null
+                setConnected(false)
             }
         }
         cm.registerDefaultNetworkCallback(cb)
@@ -660,14 +687,24 @@ class CodelightService : LifecycleService() {
                 .addTransportType(NetworkCapabilities.TRANSPORT_WIFI)
                 .build()
             val wcb = object : ConnectivityManager.NetworkCallback(FLAG_INCLUDE_LOCATION_INFO) {
+                override fun onAvailable(network: Network) {
+                    wifiAvailable = true
+                    Log.d("Codelight", "WiFi onAvailable: network=$network")
+                    evaluateDormancy()
+                }
+
                 override fun onCapabilitiesChanged(network: Network, capabilities: NetworkCapabilities) {
+                    wifiAvailable = true
                     currentSsid = (capabilities.transportInfo as? WifiInfo)
                         ?.ssid?.removeSurrounding("\"")
+                    Log.d("Codelight", "WiFi onCapabilitiesChanged: ssid=$currentSsid")
                     evaluateDormancy()
                 }
 
                 override fun onLost(network: Network) {
+                    wifiAvailable = false
                     currentSsid = null
+                    Log.d("Codelight", "WiFi onLost: network=$network")
                     evaluateDormancy()
                 }
             }
@@ -689,9 +726,11 @@ class CodelightService : LifecycleService() {
             .getStringSet(KEY_ALLOWED_SSIDS, emptySet()) ?: emptySet()
         if (allowed.isEmpty()) { exitDormant(); return }   // filter disabled
 
+        if (!wifiAvailable) { enterDormant(); return }
+
         val ssid = currentSsid
-        // Fail open when on WiFi but the SSID is unreadable (missing permission)
-        val active = ssid != null && (ssid == "<unknown ssid>" || ssid in allowed)
+        // Fail open when Wi-Fi is up but SSID is not yet available/readable.
+        val active = ssid == null || ssid == "<unknown ssid>" || ssid in allowed
         if (active) exitDormant() else enterDormant()
     }
 
@@ -705,28 +744,14 @@ class CodelightService : LifecycleService() {
         webSocket?.cancel()
         webSocket = null
         setConnected(false)
-        // Drop the foreground notification while paused so nothing clutters the
-        // shade off the home network. The service keeps running (START_STICKY +
-        // the Wi-Fi network callback), and re-promotes to foreground on resume.
-        stopForeground(Service.STOP_FOREGROUND_REMOVE)
     }
 
     private fun exitDormant() {
         if (!dormant) return
         dormant = false
         Log.i("Codelight", "Allowed WiFi '$currentSsid' available — resuming")
-        promoteForeground("Searching…")   // re-show the foreground notification
         setConnected(false)               // restores the normal "Searching…" text
         scheduleReconnect()
-    }
-
-    private fun promoteForeground(text: String) {
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-            startForeground(SVC_NOTIF_ID, buildServiceNotification(text),
-                ServiceInfo.FOREGROUND_SERVICE_TYPE_CONNECTED_DEVICE)
-        } else {
-            startForeground(SVC_NOTIF_ID, buildServiceNotification(text))
-        }
     }
 
     private fun scheduleReconnect() {
