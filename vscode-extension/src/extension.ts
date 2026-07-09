@@ -193,10 +193,7 @@ function esc(s: string): string {
 }
 
 function getNonce(): string {
-    let t = '';
-    const c = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789';
-    for (let i = 0; i < 32; i++) { t += c.charAt(Math.floor(Math.random() * c.length)); }
-    return t;
+    return Buffer.from(require('crypto').randomBytes(24)).toString('base64url');
 }
 
 function renderHtml(webview: vscode.Webview, req: any): string {

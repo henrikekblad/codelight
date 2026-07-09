@@ -499,7 +499,10 @@ export default class CodelightExtension extends Extension {
 
         const head = new PopupMenu.PopupBaseMenuItem({ reactive: false });
         head.add_child(new St.Label({
-            text: `${agentName(req)} asks`, style: 'font-weight: bold; color: #eeeeee;' }));
+            text: req.kind === 'permission'
+                ? `${agentName(req)} requests permission`
+                : `${agentName(req)} asks`,
+            style: 'font-weight: bold; color: #eeeeee;' }));
         this._qSection.addMenuItem(head);
 
         if (req.kind === 'permission')
@@ -518,10 +521,8 @@ export default class CodelightExtension extends Extension {
         const id = this._reqActiveId;
         if (!id) return;
         this._qKeepalive = GLib.timeout_add_seconds(GLib.PRIORITY_DEFAULT, 20, () => {
-            try {
-                this._proxy?.call_sync('ExtendRequest',
-                    new GLib.Variant('(s)', [id]), Gio.DBusCallFlags.NONE, -1, null);
-            } catch (_) {}
+            this._proxy?.call('ExtendRequest',
+                new GLib.Variant('(s)', [id]), Gio.DBusCallFlags.NONE, -1, null, null);
             return GLib.SOURCE_CONTINUE;
         });
     }
@@ -724,7 +725,7 @@ export default class CodelightExtension extends Extension {
         const activeName = agentName(data);
 
         // statuses without an icon of their own fall back to the offline icon
-        const agent = agentIconKey(data);
+        const agent = agentIconKey(data).replace(/[^a-z0-9_-]/g, '');
         const iconStatus = C[status] ? status : 'offline';
         const preferred = `${this.path}/icons/${agent}-${iconStatus}.svg`;
         const fallback = `${this.path}/icons/claude-${iconStatus}.svg`;
@@ -742,7 +743,7 @@ export default class CodelightExtension extends Extension {
             if (perAgent && typeof perAgent === 'object') {
                 for (const [agentId, items] of Object.entries(this._usageItems)) {
                     const usage = perAgent[agentId];
-                    const hasStatus = perAgentStatus && Object.hasOwn(perAgentStatus, agentId);
+                    const hasStatus = perAgentStatus && Object.prototype.hasOwnProperty.call(perAgentStatus, agentId);
                     const display = usage?.agent_display ??
                         agentId.charAt(0).toUpperCase() + agentId.slice(1);
                     items.header.visible = !!usage || !!hasStatus;
