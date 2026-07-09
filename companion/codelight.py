@@ -4,14 +4,13 @@ codelight.py - pushes coding-agent status to codelight clients.
 
 Usage:
     python3 codelight.py --name my-laptop
+    python3 codelight.py dashboard
     python3 codelight.py --name my-laptop --verbose   # also show socket events and API data
     python3 -u codelight.py | tee                         # -u avoids buffering when piping
 """
 import argparse
 import asyncio
 import collections
-import hashlib
-import hmac
 import json
 import os
 import secrets
@@ -28,6 +27,17 @@ import urllib.parse
 import urllib.request
 import urllib.error
 from datetime import datetime, timezone
+from codelight_core.agents import claude as claude_agent
+from codelight_core.agents import codex as codex_agent
+from codelight_core.agents import copilot as copilot_agent
+from codelight_core import auth as auth_core
+from codelight_core import dashboard_client
+from codelight_core import hooks as hooks_core
+from codelight_core import policy as policy_core
+from codelight_core.state import CodelightState
+from codelight_core import transcript as transcript_core
+from codelight_core import timefmt
+from codelight_core.usage import UsagePoller
 
 try:
     import websockets as _websockets
@@ -76,14 +86,6 @@ _shutdown = threading.Event()
 _lock: threading.Lock = threading.Lock()
 _policy_lock: threading.Lock = threading.Lock()
 # session_id → {"state": "working"|"waiting", "time": float}
-_sessions: dict[str, dict] = {}
-_usage_cache: dict = {
-    "session_pct": 0.0, "weekly_pct": 0.0,
-    "session_reset": "--", "weekly_reset": "--",
-    "session_reset_at": 0, "weekly_reset_at": 0,
-}
-_codex_usage_cache: dict = {}
-_copilot_usage_cache: dict = {}
 _github_org: str = ""
 _github_token_file: str = ""
 
@@ -117,13 +119,9 @@ _gnome_features: set = set()
 _last_qclient_gone: float = 0.0
 # Last transcript we saw, kept even after the session ends so the trailing
 # assistant message (flushed just after the Stop hook) still reaches clients.
-_last_transcript: dict = {"sid": "", "path": ""}
 _last_conv_mtime: float = 0.0
 
 _log_lines:       collections.deque = collections.deque(maxlen=10)
-_last_payload:    dict | None = None
-_render_lock:     threading.Lock = threading.Lock()
-_dashboard_ready: bool = False   # True after the first full-screen clear
 
 AGENT_REGISTRY: dict[str, dict[str, str]] = {
     "claude": {"display": "Claude", "short": "C"},
@@ -131,95 +129,63 @@ AGENT_REGISTRY: dict[str, dict[str, str]] = {
     "codex": {"display": "Codex", "short": "X"},
 }
 DEFAULT_AGENT_ID = "claude"
-_last_active_agent: str = DEFAULT_AGENT_ID
+_state = CodelightState(
+    default_agent_id=DEFAULT_AGENT_ID,
+    agent_registry=AGENT_REGISTRY,
+    idle_window=IDLE_WINDOW,
+    idle_window_waiting=IDLE_WINDOW_WAITING,
+)
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
 def vprint(*args, **kwargs):
     if _verbose:
-        if sys.stdout.isatty():
-            _log(" ".join(str(a) for a in args))
-        else:
-            print(*args, **kwargs, flush=True)
+        print(*args, **kwargs, flush=True)
 
 
 def _log(msg: str) -> None:
     """Append a timestamped line to the rolling activity log.
-    In TTY mode the dashboard redraws immediately; in pipe mode it prints directly."""
+    The terminal dashboard consumes this over the same client payload as every
+    other surface."""
     ts = datetime.now().strftime("%H:%M:%S")
     _log_lines.append(f"[{ts}] {msg}")
-    if sys.stdout.isatty() and _last_payload is not None:
-        with _render_lock:
-            _render_dashboard(_last_payload)
-    elif not sys.stdout.isatty():
-        print(f"[{ts}] {msg}", flush=True)
+    print(f"[{ts}] {msg}", flush=True)
 
 
 def _format_countdown(diff_secs: int) -> str:
-    if diff_secs <= 0:
-        return "--"
-    days  = diff_secs // 86400
-    hours = (diff_secs % 86400) // 3600
-    mins  = (diff_secs % 3600)  // 60
-    if days > 0:
-        return f"{days}d {hours}h"
-    if hours > 0:
-        return f"{hours}h {mins}m"
-    return f"{mins}m"
+    return timefmt.format_countdown(diff_secs)
 
 
 def _epoch(iso_ts: str) -> int:
     """ISO-8601 timestamp → epoch seconds (0 if unparseable)."""
-    if not iso_ts:
-        return 0
-    try:
-        return int(datetime.fromisoformat(iso_ts.replace("Z", "+00:00")).timestamp())
-    except Exception:
-        return 0
+    return timefmt.epoch(iso_ts)
 
 
 def _format_iso_countdown(iso_ts: str) -> str:
     """Convert an ISO-8601 timestamp to a human-readable countdown like '3h 45m'."""
-    if not iso_ts:
-        return "--"
-    try:
-        target = datetime.fromisoformat(iso_ts.replace("Z", "+00:00"))
-        diff = int((target - datetime.now(timezone.utc)).total_seconds())
-        return _format_countdown(diff)
-    except Exception:
-        return "--"
+    return timefmt.format_iso_countdown(iso_ts)
 
 
 def _format_epoch_countdown(epoch_seconds: int) -> str:
-    try:
-        diff = int(epoch_seconds) - int(time.time())
-        return _format_countdown(diff)
-    except (TypeError, ValueError):
-        return "--"
+    return timefmt.format_epoch_countdown(epoch_seconds)
 
 
 def _normalize_agent_id(agent_id: str | None) -> str:
-    aid = str(agent_id or "").strip().lower()
-    return aid if aid else DEFAULT_AGENT_ID
+    return _state.normalize_agent_id(agent_id)
 
 
 def _agent_display_name(agent_id: str | None) -> str:
-    aid = _normalize_agent_id(agent_id)
-    if aid in AGENT_REGISTRY:
-        return AGENT_REGISTRY[aid]["display"]
-    return aid.capitalize() if aid else AGENT_REGISTRY[DEFAULT_AGENT_ID]["display"]
+    return _state.agent_display_name(agent_id)
 
 
 def _agent_meter_titles(agent_id: str | None) -> tuple[str, str]:
-    display = _agent_display_name(agent_id)
-    return f"{display} Weekly", f"{display} Session"
+    return _state.agent_meter_titles(agent_id)
 
 
 def _valid_auth_response(data: dict, secret: str, nonce: str) -> bool:
     if not isinstance(data, dict) or "auth_hmac" not in data:
         return False
-    expected = hmac.new(secret.encode(), nonce.encode(), hashlib.sha256).hexdigest()
-    return hmac.compare_digest(str(data.get("auth_hmac", "")), expected)
+    return auth_core.valid_auth_response(data, secret, nonce)
 
 
 def _get_local_ip() -> str:
@@ -262,48 +228,27 @@ def _broadcast(payload: dict) -> None:
 def _update_session(session_id: str, state: str,
                     transcript: str = "", cwd: str = "",
                     agent_id: str = DEFAULT_AGENT_ID) -> None:
-    global _last_transcript, _last_active_agent
     normalized_agent = _normalize_agent_id(agent_id)
     if not transcript and normalized_agent == "copilot":
         transcript = _copilot_events_path_for_session(session_id)
     elif not transcript and normalized_agent == "codex":
         transcript = _codex_rollout_path_for_session(session_id)
-    if transcript:
-        _last_transcript = {"sid": session_id, "path": transcript,
-                            "agent_id": normalized_agent}
-    with _lock:
-        if state == "ended":
-            _sessions.pop(session_id, None)
-        else:
-            info = _sessions.get(session_id, {})
-            info["state"] = state
-            info["time"]  = time.time()
-            # Keep the last-known transcript/cwd when a later event omits them
-            # (e.g. PermissionRequest carries cwd but no transcript_path).
-            if transcript:
-                info["transcript"] = transcript
-            if cwd:
-                info["cwd"] = cwd
-            info["agent_id"] = normalized_agent
-            _sessions[session_id] = info
-        if state in ("working", "waiting"):
-            _last_active_agent = normalized_agent
+    _state.update_session(
+        session_id,
+        state,
+        transcript=transcript,
+        cwd=cwd,
+        agent_id=normalized_agent,
+    )
 
 
 def _active_transcript() -> tuple[str, str]:
     """(session_id, transcript_path) of the most-recently-active session that
     has a known transcript. Falls back to the last transcript we ever saw so
     the trailing message survives the session being popped on Stop."""
-    with _lock:
-        best = None
-        for sid, info in _sessions.items():
-            if info.get("transcript"):
-                if best is None or info["time"] > best[1]:
-                    best = (sid, info["time"], info["transcript"])
-    if best:
-        return (best[0], best[2])
-    if _last_transcript["path"]:
-        return (_last_transcript["sid"], _last_transcript["path"])
+    active = _state.active_transcript()
+    if active.path:
+        return (active.session_id, active.path)
     # Copilot fallback: if hooks did not pass transcript_path, use the newest
     # session-state events file.
     p = _latest_copilot_events_path()
@@ -345,254 +290,37 @@ def _latest_copilot_events_path() -> str:
 
 
 def _codex_rollout_path_for_session(session_id: str) -> str:
-    """Find Codex's rollout JSONL for a hook session/thread id."""
-    sid = str(session_id or "").strip()
-    if not sid or sid == "unknown":
-        return ""
-    try:
-        base = os.path.realpath(os.path.join(CODEX_HOME, "sessions"))
-        suffix = f"-{sid}.jsonl"
-        for root, _, files in os.walk(base):
-            for name in files:
-                if name.endswith(suffix):
-                    candidate = os.path.realpath(os.path.join(root, name))
-                    if candidate.startswith(base + os.sep):
-                        return candidate
-    except Exception:
-        pass
-    return ""
+    return codex_agent.rollout_path_for_session(CODEX_HOME, session_id)
 
 
 def _latest_codex_rollout_path() -> str:
-    try:
-        base = os.path.join(CODEX_HOME, "sessions")
-        newest_path = ""
-        newest_mtime = 0.0
-        for root, _, files in os.walk(base):
-            for name in files:
-                if not name.endswith(".jsonl"):
-                    continue
-                path = os.path.join(root, name)
-                try:
-                    mtime = os.path.getmtime(path)
-                except OSError:
-                    continue
-                if mtime > newest_mtime:
-                    newest_mtime = mtime
-                    newest_path = path
-        return newest_path
-    except Exception:
-        return ""
+    return codex_agent.latest_rollout_path(CODEX_HOME)
 
 
 def _parse_transcript(path: str, max_msgs: int = 60) -> list[dict]:
-    """Best-effort parse of supported-agent transcript JSONL into a list of
-    {"role", "text"} dicts (newest last). The transcript format is INTERNAL to
-    each agent and may change without notice, so this must never raise."""
-    try:
-        with open(path, "r") as f:
-            raw_lines = f.readlines()
-    except Exception:
-        return []
-
-    def extract_role_and_content(o: dict):
-        """Best-effort role/content extraction across transcript formats."""
-        t = str(o.get("type") or "").strip().lower()
-
-        # Codex rollout shape:
-        #   {"type":"response_item","payload":{"type":"message",...}}
-        # Tool calls and outputs are also response_item payloads.
-        if t == "response_item" and isinstance(o.get("payload"), dict):
-            payload = o["payload"]
-            pt = str(payload.get("type") or "").strip().lower()
-            if pt == "message":
-                role = str(payload.get("role") or "").strip().lower()
-                # Developer/system records are configuration, not conversation.
-                if role in ("user", "assistant"):
-                    return role, payload.get("content")
-            if pt in ("function_call", "custom_tool_call", "tool_call"):
-                name = str(payload.get("name") or "tool")
-                args = payload.get("arguments", payload.get("input", {}))
-                if isinstance(args, str):
-                    try:
-                        args = json.loads(args)
-                    except Exception:
-                        args = {"input": args}
-                if not isinstance(args, dict):
-                    args = {"input": args}
-                return "tool", _tool_summary(name, args)
-            if pt in ("function_call_output", "custom_tool_call_output",
-                      "tool_call_output"):
-                output = _codex_tool_result_text(payload.get("output"))
-                return "output", ("↳ " + output[:400]) if output else None
-
-        # Copilot events.jsonl shape:
-        #   {"type":"user.message"|"assistant.message","data":{"content":...}}
-        if t in ("user.message", "assistant.message"):
-            data = o.get("data")
-            if isinstance(data, dict):
-                content = data.get("content")
-                if content is not None:
-                    return ("user" if t.startswith("user") else "assistant"), content
-
-        # Claude-style envelope: {type,user|assistant, message:{role,content}}
-        if t in ("user", "assistant"):
-            msg = o.get("message")
-            if isinstance(msg, dict):
-                role = str(msg.get("role") or t)
-                content = msg.get("content")
-                if content is not None:
-                    return role, content
-            if isinstance(msg, str):
-                return t, msg
-
-        # Generic shape: {role, content}
-        role = str(o.get("role") or "").strip().lower()
-        content = o.get("content")
-        if role in ("user", "assistant") and content is not None:
-            return role, content
-
-        # Some logs keep message payload at top-level text.
-        text = o.get("text")
-        if isinstance(text, str) and text.strip():
-            if role in ("user", "assistant"):
-                return role, text
-            if "user" in t or "prompt" in t or t == "request":
-                return "user", text
-            if "assistant" in t or "response" in t or t == "reply":
-                return "assistant", text
-
-        # Prompt/response fallbacks often used by non-Claude tool logs.
-        prompt = o.get("prompt")
-        if isinstance(prompt, str) and prompt.strip():
-            return "user", prompt
-        response = o.get("response")
-        if isinstance(response, str) and response.strip():
-            return "assistant", response
-
-        # Sometimes "message" is an object with role/text instead of content list.
-        msg = o.get("message")
-        if isinstance(msg, dict):
-            mr = str(msg.get("role") or "").strip().lower()
-            if mr in ("user", "assistant"):
-                mc = msg.get("content")
-                if mc is None:
-                    mc = msg.get("text")
-                if mc is not None:
-                    return mr, mc
-
-        return "", None
-
-    out: list[dict] = []
-    # Only scan the tail; each turn can span several lines (tool_use/result).
-    for raw in raw_lines[-8 * max_msgs:]:
-        try:
-            o = json.loads(raw)
-        except Exception:
-            continue
-        if o.get("isMeta") or o.get("isCompactSummary"):
-            continue
-        role, content = extract_role_and_content(o)
-        if role not in ("user", "assistant", "tool", "output") or content is None:
-            continue
-
-        if isinstance(content, str):
-            s = content.strip()
-            if s and not _is_noise(s):
-                out.append({"role": role, "text": s[:2000]})
-        elif isinstance(content, list):
-            # Emit the human/assistant prose first, then each tool call and its
-            # output as their own lines so the phone shows what actually happened.
-            prose: list[str] = []
-            tail: list[dict] = []
-            for block in content:
-                if isinstance(block, str):
-                    prose.append(block); continue
-                if not isinstance(block, dict):
-                    continue
-                bt = block.get("type")
-                if bt in ("text", "input_text", "output_text"):
-                    prose.append(block.get("text", ""))
-                elif bt == "image":
-                    prose.append("[image]")
-                elif bt == "tool_use":
-                    tail.append({"role": "tool",
-                                 "text": _tool_summary(block.get("name", "?"),
-                                                       block.get("input") or {})})
-                elif bt == "tool_result":
-                    snippet = _tool_result_text(block.get("content"))
-                    if snippet:
-                        tail.append({"role": "output", "text": "⤷ " + snippet[:400]})
-                # thinking → skip
-            prose_text = "\n".join(p for p in prose if p).strip()
-            if prose_text and not _is_noise(prose_text):
-                out.append({"role": role, "text": prose_text[:2000]})
-            out.extend(tail)
-
-    return out[-max_msgs:]
+    return transcript_core.parse_transcript(
+        path, tool_summary=_tool_summary, max_msgs=max_msgs)
 
 
 def _extract_transcript_path(data: dict) -> str:
     """Read transcript path across hook payload variants."""
-    if not isinstance(data, dict):
-        return ""
-    for key in (
-        "transcript_path",
-        "transcriptPath",
-        "transcript",
-        "transcriptFile",
-        "transcript_file",
-        "log_path",
-        "logPath",
-    ):
-        v = data.get(key)
-        if isinstance(v, str) and v.strip():
-            return v
-    return ""
+    return transcript_core.extract_transcript_path(data)
 
 
 def _is_noise(s: str) -> bool:
     """True for machine-generated wrappers (slash-commands, IDE hints, injected
     reminders) that aren't turns the human actually typed."""
-    return ("<command-" in s or "<system-reminder" in s or "<ide_" in s
-            or "<local-command" in s or s.startswith("Caveat:"))
+    return transcript_core.is_noise(s)
 
 
 def _tool_result_text(content) -> str:
     """Extract a short plain-text snippet from a tool_result block's content."""
-    if isinstance(content, str):
-        s = content
-    elif isinstance(content, list):
-        parts = []
-        for b in content:
-            if isinstance(b, dict) and b.get("type") == "text":
-                parts.append(b.get("text", ""))
-            elif isinstance(b, str):
-                parts.append(b)
-        s = "\n".join(parts)
-    else:
-        s = ""
-    return " ".join(s.split())   # collapse whitespace to one line
+    return transcript_core.tool_result_text(content)
 
 
 def _codex_tool_result_text(content) -> str:
     """Remove Codex's execution envelope from a tool result."""
-    if not isinstance(content, str):
-        return _tool_result_text(content)
-    lines = content.strip().splitlines()
-    while lines and (
-        lines[0].startswith("Chunk ID:")
-        or lines[0].startswith("Wall time:")
-        or lines[0].startswith("Process exited with code ")
-        or lines[0].startswith("Process running with session ID ")
-        or lines[0].startswith("Exit code:")
-        or lines[0].startswith("Original token count:")
-        or lines[0].startswith("Final output:")
-        or lines[0].startswith("Original output:")
-        or lines[0].startswith("Output:")
-    ):
-        lines.pop(0)
-    return " ".join("\n".join(lines).split())
+    return transcript_core.codex_tool_result_text(content)
 
 
 def _conversation_payload() -> dict | None:
@@ -600,13 +328,7 @@ def _conversation_payload() -> dict | None:
     sid, path = _active_transcript()
     if not path:
         return None
-    with _lock:
-        info = _sessions.get(sid, {})
-        agent_id = _normalize_agent_id(
-            info.get("agent_id")
-            or _last_transcript.get("agent_id")
-            or _last_active_agent
-        )
+    agent_id = _state.conversation_agent(sid)
     lines = _parse_transcript(path)
     for line in lines:
         if isinstance(line, dict):
@@ -662,122 +384,36 @@ def _broadcast_conversation() -> None:
 
 
 def _status_rank(status: str) -> int:
-    return {"idle": 0, "waiting": 1, "working": 2}.get(status, 0)
+    return CodelightState._status_rank(status)
 
 
 def _overall_status() -> tuple[int, str, dict[str, str], str]:
     """Return (active_count, overall_status) from in-memory session state.
     Cleans up sessions that have been silent longer than IDLE_WINDOW."""
-    now = time.time()
-    active  = 0
-    overall = "idle"
-    per_agent: dict[str, str] = {}
-    last_agent = _normalize_agent_id(_last_active_agent)
     with _lock:
         # Sessions with a pending remote permission/question request stay alive —
         # the 30 s waiting window would otherwise drop them mid-request
         pending_sids = ({p["session_id"] for p in _pending_perms.values()}
                         | {q["session_id"] for q in _pending_questions.values()})
-        stale = [sid for sid, info in _sessions.items()
-                 if sid not in pending_sids
-                 and now - info["time"] > (IDLE_WINDOW_WAITING
-                                           if info["state"] == "waiting"
-                                           else IDLE_WINDOW)]
-        for sid in stale:
-            del _sessions[sid]
-        for info in _sessions.values():
-            active += 1
-            state = str(info.get("state") or "idle")
-            agent_id = _normalize_agent_id(info.get("agent_id"))
-            prev = per_agent.get(agent_id, "idle")
-            if _status_rank(state) > _status_rank(prev):
-                per_agent[agent_id] = state
-            if state == "working":
-                overall = "working"
-            elif state == "waiting" and overall != "working":
-                overall = "waiting"
-    if not per_agent:
-        per_agent[last_agent] = "idle"
-    return active, overall, per_agent, last_agent
+    return _state.overall_status(pending_sids)
 
 
 def _status_snapshot() -> dict:
-    sessions, status, per_agent_status, last_agent = _overall_status()
-
     with _lock:
-        usage_snap   = dict(_usage_cache)
-        codex_snap   = dict(_codex_usage_cache)
-        copilot_snap = dict(_copilot_usage_cache)
-
-    # Pick which agent's limits drive the top-level meter fields read by the
-    # ESP screen (weekly_pct / session_pct).  Copilot only has a monthly limit
-    # so we map it to the weekly slot and leave session blank.
-    if last_agent == "copilot" and copilot_snap:
-        meter_agent = "copilot"
-        usage = {
-            "weekly_pct":      copilot_snap.get("monthly_pct", 0.0),
-            "weekly_reset":    copilot_snap.get("monthly_reset", "--"),
-            "weekly_reset_at": copilot_snap.get("monthly_reset_at", 0),
-            "session_pct":     0.0,
-            "session_reset":   "--",
-            "session_reset_at": 0,
-        }
-        weekly_title  = "Copilot Monthly"
-        session_title = ""
-    elif last_agent == "codex" and codex_snap:
-        meter_agent = "codex"
-        usage = codex_snap
-        weekly_title, session_title = _agent_meter_titles(meter_agent)
-    else:
-        meter_agent = DEFAULT_AGENT_ID
-        usage = usage_snap
-        weekly_title, session_title = _agent_meter_titles(meter_agent)
-    per_agent_usage = {
-        "claude": {
-            **usage_snap,
-            "agent_display": _agent_display_name("claude"),
-            "limits": [
-                _usage_limit("Weekly", usage_snap, "weekly"),
-                _usage_limit("Session", usage_snap, "session"),
-            ],
-        },
+        pending_sids = ({p["session_id"] for p in _pending_perms.values()}
+                        | {q["session_id"] for q in _pending_questions.values()})
+    payload = _state.status_snapshot(pending_sids)
+    payload["activity"] = list(_log_lines)
+    payload["clients"] = {
+        "websocket": len(_ws_clients),
+        "dbus": _dbus_iface is not None,
     }
-    if codex_snap:
-        per_agent_usage["codex"] = {
-            **codex_snap,
-            "agent_display": _agent_display_name("codex"),
-            "limits": [
-                _usage_limit("Weekly", codex_snap, "weekly"),
-                _usage_limit("Session", codex_snap, "session"),
-            ],
-        }
-    if copilot_snap:
-        per_agent_usage["copilot"] = {
-            **copilot_snap,
-            "agent_display": _agent_display_name("copilot"),
-        }
-    return {
-        **usage,
-        "sessions": sessions,
-        "status": status,
-        "per_agent_status": per_agent_status,
-        "per_agent_usage": per_agent_usage,
-        "last_active_agent": last_agent,
-        "agent_id": last_agent,
-        "agent_display": _agent_display_name(last_agent),
-        "weekly_title": weekly_title,
-        "session_title": session_title,
-    }
+    return payload
 
 
 def _usage_limit(label: str, usage: dict, prefix: str) -> dict:
     """Return the generic limit shape understood by multi-agent clients."""
-    return {
-        "label": label,
-        "pct": usage.get(f"{prefix}_pct", 0.0),
-        "reset": usage.get(f"{prefix}_reset", "--"),
-        "reset_at": usage.get(f"{prefix}_reset_at", 0),
-    }
+    return CodelightState._usage_limit(label, usage, prefix)
 
 # ── D-Bus interface ───────────────────────────────────────────────────────────
 
@@ -792,9 +428,7 @@ if _have_dbus:
 
         @_dbus_method()
         def GetStatus(self) -> 's':  # type: ignore[return]
-            with _lock:
-                usage = dict(_usage_cache)
-            return json.dumps({**usage, **_status_snapshot()})
+            return json.dumps(_status_snapshot())
 
         @_dbus_signal()
         def PermissionRequest(self, request_json: str) -> 's':  # type: ignore[return]
@@ -1225,152 +859,44 @@ def _register_question(conn, msg: dict) -> None:
 
 # ── Hook installation ─────────────────────────────────────────────────────────
 
-HookSpec = tuple[str, str, dict]
+HookSpec = hooks_core.HookSpec
 
 
 def _hook_command_base(script_path: str, agent_id: str) -> str:
-    return f"python3 {shlex.quote(script_path)} --agent {shlex.quote(agent_id)} --hook"
+    return hooks_core.hook_command_base(script_path, agent_id)
 
 
 def _command_hook(command: str, timeout_key: str = "timeout",
                   timeout: int | None = None,
                   status_message: str | None = None) -> dict:
-    hook = {"type": "command", "command": command}
-    if timeout is not None:
-        hook[timeout_key] = timeout
-    if status_message:
-        hook["statusMessage"] = status_message
-    return hook
+    return hooks_core.command_hook(
+        command, timeout_key=timeout_key, timeout=timeout,
+        status_message=status_message)
 
 
 def _is_codelight_hook_cmd(cmd: str) -> bool:
-    # Broader than the current command line so old installs are cleaned too.
-    return (("codelight" in cmd or "claude_monitor" in cmd) and "--hook" in cmd) \
-           or "monitor_hook.py" in cmd
+    return hooks_core.is_codelight_hook_cmd(cmd)
 
 
 def _read_json_object(path: str, label: str) -> dict | None:
-    data: dict = {}
-    try:
-        with open(path) as f:
-            settings = json.load(f)
-        if isinstance(settings, dict):
-            data = settings
-        else:
-            print(f"[{label}] warning: {path} is not a JSON object", file=sys.stderr)
-            return None
-    except FileNotFoundError:
-        pass
-    except Exception as e:
-        print(f"[{label}] warning: could not read {path}: {e}", file=sys.stderr)
-        return None
-    return data
+    return hooks_core.read_json_object(path, label)
 
 
 def _write_json_object(path: str, data: dict) -> None:
-    os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
-    tmp = f"{path}.tmp.{os.getpid()}"
-    try:
-        with open(tmp, "w") as f:
-            json.dump(data, f, indent=2)
-            f.write("\n")
-        os.replace(tmp, path)
-    except Exception:
-        try:
-            os.unlink(tmp)
-        except OSError:
-            pass
-        raise
+    hooks_core.write_json_object(path, data)
 
 
 def _merge_matcher_group_hooks(hooks: dict, desired: list[HookSpec]) -> bool:
-    before = json.dumps(hooks, sort_keys=True)
-
-    # Strip every codelight/monitor command from all events while preserving
-    # unrelated hooks and non-standard entries.
-    for event in list(hooks.keys()):
-        event_hooks = hooks.get(event, [])
-        if not isinstance(event_hooks, list):
-            continue
-        cleaned = []
-        for entry in event_hooks:
-            if not isinstance(entry, dict):
-                cleaned.append(entry)
-                continue
-            entry_hooks = entry.get("hooks", [])
-            if not isinstance(entry_hooks, list):
-                cleaned.append(entry)
-                continue
-            inner = [c for c in entry_hooks
-                     if not (isinstance(c, dict)
-                             and _is_codelight_hook_cmd(c.get("command", "")))]
-            if inner:
-                cleaned.append({**entry, "hooks": inner})
-            elif not entry.get("hooks"):
-                cleaned.append(entry)
-        if cleaned:
-            hooks[event] = cleaned
-        else:
-            del hooks[event]
-
-    for event, matcher, hook_dict in desired:
-        entries = hooks.get(event)
-        if not isinstance(entries, list):
-            entries = []
-            hooks[event] = entries
-        slot = next((e for e in entries
-                     if isinstance(e, dict) and e.get("matcher", "") == matcher), None)
-        if slot is None:
-            entries.append({"matcher": matcher, "hooks": [hook_dict]})
-        else:
-            slot.setdefault("hooks", []).append(hook_dict)
-
-    return json.dumps(hooks, sort_keys=True) != before
+    return hooks_core.merge_matcher_group_hooks(hooks, desired)
 
 
 def _install_matcher_group_hooks(path: str, desired: list[HookSpec],
                                  label: str) -> None:
-    doc = _read_json_object(path, label)
-    if doc is None:
-        return
-
-    hooks = doc.get("hooks", {})
-    if not isinstance(hooks, dict):
-        print(f"[{label}] warning: {path} has non-object hooks", file=sys.stderr)
-        return
-
-    if not _merge_matcher_group_hooks(hooks, desired):
-        vprint(f"[{label}] already up to date")
-        return
-
-    doc["hooks"] = hooks
-    _write_json_object(path, doc)
-    print(f"[{label}] installed in {path}", flush=True)
+    hooks_core.install_matcher_group_hooks(path, desired, label, vprint=vprint)
 
 
 def _remove_matcher_group_hooks(path: str) -> None:
-    try:
-        with open(path) as f:
-            doc = json.load(f)
-    except FileNotFoundError:
-        print(f"[uninstall] no {os.path.basename(path)} found at {path}")
-        return
-    except Exception as e:
-        print(f"[uninstall] could not update {path}: {e}", file=sys.stderr)
-        return
-
-    hooks = doc.get("hooks", {}) if isinstance(doc, dict) else {}
-    if not isinstance(hooks, dict):
-        print(f"[uninstall] no codelight hooks found in {path}")
-        return
-
-    changed = _merge_matcher_group_hooks(hooks, [])
-    if changed:
-        doc["hooks"] = hooks
-        _write_json_object(path, doc)
-        print(f"[uninstall] removed hooks from {path}")
-    else:
-        print(f"[uninstall] no codelight hooks found in {path}")
+    hooks_core.remove_matcher_group_hooks(path)
 
 
 def install_hooks(script_path: str, remote_permissions: bool = False,
@@ -1382,43 +908,23 @@ def install_hooks(script_path: str, remote_permissions: bool = False,
     decision; with remote_questions a PreToolUse hook (matcher AskUserQuestion)
     blocks for a remote answer.
     """
-    settings_path = os.path.expanduser("~/.claude/settings.json")
-    cmd_base = _hook_command_base(script_path, "claude")
-    if remote_permissions:
-        # Hook-side wait is permission_timeout; give Claude Code's own hook
-        # timeout headroom above that so it never kills a deciding hook.
-        perm_hook = _command_hook(
-            f"{cmd_base} permission --permission-timeout {permission_timeout}",
-            timeout=HOOK_WAIT_CEILING + 15)
-    else:
-        perm_hook = _command_hook(f"{cmd_base} waiting")
-
-    # desired: list of (event, matcher, hook_dict) — an event may appear more
-    # than once with different matchers (e.g. PreToolUse status + question).
-    desired = [
-        ("PreToolUse",        "", _command_hook(f"{cmd_base} working")),
-        ("PostToolUse",       "", _command_hook(f"{cmd_base} working")),
-        ("UserPromptSubmit",  "", _command_hook(f"{cmd_base} working")),
-        ("PermissionRequest", "", perm_hook),
-        ("PermissionDenied",  "", _command_hook(f"{cmd_base} working")),
-        ("Stop",              "", _command_hook(f"{cmd_base} ended")),
-        ("SessionEnd",        "", _command_hook(f"{cmd_base} ended")),
-    ]
-    if remote_questions:
-        desired.append(("PreToolUse", "AskUserQuestion", {
-            "type": "command",
-            "command": f"{cmd_base} question --permission-timeout {permission_timeout}",
-            "timeout": HOOK_WAIT_CEILING + 15}))
-
-    _install_matcher_group_hooks(settings_path, desired, "hooks")
+    hooks_core.install_claude_hooks(
+        os.path.expanduser("~/.claude/settings.json"),
+        script_path,
+        hook_wait_ceiling=HOOK_WAIT_CEILING,
+        remote_permissions=remote_permissions,
+        remote_questions=remote_questions,
+        permission_timeout=permission_timeout,
+        vprint=vprint,
+    )
 
 
 def _copilot_hooks_path() -> str:
-    return os.path.join(COPILOT_HOME, "hooks", "codelight.json")
+    return hooks_core.copilot_hooks_path(COPILOT_HOME)
 
 
 def _codex_hooks_path() -> str:
-    return os.path.join(CODEX_HOME, "hooks.json")
+    return hooks_core.codex_hooks_path(CODEX_HOME)
 
 
 def install_codex_hooks(script_path: str, remote_permissions: bool = False,
@@ -1429,112 +935,27 @@ def install_codex_hooks(script_path: str, remote_permissions: bool = False,
     Codex local surfaces (CLI and IDE extension) share CODEX_HOME. Project-local
     hooks would need trust per repo, so codelight uses the user layer.
     """
-    cmd_base = _hook_command_base(script_path, "codex")
-    if remote_permissions:
-        perm_hook = _command_hook(
-            f"{cmd_base} permission --permission-timeout {permission_timeout}",
-            timeout=HOOK_WAIT_CEILING + 15,
-            status_message="Waiting for codelight approval")
-    else:
-        perm_hook = _command_hook(f"{cmd_base} waiting")
-
-    desired: list[HookSpec] = [
-        ("SessionStart",     "startup|resume|clear|compact",
-         _command_hook(f"{cmd_base} working")),
-        ("UserPromptSubmit", "", _command_hook(f"{cmd_base} working")),
-        ("PreToolUse",      "", _command_hook(f"{cmd_base} working")),
-        ("PostToolUse",     "", _command_hook(f"{cmd_base} working")),
-        ("PermissionRequest", "", perm_hook),
-        ("Stop",            "", _command_hook(f"{cmd_base} ended")),
-        # Subagent lifecycle means "Codex is busy", not that the root session
-        # should disappear from clients when a child finishes.
-        ("SubagentStart",    "", _command_hook(f"{cmd_base} working")),
-        ("SubagentStop",     "", _command_hook(f"{cmd_base} working")),
-    ]
-    if remote_questions:
-        desired.append(("PreToolUse", "^request_user_input$", _command_hook(
-            f"{cmd_base} question-codex --permission-timeout {permission_timeout}",
-            timeout=HOOK_WAIT_CEILING + 15,
-            status_message="Waiting for codelight answer")))
-
-    _install_matcher_group_hooks(_codex_hooks_path(), desired, "codex-hooks")
-    print("[codex-hooks] review new or changed hooks with /hooks in Codex CLI",
-          flush=True)
+    hooks_core.install_codex_hooks(
+        _codex_hooks_path(),
+        script_path,
+        hook_wait_ceiling=HOOK_WAIT_CEILING,
+        remote_permissions=remote_permissions,
+        remote_questions=remote_questions,
+        permission_timeout=permission_timeout,
+        vprint=vprint,
+    )
 
 
 def install_copilot_hooks(script_path: str, remote_permissions: bool = False,
                           permission_timeout: int = 60) -> None:
     """Install user-level GitHub Copilot CLI hooks in ~/.copilot/hooks/codelight.json."""
-    hooks_path = _copilot_hooks_path()
-    cmd_base = _hook_command_base(script_path, "copilot")
-
-    permission_hook = {
-        "type": "command",
-        "command": f"{cmd_base} permission-copilot --permission-timeout {permission_timeout}",
-        "timeoutSec": HOOK_WAIT_CEILING + 15,
-    } if remote_permissions else {
-        "type": "command",
-        "command": f"{cmd_base} waiting",
-    }
-
-    doc = {
-        "version": 1,
-        "hooks": {
-            "SessionStart": [
-                {"type": "command", "command": f"{cmd_base} working"},
-            ],
-            "UserPromptSubmit": [
-                {"type": "command", "command": f"{cmd_base} working"},
-            ],
-            "PreToolUse": (
-                [
-                    {"type": "command", "command": f"{cmd_base} working"},
-                    {
-                        "type": "command",
-                        "command": f"{cmd_base} permission-vscode --permission-timeout {permission_timeout}",
-                        "timeoutSec": HOOK_WAIT_CEILING + 15,
-                    },
-                    {
-                        "type": "command",
-                        "command": f"{cmd_base} question-vscode --permission-timeout {permission_timeout}",
-                        "timeoutSec": HOOK_WAIT_CEILING + 15,
-                    },
-                ] if remote_permissions else [
-                    {"type": "command", "command": f"{cmd_base} working"},
-                ]
-            ),
-            "PostToolUse": [
-                {"type": "command", "command": f"{cmd_base} working"},
-            ],
-            "PermissionRequest": [
-                permission_hook,
-            ],
-            "Notification": [
-                {
-                    "type": "command",
-                    "matcher": "permission_prompt|elicitation_dialog|agent_idle",
-                    "command": f"{cmd_base} waiting",
-                },
-            ],
-            "Stop": [
-                {"type": "command", "command": f"{cmd_base} ended"},
-            ],
-            "SessionEnd": [
-                {"type": "command", "command": f"{cmd_base} ended"},
-            ],
-        },
-    }
-
-    try:
-        with open(hooks_path) as _f:
-            existing = json.load(_f)
-    except Exception:
-        existing = {}
-    if existing == doc:
-        print(f"[copilot-hooks] already up to date in {hooks_path}", flush=True)
-        return
-    _write_json_object(hooks_path, doc)
-    print(f"[copilot-hooks] installed in {hooks_path}", flush=True)
+    hooks_core.install_copilot_hooks(
+        _copilot_hooks_path(),
+        script_path,
+        hook_wait_ceiling=HOOK_WAIT_CEILING,
+        remote_permissions=remote_permissions,
+        permission_timeout=permission_timeout,
+    )
 
 # ── Hook mode ─────────────────────────────────────────────────────────────────
 
@@ -1609,354 +1030,79 @@ def run_hook(state: str, agent_id: str = DEFAULT_AGENT_ID) -> None:
 
 
 def _truncate_tool_input(tool_input, max_str: int = 500, max_total: int = 3000):
-    """Bound tool_input for transport: long strings clipped, payload capped."""
-    def clip(v, depth=0):
-        if isinstance(v, str):
-            return v if len(v) <= max_str else v[:max_str] + "…"
-        if isinstance(v, dict) and depth < 4:
-            return {k: clip(x, depth + 1) for k, x in list(v.items())[:20]}
-        if isinstance(v, list) and depth < 4:
-            return [clip(x, depth + 1) for x in v[:10]]
-        return v
-
-    out = clip(tool_input)
-    try:
-        if len(json.dumps(out)) > max_total:
-            return {"_truncated": json.dumps(out)[:max_total] + "…"}
-    except Exception:
-        return {}
-    return out
+    return policy_core.truncate_tool_input(
+        tool_input, max_str=max_str, max_total=max_total)
 
 
 def _norm_path(path: str) -> str:
-    try:
-        # realpath also resolves symlinked parents for not-yet-created files,
-        # preventing a trusted-repository symlink from escaping the policy root.
-        return os.path.realpath(
-            os.path.abspath(os.path.expanduser(str(path))), strict=False)
-    except Exception:
-        return ""
+    return policy_core.norm_path(path)
 
 
 def _load_policy() -> dict:
-    try:
-        with open(POLICY_PATH) as stream:
-            value = json.load(stream)
-        if isinstance(value, dict) and value.get("version") == 1:
-            return value
-    except FileNotFoundError:
-        pass
-    except Exception as e:
-        print(f"[policy] could not read {POLICY_PATH}: {e}",
-              file=sys.stderr, flush=True)
-    return {"version": 1, "trusted_folders": [], "allowed_commands": []}
+    return policy_core.load_policy(POLICY_PATH)
 
 
 def _write_policy(policy: dict) -> bool:
     """Atomically persist the user-owned cross-agent permission policy."""
-    tmp = f"{POLICY_PATH}.tmp.{os.getpid()}"
-    try:
-        os.makedirs(os.path.dirname(POLICY_PATH), mode=0o700, exist_ok=True)
-        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-        with os.fdopen(fd, "w") as stream:
-            json.dump(policy, stream, indent=2)
-            stream.write("\n")
-        os.replace(tmp, POLICY_PATH)
-        return True
-    except Exception as e:
-        try:
-            os.unlink(tmp)
-        except OSError:
-            pass
-        print(f"[policy] could not write {POLICY_PATH}: {e}",
-              file=sys.stderr, flush=True)
-        return False
+    return policy_core.write_policy(POLICY_PATH, policy)
 
 
 def _trusted_folders() -> list[str]:
     """Return normalized trusted roots from codelight's policy."""
-    out: list[str] = []
-    seen: set[str] = set()
-    policy = _load_policy()
-    raw = policy.get("trusted_folders", [])
-    candidates = raw if isinstance(raw, list) else []
-    for item in candidates:
-        if not isinstance(item, str):
-            continue
-        path = _norm_path(item)
-        if path and path not in seen:
-            seen.add(path)
-            out.append(path)
-    return out
+    return policy_core.trusted_folders(POLICY_PATH)
 
 
 def _path_is_within(path: str, root: str) -> bool:
-    try:
-        return os.path.commonpath([path, root]) == root
-    except Exception:
-        return False
+    return policy_core.path_is_within(path, root)
 
 
 def _is_trusted_repo_cwd(cwd: str) -> bool:
-    p = _norm_path(cwd)
-    if not p:
-        return False
-    for root in _trusted_folders():
-        if _path_is_within(p, root):
-            return True
-    return False
+    return policy_core.is_trusted_repo_cwd(POLICY_PATH, cwd)
 
 
 def _repo_root_for(cwd: str) -> str:
-    cur = _norm_path(cwd)
-    if not cur:
-        return ""
-    while True:
-        if os.path.isdir(os.path.join(cur, ".git")) or os.path.isfile(os.path.join(cur, ".git")):
-            return cur
-        parent = os.path.dirname(cur)
-        if parent == cur:
-            return _norm_path(cwd)
-        cur = parent
+    return policy_core.repo_root_for(cwd)
 
 
 def _allow_folder(cwd: str) -> tuple[bool, str]:
-    folder = _repo_root_for(cwd)
-    if not folder:
-        return False, ""
-
-    with _policy_lock:
-        policy = _load_policy()
-        raw = policy.get("trusted_folders", [])
-        allowed = [_norm_path(x) for x in raw if isinstance(x, str)] \
-            if isinstance(raw, list) else []
-        for existing in allowed:
-            if existing and _path_is_within(folder, existing):
-                return True, existing
-        policy["trusted_folders"] = [*filter(None, allowed), folder]
-        policy.setdefault("allowed_commands", [])
-        return _write_policy(policy), folder
+    return policy_core.allow_folder(POLICY_PATH, _policy_lock, cwd)
 
 
 def _command_from_tool(tool_name: str, tool_input) -> str:
-    if not isinstance(tool_input, dict):
-        return ""
-    name = str(tool_name or "").strip()
-    key = "command" if name in {"Bash", "run_in_terminal"} else \
-        "cmd" if name == "exec_command" else ""
-    command = tool_input.get(key) if key else None
-    if not isinstance(command, str):
-        return ""
-    command = command.strip()
-    return command if 0 < len(command) <= 4096 else ""
+    return policy_core.command_from_tool(tool_name, tool_input)
 
 
 def _is_allowed_command(tool_name: str, tool_input, cwd: str) -> bool:
-    command = _command_from_tool(tool_name, tool_input)
-    current = _norm_path(cwd)
-    if not command or not current:
-        return False
-    raw = _load_policy().get("allowed_commands", [])
-    if not isinstance(raw, list):
-        return False
-    for item in raw:
-        if not isinstance(item, dict) or item.get("command") != command:
-            continue
-        root = _norm_path(item.get("folder", ""))
-        if root and _path_is_within(current, root):
-            return True
-    return False
+    return policy_core.is_allowed_command(POLICY_PATH, tool_name, tool_input, cwd)
 
 
 def _allow_command(command: str, cwd: str) -> tuple[bool, str]:
-    command = str(command or "").strip()
-    folder = _repo_root_for(cwd)
-    if not command or len(command) > 4096 or not folder:
-        return False, ""
-    with _policy_lock:
-        policy = _load_policy()
-        raw = policy.get("allowed_commands", [])
-        allowed = [x for x in raw if isinstance(x, dict)] \
-            if isinstance(raw, list) else []
-        if any(x.get("command") == command
-               and _norm_path(x.get("folder", "")) == folder for x in allowed):
-            return True, command
-        allowed.append({"command": command, "folder": folder})
-        policy["allowed_commands"] = allowed
-        policy.setdefault("trusted_folders", [])
-        return _write_policy(policy), command
+    return policy_core.allow_command(POLICY_PATH, _policy_lock, command, cwd)
 
 
 def _tool_summary(tool_name: str, tool_input: dict) -> str:
-    """One-line human summary of what an agent wants to do."""
-    def _compact(s: str) -> str:
-        return " ".join(str(s).split())
-
-    def _first_patch_file(patch_text: str) -> str:
-        for line in str(patch_text).splitlines():
-            line = line.strip()
-            if line.startswith("*** Update File:"):
-                return line.split(":", 1)[1].strip()
-            if line.startswith("*** Add File:"):
-                return line.split(":", 1)[1].strip()
-            if line.startswith("*** Delete File:"):
-                return line.split(":", 1)[1].strip()
-        return ""
-
-    if tool_name in ("Bash", "exec_command"):
-        detail = tool_input.get("command", "") or tool_input.get("cmd", "")
-    elif tool_name in ("Edit", "Write", "Read", "NotebookEdit"):
-        detail = tool_input.get("file_path", "")
-    elif tool_name in ("WebFetch", "WebSearch"):
-        detail = tool_input.get("url", "") or tool_input.get("query", "")
-    elif tool_name == "apply_patch":
-        explanation = _compact(tool_input.get("explanation", ""))
-        first_file = _first_patch_file(tool_input.get("input", ""))
-        parts = []
-        if explanation:
-            parts.append(explanation)
-        if first_file:
-            parts.append(f"target={first_file}")
-        detail = " | ".join(parts)
-    elif tool_name == "run_in_terminal":
-        detail = tool_input.get("goal", "") or tool_input.get("explanation", "")
-    elif tool_name == "write_stdin":
-        detail = "read running command output"
-    elif tool_name == "update_plan":
-        detail = tool_input.get("explanation", "") or "update task progress"
-    elif tool_name == "request_user_input":
-        detail = "ask for input"
-    elif tool_name in ("view_image", "open_image"):
-        detail = tool_input.get("path", "")
-    elif tool_name in ("tool_search_tool", "tool_search"):
-        detail = tool_input.get("query", "")
-    elif tool_name in ("create_file", "read_file"):
-        detail = tool_input.get("filePath", "") or tool_input.get("file_path", "")
-    elif tool_name in ("get_errors", "grep_search", "file_search"):
-        detail = tool_input.get("query", "") or tool_input.get("includePattern", "")
-    else:
-        try:
-            detail = json.dumps(tool_input)
-        except Exception:
-            detail = ""
-    detail = _compact(detail)
-    if len(detail) > 200:
-        detail = detail[:200] + "…"
-    return f"{tool_name}: {detail}" if detail else tool_name
+    return policy_core.tool_summary(tool_name, tool_input)
 
 
 def _is_trusted_auto_allow_tool(tool_name: str) -> bool:
-    """Tools that are safe to auto-allow inside a trusted workspace.
-
-    Keep this narrowly scoped: mutating tools (terminal, edits, writes, etc.)
-    must still go through remote approval.
-    """
-    t = str(tool_name or "").strip()
-    if not t:
-        return False
-
-    # Explicit workspace trust/status probes used by some clients.
-    if t in {"check_workspace_trust", "read_workspace_status"}:
-        return True
-
-    # Read-only workspace inspection tools.
-    return t in {
-        "list_dir",
-        "read_file",
-        "file_search",
-        "grep_search",
-        "semantic_search",
-        "get_errors",
-        "get_changed_files",
-        "copilot_getNotebookSummary",
-        "read_notebook_cell_output",
-        "read_page",
-        "screenshot_page",
-        "view_image",
-        "fetch_webpage",
-        "vscode_listCodeUsages",
-        "terminal_last_command",
-        "terminal_selection",
-        "testFailure",
-        "get_task_output",
-        "manage_todo_list",
-    }
+    return policy_core.is_trusted_auto_allow_tool(tool_name)
 
 
 def _is_safe_memory_read(tool_name: str, tool_input) -> bool:
-    """Allow memory reads for repo/session scopes only.
-
-    Keeps user-global memory and all mutating memory commands behind approval.
-    """
-    if str(tool_name or "").strip() != "memory":
-        return False
-    if not isinstance(tool_input, dict):
-        return False
-
-    command = str(tool_input.get("command") or "").strip().lower()
-    path = str(tool_input.get("path") or "").strip()
-
-    if command != "view":
-        return False
-    if not path:
-        return False
-
-    # Read-only auto-allow for ephemeral/local scopes.
-    if path.startswith("/memories/repo/") or path == "/memories/repo":
-        return True
-    if path.startswith("/memories/session/") or path == "/memories/session":
-        return True
-
-    # Keep /memories/ user scope behind approval.
-    return False
+    return policy_core.is_safe_memory_read(tool_name, tool_input)
 
 
 def _extract_patch_targets(patch_text: str) -> tuple[list[str], bool]:
-    """Return patch target paths and whether it includes a file delete action."""
-    targets: list[str] = []
-    has_delete = False
-    for raw in str(patch_text or "").splitlines():
-        line = raw.strip()
-        if line.startswith("*** Update File:"):
-            targets.append(line.split(":", 1)[1].strip())
-        elif line.startswith("*** Add File:"):
-            targets.append(line.split(":", 1)[1].strip())
-        elif line.startswith("*** Delete File:"):
-            has_delete = True
-    return targets, has_delete
+    return policy_core.extract_patch_targets(patch_text)
 
 
 def _is_trusted_target_path(path: str, cwd: str) -> bool:
-    p = str(path or "").strip()
-    if not p:
-        return False
-    # Paths in apply_patch are usually absolute; support relative defensively.
-    if os.path.isabs(p):
-        candidate = _norm_path(p)
-    else:
-        candidate = _norm_path(os.path.join(cwd or "", p))
-    if not candidate:
-        return False
-    for root in _trusted_folders():
-        if _path_is_within(candidate, root):
-            return True
-    return False
+    return policy_core.is_trusted_target_path(POLICY_PATH, path, cwd)
 
 
 def _is_safe_trusted_apply_patch(tool_name: str, tool_input, cwd: str) -> bool:
-    """Allow apply_patch automatically only for in-trusted-folder edits.
-
-    Keeps file-delete patches and out-of-scope targets behind approval.
-    """
-    if str(tool_name or "").strip() != "apply_patch":
-        return False
-    if not isinstance(tool_input, dict):
-        return False
-
-    targets, has_delete = _extract_patch_targets(tool_input.get("input", ""))
-    if has_delete or not targets:
-        return False
-    return all(_is_trusted_target_path(t, cwd) for t in targets)
+    return policy_core.is_safe_trusted_apply_patch(
+        POLICY_PATH, tool_name, tool_input, cwd)
 
 
 def _emit_permission_decision(decision: str, copilot_mode: bool,
@@ -2237,154 +1383,30 @@ def get_usage() -> dict | None:
     Returns a dict with session_pct/weekly_pct/resets, or None on failure
     (caller keeps cached values).
     """
-    try:
-        with open(_CREDS_PATH) as f:
-            creds = json.load(f)
-        token = creds["claudeAiOauth"]["accessToken"]
-    except Exception as e:
-        print(f"[usage] could not read credentials: {e}", file=sys.stderr, flush=True)
-        return None
-
-    req = urllib.request.Request(
-        _USAGE_API,
-        headers={
-            "Authorization": f"Bearer {token}",
-            "User-Agent":    "claude-code/1.0.0",
-            "Accept":        "application/json",
-        },
-    )
-    try:
-        with urllib.request.urlopen(req, timeout=10) as r:
-            data = json.loads(r.read())
-    except urllib.error.HTTPError as e:
-        print(f"[usage] HTTP {e.code}: {e.reason}", file=sys.stderr, flush=True)
-        return None
-    except Exception as e:
-        print(f"[usage] request error: {e}", file=sys.stderr, flush=True)
-        return None
-
-    session = data.get("five_hour") or {}
-    weekly  = data.get("seven_day")  or {}
-
-    session_pct   = float(session.get("utilization") or 0.0) / 100.0
-    weekly_pct    = float(weekly.get("utilization")  or 0.0) / 100.0
-    session_reset = _format_iso_countdown(session.get("resets_at", ""))
-    weekly_reset  = _format_iso_countdown(weekly.get("resets_at",  ""))
-
-    vprint(f"[usage] API: session={session_pct:.0%} weekly={weekly_pct:.0%}")
-    return {
-        "session_pct":   session_pct,
-        "weekly_pct":    weekly_pct,
-        "session_reset": session_reset,
-        "weekly_reset":  weekly_reset,
-        # Absolute reset instants (epoch seconds) so offline clients can keep
-        # counting down and zero the bar once the window has passed.
-        "session_reset_at": _epoch(session.get("resets_at", "")),
-        "weekly_reset_at":  _epoch(weekly.get("resets_at",  "")),
-    }
+    return claude_agent.ClaudeAgent(
+        _CREDS_PATH, usage_api=_USAGE_API, log=vprint).get_usage()
 
 
 def _usage_from_codex_rollout(path: str) -> dict | None:
     """Read the newest Codex 5-hour and weekly rate-limit snapshot."""
-    if not path:
-        return None
-    try:
-        with open(path, "r") as stream:
-            lines = stream.readlines()
-    except Exception:
-        return None
-
-    limits = None
-    for raw in reversed(lines):
-        try:
-            record = json.loads(raw)
-        except Exception:
-            continue
-        if record.get("type") != "event_msg":
-            continue
-        payload = record.get("payload")
-        if not isinstance(payload, dict) or payload.get("type") != "token_count":
-            continue
-        candidate = payload.get("rate_limits")
-        if isinstance(candidate, dict) and candidate.get("limit_id") == "codex":
-            limits = candidate
-            break
-    if not limits:
-        return None
-
-    primary = limits.get("primary") if isinstance(limits.get("primary"), dict) else {}
-    secondary = limits.get("secondary") if isinstance(limits.get("secondary"), dict) else {}
-
-    def pct(window: dict) -> float:
-        try:
-            return max(0.0, min(1.0, float(window.get("used_percent") or 0.0) / 100.0))
-        except (TypeError, ValueError):
-            return 0.0
-
-    def reset_at(window: dict) -> int:
-        try:
-            return int(window.get("resets_at") or 0)
-        except (TypeError, ValueError):
-            return 0
-
-    session_reset_at = reset_at(primary)
-    weekly_reset_at = reset_at(secondary)
-    return {
-        "session_pct": pct(primary),
-        "weekly_pct": pct(secondary),
-        "session_reset": _format_epoch_countdown(session_reset_at),
-        "weekly_reset": _format_epoch_countdown(weekly_reset_at),
-        "session_reset_at": session_reset_at,
-        "weekly_reset_at": weekly_reset_at,
-    }
+    return codex_agent.CodexAgent(CODEX_HOME).usage_from_rollout(path)
 
 
 def get_codex_usage() -> dict | None:
-    return _usage_from_codex_rollout(_latest_codex_rollout_path())
+    return codex_agent.CodexAgent(CODEX_HOME).get_usage()
 
 
 def _github_token() -> str:
     """Resolve a GitHub token without making the gh CLI a requirement."""
-    for key in ("CODELIGHT_GITHUB_TOKEN", "GITHUB_TOKEN", "GH_TOKEN"):
-        token = os.environ.get(key, "").strip()
-        if token:
-            return token
-    if _github_token_file:
-        try:
-            with open(os.path.expanduser(_github_token_file)) as stream:
-                return stream.read().strip()
-        except Exception as e:
-            vprint(f"[copilot-usage] could not read token file: {e}")
-    gh = shutil.which("gh")
-    if gh:
-        try:
-            result = subprocess.run(
-                [gh, "auth", "token"], capture_output=True, text=True, timeout=5)
-            if result.returncode == 0:
-                return result.stdout.strip()
-        except Exception:
-            pass
-    return ""
+    return copilot_agent.github_token(_github_token_file)
 
 
 def _github_api(path: str, token: str) -> dict:
-    req = urllib.request.Request(
-        f"https://api.github.com/{path.lstrip('/')}",
-        headers={
-            "Authorization": f"Bearer {token}",
-            "Accept": "application/vnd.github+json",
-            "X-GitHub-Api-Version": "2026-03-10",
-            "User-Agent": "codelight",
-        },
-    )
-    with urllib.request.urlopen(req, timeout=10) as response:
-        return json.loads(response.read())
+    return copilot_agent.github_api(path, token)
 
 
 def _next_month_start(now: datetime) -> int:
-    year = now.year + (1 if now.month == 12 else 0)
-    month = 1 if now.month == 12 else now.month + 1
-    return int(datetime(year, month, 1, tzinfo=timezone.utc).timestamp())
+    return copilot_agent.next_month_start(now)
 
 
 def get_copilot_usage(org: str | None = None, token: str | None = None,
@@ -2395,195 +1417,39 @@ def get_copilot_usage(org: str | None = None, token: str | None = None,
     without enhanced billing all return None. Clients then keep showing the
     Copilot activity status without inventing a zero-percent limit.
     """
-    org = (org if org is not None else _github_org).strip()
-    token = token if token is not None else _github_token()
-    if not org or not token:
-        return None
-    now = now or datetime.now(timezone.utc)
-    query = urllib.parse.urlencode({"year": now.year, "month": now.month})
-    try:
-        billing = _github_api(
-            f"organizations/{urllib.parse.quote(org)}/settings/billing/"
-            f"ai_credit/usage?{query}", token)
-    except urllib.error.HTTPError as e:
-        vprint(f"[copilot-usage] billing unavailable for {org}: HTTP {e.code}")
-        return None
-    except Exception as e:
-        vprint(f"[copilot-usage] billing request failed: {e}")
-        return None
-    try:
-        subscription = _github_api(
-            f"orgs/{urllib.parse.quote(org)}/copilot/billing", token)
-    except urllib.error.HTTPError as e:
-        # 403 is expected for ordinary users who can access Copilot but not org billing
-        vprint(f"[copilot-usage] subscription unavailable for {org}: HTTP {e.code}")
-        return None
-    except Exception as e:
-        vprint(f"[copilot-usage] subscription request failed: {e}")
-        return None
-
-    try:
-        used = sum(
-            float(item.get("grossQuantity") or 0.0)
-            for item in billing.get("usageItems", [])
-            if item.get("product") == "Copilot"
-            and str(item.get("unitType", "")).lower() in
-                {"credits", "ai-credits"}
-        )
-        seats = int(subscription.get("seat_breakdown", {}).get("total") or 0)
-        plan = str(subscription.get("plan_type") or "business").lower()
-    except (TypeError, ValueError):
-        return None
-    if seats <= 0:
-        return None
-
-    # GitHub's June–August 2026 transition grants existing Business/Enterprise
-    # customers 3,000/7,000 credits per seat; standard pools are 1,900/3,900.
-    promotional = datetime(2026, 6, 1, tzinfo=timezone.utc) <= now < \
-        datetime(2026, 9, 1, tzinfo=timezone.utc)
-    per_seat = (
-        7000 if promotional and plan == "enterprise"
-        else 3000 if promotional
-        else 3900 if plan == "enterprise"
-        else 1900
+    agent = copilot_agent.CopilotAgent(
+        _github_org,
+        token_file=_github_token_file,
+        api=_github_api,
+        log=vprint,
     )
-    allowance = seats * per_seat
-    reset_at = _next_month_start(now)
-    pct = max(0.0, min(1.0, used / allowance))
-    vprint(
-        f"[copilot-usage] {org}: {used:.0f}/{allowance} credits ({pct:.0%})")
-    return {
-        "monthly_pct": pct,
-        "monthly_reset": _format_epoch_countdown(reset_at),
-        "monthly_reset_at": reset_at,
-        "used_credits": used,
-        "included_credits": allowance,
-        "plan_type": plan,
-        "seat_count": seats,
-        "limits": [{
-            "label": "Monthly",
-            "pct": pct,
-            "reset": _format_epoch_countdown(reset_at),
-            "reset_at": reset_at,
-        }],
-    }
-
-
-# ── Payload helpers ───────────────────────────────────────────────────────────
-
-_STATUS_COLOR = {
-    "working":  "\033[33m",   # orange
-    "waiting":  "\033[31m",   # red
-    "idle": "\033[32m",   # green
-}
-_RESET = "\033[0m"
-_BOLD  = "\033[1m"
-_DIM   = "\033[2m"
-_BAR_W = 28
-
-
-def _render_dashboard(payload: dict) -> None:
-    """Write the top-like dashboard to stdout (caller holds _render_lock)."""
-    global _dashboard_ready
-    status  = payload["status"]
-    color   = _STATUS_COLOR.get(status, "")
-    ts      = datetime.now().strftime("%H:%M:%S")
-
-    def bar(pct: float) -> str:
-        filled = round(max(0.0, min(1.0, pct)) * _BAR_W)
-        return "█" * filled + "░" * (_BAR_W - filled)
-
-    ws_count = len(_ws_clients)
-    parts: list[str] = []
-    if ws_count:
-        parts.append(f"{ws_count} WebSocket{'s' if ws_count != 1 else ''}")
-    if _dbus_iface is not None:
-        parts.append("D-Bus")
-    clients_str = "  ".join(parts) if parts else "none"
-
-    sessions = payload["sessions"]
-    per_agent_status = payload.get("per_agent_status")
-    if not isinstance(per_agent_status, dict):
-        per_agent_status = {}
-    per_agent_usage = payload.get("per_agent_usage")
-    if not isinstance(per_agent_usage, dict):
-        per_agent_usage = {}
-
-    agent_lines: list[str] = []
-    for aid in AGENT_REGISTRY.keys():
-        if aid not in per_agent_usage and aid not in per_agent_status:
-            continue
-        display = _agent_display_name(aid)
-        short = AGENT_REGISTRY.get(aid, {}).get("short", "?")
-        astate = str(per_agent_status.get(aid, "idle"))
-        acolor = _STATUS_COLOR.get(astate, "")
-
-        usage = per_agent_usage.get(aid, {})
-        limits = usage.get("limits") if isinstance(usage, dict) else None
-        agent_lines.append(
-            f"  {acolor}● [{short}] {_BOLD}{display}{_RESET} "
-            f"{_DIM}{astate.upper()}{_RESET}")
-        if not isinstance(limits, list):
-            limits = []
-        rendered_limit = False
-        for limit in limits:
-            if not isinstance(limit, dict):
-                continue
-            rendered_limit = True
-            pct_raw = limit.get("pct", 0.0)
-            try:
-                pct = float(pct_raw)
-            except (TypeError, ValueError):
-                pct = 0.0
-            label = str(limit.get("label") or "Limit")
-            reset = str(limit.get("reset") or "--")
-            agent_lines.append(
-                f"    {label:<8} {bar(pct)} {pct:>4.0%}"
-                f"  {_DIM}resets {reset}{_RESET}")
-        if not rendered_limit:
-            agent_lines.append(f"    {_DIM}No usage data{_RESET}")
-        agent_lines.append("")
-
-    lines = [
-        f"{_BOLD}CODELIGHT{_RESET}",
-        f"  Updated:  {ts}",
-        f"  Clients:  {clients_str}",
-        "",
-        f"  {color}● {status.upper()}{_RESET}  "
-        f"{_DIM}({sessions} session{'s' if sessions != 1 else ''}){_RESET}",
-        "",
-        f"  {_DIM}Agents{_RESET}",
-    ] + agent_lines + [
-        f"  {_DIM}Recent activity{_RESET}",
-    ] + [f"  {ln}" for ln in _log_lines]
-
-    # First render: clear the whole screen (removes startup messages).
-    # Subsequent renders: move to top-left and overwrite in-place.
-    # Append \033[K (erase to EOL) to every line so leftover characters
-    # from a previous longer line don't bleed through on the right.
-    prefix = "\033[2J\033[H" if not _dashboard_ready else "\033[H"
-    _dashboard_ready = True
-    cleared = [ln + "\033[K" for ln in lines]
-    sys.stdout.write(prefix + "\n".join(cleared) + "\033[J")
-    sys.stdout.flush()
-
-
-def print_payload(payload: dict) -> None:
-    """Update the live dashboard (TTY). In non-TTY mode just tracks state for _log()."""
-    global _last_payload
-    _last_payload = payload
-    if sys.stdout.isatty():
-        with _render_lock:
-            _render_dashboard(payload)
+    return agent.get_usage(org=org, token=token, now=now)
 
 
 def _push() -> None:
     """Build payload from current state and broadcast to all clients."""
-    with _lock:
-        usage = dict(_usage_cache)
-    payload = {**usage, **_status_snapshot()}
+    payload = _status_snapshot()
     _broadcast(payload)
-    print_payload(payload)
+
+
+def run_dashboard(host: str, ws_port: int, secret: str) -> None:
+    """Run the terminal dashboard as a normal WebSocket client."""
+    if not _have_websockets:
+        print("[dashboard] websockets not installed — dashboard unavailable",
+              file=sys.stderr)
+        print("[dashboard] Install: pip install websockets", file=sys.stderr)
+        return
+    uri = f"ws://{host}:{ws_port}"
+    try:
+        asyncio.run(dashboard_client.run(
+            uri=uri,
+            secret=secret,
+            agent_registry=AGENT_REGISTRY,
+            default_agent_id=DEFAULT_AGENT_ID,
+            websockets_module=_websockets,
+        ))
+    except KeyboardInterrupt:
+        pass
 
 # ── Daemon threads ────────────────────────────────────────────────────────────
 
@@ -2635,9 +1501,7 @@ def _ws_thread(port: int, secret: str) -> None:
                                       "remote_control": _remote_permissions}))
 
             # Send current state immediately so the client isn't blank on connect
-            with _lock:
-                usage = dict(_usage_cache)
-            await ws.send(json.dumps({**usage, **_status_snapshot()}))
+            await ws.send(json.dumps(_status_snapshot()))
 
             client_name = "ws"
             try:
@@ -2724,11 +1588,8 @@ def _ws_thread(port: int, secret: str) -> None:
                 _, current_status, _, _ = _overall_status()
                 if current_status != _last_ws_status:
                     _last_ws_status = current_status
-                    with _lock:
-                        usage = dict(_usage_cache)
-                    payload = {**usage, **_status_snapshot()}
+                    payload = _status_snapshot()
                     msg = json.dumps(payload)
-                    print_payload(payload)  # update dashboard status immediately
                     _log(f"[ws] timeout → {current_status}")
                     if _ws_clients:
                         await asyncio.gather(
@@ -2916,45 +1777,16 @@ def _socket_thread() -> None:
 
 def _usage_thread() -> None:
     """Refresh supported-agent usage and broadcast after each update."""
-    while not _shutdown.is_set():
-        _log("[usage] polling…")
-        try:
-            fresh = get_usage()
-            codex_fresh = get_codex_usage()
-            copilot_fresh = get_copilot_usage()
-        except Exception as e:
-            print(f"[usage] unexpected error: {e}", file=sys.stderr, flush=True)
-            fresh = None
-            codex_fresh = None
-            copilot_fresh = None
-
-        with _lock:
-            if fresh is not None:
-                _usage_cache.update(fresh)
-            if codex_fresh is not None:
-                _codex_usage_cache.update(codex_fresh)
-            else:
-                _codex_usage_cache.clear()
-            if copilot_fresh is not None:
-                _copilot_usage_cache.update(copilot_fresh)
-            else:
-                _copilot_usage_cache.clear()
-        if fresh is not None or codex_fresh is not None or copilot_fresh is not None:
-            parts = []
-            if fresh is not None:
-                parts.append(f"Claude {fresh['session_pct']:.0%}/{fresh['weekly_pct']:.0%}")
-            if codex_fresh is not None:
-                parts.append(
-                    f"Codex {codex_fresh['session_pct']:.0%}/"
-                    f"{codex_fresh['weekly_pct']:.0%}")
-            if copilot_fresh is not None:
-                parts.append(f"Copilot {copilot_fresh['monthly_pct']:.0%}")
-            _log("[usage] " + "  ".join(parts))
-        else:
-            _log("[usage] no data from any agent")
-
-        _push()
-        _shutdown.wait(USAGE_INTERVAL)
+    UsagePoller(
+        state=_state,
+        fetch_claude=get_usage,
+        fetch_codex=get_codex_usage,
+        fetch_copilot=get_copilot_usage,
+        interval=USAGE_INTERVAL,
+        shutdown=_shutdown,
+        log=_log,
+        push=_push,
+    ).run()
 
 # ── Uninstall ─────────────────────────────────────────────────────────────────
 
@@ -3286,6 +2118,8 @@ def main():
     global _verbose
 
     parser = argparse.ArgumentParser()
+    parser.add_argument("command", nargs="?", choices=["dashboard"],
+                        help="Run the terminal dashboard as a client.")
     parser.add_argument("--uninstall", action="store_true",
                         help="Remove codelight agent hooks and delete state files.")
     parser.add_argument("--install", action="store_true",
@@ -3299,6 +2133,8 @@ def main():
                         help="Show low-level debug events (socket, API) in activity log")
     parser.add_argument("--ws-port", type=int, default=8765,
                         help="WebSocket port for clients (default: 8765)")
+    parser.add_argument("--host", default="127.0.0.1",
+                        help="With 'dashboard': daemon host (default: 127.0.0.1)")
     parser.add_argument("--name", default=None,
                         help="mDNS service name visible to clients (required)")
     parser.add_argument("--secret", default="",
@@ -3322,6 +2158,10 @@ def main():
                              "Alternatively set CODELIGHT_GITHUB_TOKEN; if neither "
                              "is set, the gh credential is used when available.")
     args = parser.parse_args()
+
+    if args.command == "dashboard":
+        run_dashboard(args.host, args.ws_port, args.secret)
+        return
 
     if args.uninstall:
         uninstall()

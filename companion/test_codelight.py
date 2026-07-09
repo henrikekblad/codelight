@@ -1,5 +1,4 @@
 import json
-import io
 import os
 import sys
 import tempfile
@@ -9,6 +8,11 @@ from unittest import mock
 
 sys.path.insert(0, os.path.dirname(__file__))
 import codelight
+from codelight_core.state import CodelightState
+from codelight_core import auth as auth_core
+from codelight_core import dashboard_client
+from codelight_core import hooks as hooks_core
+from codelight_core.usage import UsagePoller, usage_summary
 
 
 class TranscriptParserTests(unittest.TestCase):
@@ -259,9 +263,7 @@ class AuthenticationTests(unittest.TestCase):
     def test_hmac_authentication_is_required(self):
         secret = "test-secret"
         nonce = "abc123"
-        digest = codelight.hmac.new(
-            secret.encode(), nonce.encode(), codelight.hashlib.sha256
-        ).hexdigest()
+        digest = auth_core.auth_hmac(secret, nonce)
 
         self.assertTrue(codelight._valid_auth_response(
             {"auth_hmac": digest}, secret, nonce))
@@ -298,11 +300,150 @@ class AgentDetectionTests(unittest.TestCase):
         )
 
 
+class StateSnapshotTests(unittest.TestCase):
+    def make_state(self):
+        return CodelightState(
+            default_agent_id="claude",
+            agent_registry=codelight.AGENT_REGISTRY,
+            idle_window=600,
+            idle_window_waiting=30,
+        )
+
+    def test_status_snapshot_uses_last_active_agent_usage(self):
+        state = self.make_state()
+        state.update_usage(
+            claude={"session_pct": 0.1, "weekly_pct": 0.2},
+            codex={"session_pct": 0.3, "weekly_pct": 0.4},
+            copilot={"monthly_pct": 0.5, "monthly_reset": "20d"},
+        )
+
+        state.update_session("codex-session", "working", agent_id="codex")
+        codex_payload = state.status_snapshot()
+        self.assertEqual(codex_payload["agent_id"], "codex")
+        self.assertEqual(codex_payload["session_pct"], 0.3)
+        self.assertEqual(codex_payload["weekly_pct"], 0.4)
+
+        state.update_session("copilot-session", "waiting", agent_id="copilot")
+        copilot_payload = state.status_snapshot()
+        self.assertEqual(copilot_payload["agent_id"], "copilot")
+        self.assertEqual(copilot_payload["weekly_title"], "Copilot Monthly")
+        self.assertEqual(copilot_payload["weekly_pct"], 0.5)
+        self.assertEqual(copilot_payload["session_pct"], 0.0)
+
+    def test_pending_session_is_not_pruned_by_waiting_timeout(self):
+        state = self.make_state()
+        state.update_session("question-session", "waiting", agent_id="claude")
+        with state._lock:
+            state._sessions["question-session"]["time"] = 0
+
+        active, status, _, _ = state.overall_status({"question-session"})
+
+        self.assertEqual(active, 1)
+        self.assertEqual(status, "waiting")
+
+
+class UsagePollerTests(unittest.TestCase):
+    def make_state(self):
+        return CodelightState(
+            default_agent_id="claude",
+            agent_registry=codelight.AGENT_REGISTRY,
+            idle_window=600,
+            idle_window_waiting=30,
+        )
+
+    def test_usage_summary_formats_available_agents(self):
+        self.assertEqual(
+            usage_summary(
+                claude={"session_pct": 0.12, "weekly_pct": 0.34},
+                codex={"session_pct": 0.56, "weekly_pct": 0.78},
+                copilot={"monthly_pct": 0.9},
+            ),
+            "Claude 12%/34%  Codex 56%/78%  Copilot 90%",
+        )
+
+    def test_poll_once_updates_state_and_clears_missing_optional_agents(self):
+        state = self.make_state()
+        logs: list[str] = []
+        pushes: list[bool] = []
+        state.update_usage(
+            codex={"session_pct": 0.9, "weekly_pct": 0.8},
+            copilot={"monthly_pct": 0.7, "monthly_reset": "1d"},
+        )
+
+        poller = UsagePoller(
+            state=state,
+            fetch_claude=lambda: {"session_pct": 0.1, "weekly_pct": 0.2},
+            fetch_codex=lambda: None,
+            fetch_copilot=lambda: None,
+            interval=60,
+            shutdown=threading.Event(),
+            log=logs.append,
+            push=lambda: pushes.append(True),
+        )
+
+        poller.poll_once()
+
+        snapshot = state.status_snapshot()
+        self.assertEqual(snapshot["per_agent_usage"]["claude"]["session_pct"], 0.1)
+        self.assertNotIn("codex", snapshot["per_agent_usage"])
+        self.assertNotIn("copilot", snapshot["per_agent_usage"])
+        self.assertEqual(logs[-1], "[usage] Claude 10%/20%")
+        self.assertEqual(pushes, [True])
+
+
+class HookConfigTests(unittest.TestCase):
+    def test_matcher_group_merge_removes_old_codelight_hooks_only(self):
+        hooks = {
+            "PreToolUse": [
+                {
+                    "matcher": "",
+                    "hooks": [
+                        {"type": "command", "command": "python3 /x/codelight.py --hook working"},
+                        {"type": "command", "command": "echo keep"},
+                    ],
+                },
+            ],
+        }
+
+        changed = hooks_core.merge_matcher_group_hooks(hooks, [
+            ("PreToolUse", "", {"type": "command", "command": "python3 /new/codelight.py --hook working"}),
+        ])
+
+        self.assertTrue(changed)
+        commands = [h["command"] for h in hooks["PreToolUse"][0]["hooks"]]
+        self.assertEqual(commands, [
+            "echo keep",
+            "python3 /new/codelight.py --hook working",
+        ])
+
+    def test_codex_question_hook_uses_request_user_input_matcher(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            hooks_path = os.path.join(tmp, "hooks.json")
+            hooks_core.install_codex_hooks(
+                hooks_path,
+                "/repo/companion/codelight.py",
+                hook_wait_ceiling=590,
+                remote_permissions=True,
+                remote_questions=True,
+                permission_timeout=42,
+            )
+            with open(hooks_path) as stream:
+                doc = json.load(stream)
+
+        pre_tool = doc["hooks"]["PreToolUse"]
+        question_slot = next(x for x in pre_tool if x["matcher"] == "^request_user_input$")
+        command = question_slot["hooks"][0]["command"]
+        self.assertIn("question-codex", command)
+        self.assertIn("--permission-timeout 42", command)
+
+
 class DashboardTests(unittest.TestCase):
     def test_renders_every_agent_and_every_limit(self):
         payload = {
             "status": "idle",
             "sessions": 0,
+            "activity": ["[10:00:00] test event"],
+            "clients": {"websocket": 1, "dbus": False},
             "per_agent_status": {
                 "claude": "idle", "copilot": "working", "codex": "idle",
             },
@@ -320,18 +461,20 @@ class DashboardTests(unittest.TestCase):
                 ]},
             },
         }
-        output = io.StringIO()
-        with mock.patch.object(codelight.sys, "stdout", output), \
-             mock.patch.object(codelight, "_dashboard_ready", False):
-            codelight._render_dashboard(payload)
-
-        rendered = output.getvalue()
+        rendered = dashboard_client.render_payload(
+            payload,
+            agent_registry=codelight.AGENT_REGISTRY,
+            default_agent_id=codelight.DEFAULT_AGENT_ID,
+            dashboard_ready=False,
+        )
         self.assertIn("Claude", rendered)
         self.assertIn("Copilot", rendered)
         self.assertIn("Codex", rendered)
         self.assertEqual(rendered.count("Weekly"), 2)
         self.assertEqual(rendered.count("Session"), 2)
         self.assertIn("Monthly", rendered)
+        self.assertIn("1 WebSocket", rendered)
+        self.assertIn("test event", rendered)
 
 
 class PendingRequestCancellationTests(unittest.TestCase):
