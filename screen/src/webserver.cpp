@@ -33,7 +33,7 @@ static const char INDEX_HTML[] PROGMEM = R"rawhtml(<!DOCTYPE html>
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Claude Screen Config</title>
+<title>codelight Screen Config</title>
 <style>
   *{box-sizing:border-box;margin:0;padding:0}
   body{font-family:system-ui,sans-serif;background:#0d1117;color:#c9d1d9;padding:20px;max-width:480px;margin:0 auto}
@@ -62,15 +62,15 @@ static const char INDEX_HTML[] PROGMEM = R"rawhtml(<!DOCTYPE html>
 </style>
 </head>
 <body>
-<h1>Claude Screen</h1>
+<h1>codelight Screen</h1>
 
 <form id="cfg">
   <h2>Device</h2>
   <label>Device name (used as mDNS hostname)</label>
-  <input type="text" id="deviceName" placeholder="claude-screen" maxlength="32">
+  <input type="text" id="deviceName" placeholder="codelight-screen" maxlength="32">
 
   <label>Companion name <span style="color:#8b949e;font-size:.8rem">(--name passed to codelight.py; blank = first found)</span></label>
-  <input type="text" id="companionName" placeholder="e.g. henrik-laptop" maxlength="64">
+  <input type="text" id="companionName" placeholder="e.g. my-laptop" maxlength="64">
 
   <label>Companion host <span style="color:#8b949e;font-size:.8rem">(IP or hostname – bypasses mDNS when set)</span></label>
   <input type="text" id="companionHost" placeholder="e.g. 192.168.1.100" maxlength="64">

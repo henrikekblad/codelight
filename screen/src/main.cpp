@@ -63,6 +63,14 @@ static void applyStatus(uint8_t* payload, size_t length) {
     displayData.sessionPct   = doc["session_pct"]  | 0.0f;
     displayData.weeklyReset  = doc["weekly_reset"].as<String>();
     displayData.sessionReset = doc["session_reset"].as<String>();
+    displayData.agentId      = doc["agent_id"].as<String>();
+    if (displayData.agentId.length() == 0) displayData.agentId = "claude";
+    displayData.agentDisplay = doc["agent_display"].as<String>();
+    if (displayData.agentDisplay.length() == 0) displayData.agentDisplay = "Claude";
+    displayData.weeklyTitle  = doc["weekly_title"].as<String>();
+    if (displayData.weeklyTitle.length() == 0) displayData.weeklyTitle = displayData.agentDisplay + " Weekly";
+    displayData.sessionTitle = doc["session_title"].as<String>();
+    if (displayData.sessionTitle.length() == 0) displayData.sessionTitle = displayData.agentDisplay + " Session";
     displayData.sessions     = doc["sessions"]     | 0;
     displayData.connected    = true;
     displayData.authFailed   = false;
@@ -130,6 +138,15 @@ static void wsEvent(WStype_t type, uint8_t* payload, size_t length) {
                     wsAuthFailed = true;
                     wsConnected = false;
                     wsClient.disconnect();
+                    displayData.weeklyPct = 0.0f;
+                    displayData.sessionPct = 0.0f;
+                    displayData.weeklyReset = "--";
+                    displayData.sessionReset = "--";
+                    displayData.weeklyTitle = "Weekly";
+                    displayData.sessionTitle = "Session";
+                    displayData.agentDisplay = "";
+                    displayData.agentId = "";
+                    displayData.sessions = 0;
                     displayData.connected = false;
                     displayData.authFailed = true;
                     displayData.status = STATUS_AUTH_FAILED;
@@ -263,7 +280,7 @@ static void sanitiseMdnsName(const String& name, String& out) {
         if (isalnum(c)) out += (char)tolower(c);
         else if (c == '-' || c == ' ') out += '-';
     }
-    if (out.length() == 0) out = "claude-screen";
+    if (out.length() == 0) out = "codelight-screen";
 }
 
 static void tryDiscover() {

@@ -5,8 +5,9 @@ export interface CodelightHandlers {
     onStatus(payload: any): void;
     onConnectionChange(connected: boolean): void;
     onAuthFailed(): void;
+    onPermissionRequest(req: any): void;
     onQuestionRequest(req: any): void;
-    onRequestResolved(id: string): void;
+    onRequestResolved(msg: any): void;
 }
 
 /** WebSocket client for the companion daemon: HMAC auth → status stream, with
@@ -23,6 +24,7 @@ export class CodelightClient {
         private host: string,
         private port: number,
         private secret: string,
+        private answerPermissions: boolean,
         private answerQuestions: boolean,
         private handlers: CodelightHandlers,
     ) {}
@@ -47,6 +49,13 @@ export class CodelightClient {
         this.send({ type: 'question_response', id, answers });
     }
 
+    respondPermission(
+        id: string,
+        decision: 'allow' | 'allow_folder' | 'allow_command' | 'deny' | 'skip',
+    ): void {
+        this.send({ type: 'permission_response', id, decision });
+    }
+
     extend(id: string): void {
         this.send({ type: 'extend', id });
     }
@@ -57,7 +66,9 @@ export class CodelightClient {
         this.ws = ws;
 
         const hello = () => {
-            const features = this.answerQuestions ? ['questions'] : [];
+            const features = [] as string[];
+            if (this.answerPermissions) { features.push('permissions'); }
+            if (this.answerQuestions) { features.push('questions'); }
             ws.send(JSON.stringify({ type: 'subscribe', features, client: 'vscode' }));
         };
 
@@ -82,14 +93,12 @@ export class CodelightClient {
                     .update(String(m.nonce)).digest('hex');
                 ws.send(JSON.stringify({ auth_hmac: proof }));
                 hello();
+            } else if (m.type === 'permission_request') {
+                this.handlers.onPermissionRequest(m);
             } else if (m.type === 'question_request') {
                 this.handlers.onQuestionRequest(m);
             } else if (m.type === 'question_resolved' || m.type === 'permission_resolved') {
-                this.handlers.onRequestResolved(String(m.id ?? ''));
-            } else if (m.type === 'permission_request') {
-                // We subscribe to "questions" which shares the daemon's remote-
-                // control set, so permission events also arrive — ignore them:
-                // permission approval stays with the native dialog.
+                this.handlers.onRequestResolved(m);
             } else if (typeof m.status === 'string') {
                 this.handlers.onStatus(m);
             }

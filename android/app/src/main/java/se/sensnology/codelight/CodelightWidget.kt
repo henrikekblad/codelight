@@ -5,11 +5,13 @@ import android.util.Log
 import androidx.compose.runtime.Composable
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.lerp
+import androidx.compose.ui.unit.DpSize
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.datastore.preferences.core.Preferences
 import androidx.datastore.preferences.core.intPreferencesKey
 import androidx.glance.GlanceId
+import androidx.glance.LocalSize
 import androidx.glance.GlanceModifier
 import androidx.glance.action.actionStartActivity
 import androidx.glance.currentState
@@ -18,6 +20,7 @@ import androidx.glance.state.PreferencesGlanceStateDefinition
 import androidx.glance.action.clickable
 import androidx.glance.appwidget.GlanceAppWidget
 import androidx.glance.appwidget.LinearProgressIndicator
+import androidx.glance.appwidget.SizeMode
 import androidx.glance.appwidget.provideContent
 import androidx.glance.background
 import androidx.glance.layout.*
@@ -30,7 +33,28 @@ class CodelightWidget : GlanceAppWidget() {
 
     companion object {
         val KEY_TICK = intPreferencesKey("tick")
+
+        // Responsive size buckets. Glance picks the largest-area bucket that
+        // fits the current widget dimensions. Three buckets cover all cases:
+        //
+        //  SMALL     (100× 80) – always fits — active agent only
+        //  TALL      (100×200) – height ≥ 200 dp — all agents stacked, status below
+        //  WIDE_TALL (280×200) – width ≥ 280 dp AND height ≥ 200 dp — all agents
+        //                         stacked, status column on the right
+        //
+        // Area order: WIDE_TALL (56 000) > TALL (20 000) > SMALL (8 000)
+        // A narrow+tall widget (e.g. 218×235) can’t fit WIDE_TALL (280 > 218),
+        // so TALL wins → status below.
+        // A wide+tall widget (e.g. 360×235) fits both; WIDE_TALL wins → status right.
+        // A short or landscape widget fits only SMALL → active agent only.
+        val SIZE_SMALL     = DpSize(100.dp, 80.dp)
+        val SIZE_TALL      = DpSize(100.dp, 200.dp)
+        val SIZE_WIDE_TALL = DpSize(280.dp, 200.dp)
     }
+
+    override val sizeMode: SizeMode = SizeMode.Responsive(
+        setOf(SIZE_SMALL, SIZE_TALL, SIZE_WIDE_TALL)
+    )
 
     override suspend fun provideGlance(context: Context, id: GlanceId) {
         provideContent { WidgetContent(context) }
@@ -43,23 +67,18 @@ class CodelightWidget : GlanceAppWidget() {
         currentState<Preferences>()[KEY_TICK]
         val prefs = context.getSharedPreferences(CodelightService.STATE_PREFS, Context.MODE_PRIVATE)
         val now          = System.currentTimeMillis() / 1000
-        val sessionResetAt = prefs.getLong(CodelightService.KEY_SESSION_RESET_AT, 0)
-        val weeklyResetAt  = prefs.getLong(CodelightService.KEY_WEEKLY_RESET_AT, 0)
-        // Once a usage window's reset time has passed, the limit has been
-        // restored — show 0% even while offline so you know you can resume.
-        val sessionPct   = if (sessionResetAt in 1 until now) 0f
-                           else prefs.getFloat(CodelightService.KEY_SESSION_PCT, 0f)
-        val weeklyPct    = if (weeklyResetAt in 1 until now) 0f
-                           else prefs.getFloat(CodelightService.KEY_WEEKLY_PCT, 0f)
-        // Count down live from the absolute reset time; fall back to the
-        // daemon's snapshot string for pre-timestamp payloads.
-        val sessionReset = countdown(sessionResetAt, now)
-            ?: prefs.getString(CodelightService.KEY_SESSION_RESET, "--") ?: "--"
-        val weeklyReset  = countdown(weeklyResetAt, now)
-            ?: prefs.getString(CodelightService.KEY_WEEKLY_RESET, "--") ?: "--"
+        val agentDisplay = prefs.getString(CodelightService.KEY_AGENT_DISPLAY, "Claude") ?: "Claude"
+        val activeId     = prefs.getString(CodelightService.KEY_AGENT_ID, "claude") ?: "claude"
         val status       = prefs.getString(CodelightService.KEY_STATUS, "idle") ?: "idle"
         val connected    = prefs.getBoolean(CodelightService.KEY_CONNECTED, false)
-        Log.d("Codelight", "WidgetContent render: connected=$connected status=$status session=${(sessionPct*100).toInt()}% weekly=${(weeklyPct*100).toInt()}%")
+        val size          = LocalSize.current
+        val allAgents     = loadAgentUsage(prefs, now)
+        val activeAgent   = allAgents.firstOrNull { it.id == activeId }
+            ?: AgentUsage(activeId, agentDisplay, status, emptyList())
+        // size == one of the three responsive buckets.
+        val showAll       = size != SIZE_SMALL
+        val shownAgents   = if (showAll) allAgents else listOf(activeAgent)
+        Log.d("Codelight", "WidgetContent render: ${size.width}×${size.height} connected=$connected agents=${shownAgents.size}")
 
         val statusColor = when {
             !connected          -> Color(0xFF2A2A2A)
@@ -69,7 +88,7 @@ class CodelightWidget : GlanceAppWidget() {
         }
         val statusLabel = when {
             !connected          -> "OFF"
-            else -> status.uppercase()
+            else -> "$agentDisplay ${status.uppercase()}"
         }
         val statusTextColor = if (!connected) Color(0xFF555555) else Color.Black
 
@@ -77,69 +96,82 @@ class CodelightWidget : GlanceAppWidget() {
         val textColor  = ColorProvider(Color.White)
         val mutedColor = ColorProvider(Color(0xFF888888))
 
-        Column(
-            modifier = GlanceModifier
-                .fillMaxSize()
-                .background(ColorProvider(bgColor)),
-        ) {
-            // ── Top: meters ───────────────────────────────────────────────────
-            Column(modifier = GlanceModifier.fillMaxWidth().padding(10.dp)
-                .clickable(actionStartActivity<MainActivity>())) {
-                /* Row(
-                    modifier = GlanceModifier.fillMaxWidth(),
-                    verticalAlignment = Alignment.CenterVertically,
-                ) {
-                    Text("codelight",
-                         style = TextStyle(color = mutedColor, fontSize = 10.sp),
-                         modifier = GlanceModifier.defaultWeight())
-                    if (!connected) {
-                        Text("○", style = TextStyle(
-                            color = ColorProvider(Color(0xFF555555)), fontSize = 10.sp))
-                    }
-                } */
-                Spacer(GlanceModifier.height(6.dp))
-                MeterRow("Weekly",  weeklyPct,  weeklyReset,  textColor)
-                Spacer(GlanceModifier.height(5.dp))
-                MeterRow("Session", sessionPct, sessionReset, textColor)
-                Spacer(GlanceModifier.height(8.dp))
-            }
-
-            // ── Bottom: status fills remaining space ──────────────────────────
-            Box(
+        if (size == SIZE_WIDE_TALL) {
+            // Wide+tall: agents stacked on the left, prominent status column on the right.
+            Row(
                 modifier = GlanceModifier
-                    .fillMaxWidth()
-                    .defaultWeight()
-                    .background(ColorProvider(statusColor))
-                    .clickable(actionStartActivity<MainActivity>()),
-                contentAlignment = Alignment.Center,
+                    .fillMaxSize()
+                    .background(ColorProvider(bgColor)),
             ) {
-                Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                Column(
+                    modifier = GlanceModifier
+                        .defaultWeight()
+                        .fillMaxHeight()
+                        .padding(10.dp)
+                        .clickable(actionStartActivity<MainActivity>()),
+                ) {
+                    shownAgents.forEachIndexed { index, agent ->
+                        if (index > 0) Spacer(GlanceModifier.height(9.dp))
+                        AgentBlock(agent, textColor, mutedColor)
+                    }
+                }
+                Box(
+                    modifier = GlanceModifier
+                        .width(90.dp)
+                        .fillMaxHeight()
+                        .background(ColorProvider(statusColor))
+                        .clickable(actionStartActivity<MainActivity>()),
+                    contentAlignment = Alignment.Center,
+                ) {
                     Text(
                         statusLabel,
                         style = TextStyle(
                             color      = ColorProvider(statusTextColor),
-                            fontSize   = 18.sp,
+                            fontSize   = 14.sp,
                             fontWeight = FontWeight.Bold,
+                            textAlign  = TextAlign.Center,
                         ),
+                        maxLines = 3,
                     )
                 }
             }
-        }
-    }
+        } else {
+            Column(
+                modifier = GlanceModifier
+                    .fillMaxSize()
+                    .background(ColorProvider(bgColor)),
+            ) {
+                // ── Top: meters ───────────────────────────────────────────────────
+                Column(modifier = GlanceModifier.fillMaxWidth().padding(10.dp)
+                    .clickable(actionStartActivity<MainActivity>())) {
+                    shownAgents.forEachIndexed { index, agent ->
+                        if (index > 0) Spacer(GlanceModifier.height(9.dp))
+                        AgentBlock(agent, textColor, mutedColor)
+                    }
+                    Spacer(GlanceModifier.height(5.dp))
+                }
 
-    /** Live countdown to an epoch-seconds reset time (e.g. "3h 45m", "now").
-     *  Returns null when no timestamp is available (older daemon). */
-    private fun countdown(resetAt: Long, now: Long): String? {
-        if (resetAt <= 0) return null
-        val diff = resetAt - now
-        if (diff <= 0) return "now"
-        val days = diff / 86400
-        val hours = (diff % 86400) / 3600
-        val mins = (diff % 3600) / 60
-        return when {
-            days > 0  -> "${days}d ${hours}h"
-            hours > 0 -> "${hours}h ${mins}m"
-            else      -> "${mins}m"
+                // ── Bottom: status fills remaining space ──────────────────────────
+                Box(
+                    modifier = GlanceModifier
+                        .fillMaxWidth()
+                        .defaultWeight()
+                        .background(ColorProvider(statusColor))
+                        .clickable(actionStartActivity<MainActivity>()),
+                    contentAlignment = Alignment.Center,
+                ) {
+                    Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                        Text(
+                            statusLabel,
+                            style = TextStyle(
+                                color      = ColorProvider(statusTextColor),
+                                fontSize   = 18.sp,
+                                fontWeight = FontWeight.Bold,
+                            ),
+                        )
+                    }
+                }
+            }
         }
     }
 
@@ -154,6 +186,29 @@ class CodelightWidget : GlanceAppWidget() {
             }
         }
         return stops[3]
+    }
+
+    @Composable
+    private fun AgentBlock(
+        agent: AgentUsage,
+        textColor: ColorProvider,
+        mutedColor: ColorProvider,
+        modifier: GlanceModifier = GlanceModifier,
+    ) {
+        Column(modifier = modifier.fillMaxWidth()) {
+            Row(modifier = GlanceModifier.fillMaxWidth()) {
+                Text(agent.display,
+                    style = TextStyle(color = textColor, fontSize = 11.sp,
+                        fontWeight = FontWeight.Bold),
+                    modifier = GlanceModifier.defaultWeight())
+                Text(agent.status.uppercase(),
+                    style = TextStyle(color = mutedColor, fontSize = 9.sp))
+            }
+            agent.limits.forEach { limit ->
+                Spacer(GlanceModifier.height(3.dp))
+                MeterRow(limit.label, limit.pct, limit.reset, textColor)
+            }
+        }
     }
 
     @Composable

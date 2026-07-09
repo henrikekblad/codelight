@@ -2,7 +2,13 @@
 #include "logo.h"
 
 TFT_eSPI tft = TFT_eSPI();
-DisplayData displayData = {0, 0, "--", "--", 0, STATUS_OFFLINE, false, false};
+DisplayData displayData = {
+    0, 0,
+    "--", "--",
+    "Claude Weekly", "Claude Session",
+    "Claude", "claude",
+    0, STATUS_OFFLINE, false, false
+};
 
 // Palette
 #define COL_BG       TFT_BLACK
@@ -16,6 +22,8 @@ DisplayData displayData = {0, 0, "--", "--", 0, STATUS_OFFLINE, false, false};
 #define COL_RED      0xF840   // #FF2200
 #define COL_OFFLINE  0x4208   // dim grey
 #define COL_LOGO     0xDB8A   // #DE7356 Claude terracotta
+#define COL_COPILOT  0x051F   // #007FFF
+#define COL_CODEX    0xFFFF   // white
 
 // Linearly interpolate between two RGB565 colours (t in 0..1).
 static uint16_t lerpColor565(uint16_t c0, uint16_t c1, float t) {
@@ -70,10 +78,23 @@ static void drawMeterBlock(int labelY, const char* label, float pct,
     tft.setTextFont(2);
     tft.setTextSize(1);
     tft.setTextColor(COL_LABEL, COL_BG);
+
+    int resetW = tft.textWidth(resetStr);
+    int resetX = 240 - X_MARGIN - resetW;
+    int maxLabelW = resetX - X_MARGIN - 4;   // leave a small visual gap
+
+    String labelText = label ? String(label) : String("");
+    if (maxLabelW < 0) maxLabelW = 0;
+    if (tft.textWidth(labelText) > maxLabelW) {
+        const String dots = "...";
+        while (labelText.length() > 0 && tft.textWidth(labelText + dots) > maxLabelW)
+            labelText.remove(labelText.length() - 1);
+        labelText += dots;
+    }
+
     tft.setCursor(X_MARGIN, labelY);
-    tft.print(label);
+    tft.print(labelText);
     int labelRight = tft.getCursorX();
-    int resetX = 240 - X_MARGIN - tft.textWidth(resetStr);
     if (resetX > labelRight)
         tft.fillRect(labelRight, labelY, resetX - labelRight, H_LABEL, COL_BG);
     tft.setTextColor(COL_RESET, COL_BG);
@@ -92,19 +113,29 @@ static void drawMeterBlock(int labelY, const char* label, float pct,
     tft.print(buf);
 }
 
-static void drawStatusBox(ClaudeStatus status, bool connected, bool authFailed) {
+static void drawStatusBox(ClaudeStatus status, bool connected, bool authFailed,
+                          const String& agentDisplay) {
     uint16_t color;
-    const char* label;
+    const char* stateLabel;
     if (authFailed) {
-        color = COL_RED; label = "AUTH FAIL";
+        color = COL_RED; stateLabel = "AUTH FAIL";
     } else if (!connected) {
-        color = COL_OFFLINE; label = "OFFLINE";
+        color = COL_OFFLINE; stateLabel = "OFFLINE";
     } else switch (status) {
-        case STATUS_WORKING:  color = COL_ORANGE; label = "WORKING";  break;
-        case STATUS_WAITING:  color = COL_RED;    label = "WAITING";  break;
-        case STATUS_INACTIVE: color = COL_GREEN;  label = "IDLE";     break;
-        case STATUS_AUTH_FAILED: color = COL_RED; label = "AUTH FAIL"; break;
-        default:              color = COL_OFFLINE; label = "OFFLINE"; break;
+        case STATUS_WORKING:  color = COL_ORANGE; stateLabel = "WORKING";  break;
+        case STATUS_WAITING:  color = COL_RED;    stateLabel = "WAITING";  break;
+        case STATUS_INACTIVE: color = COL_GREEN;  stateLabel = "IDLE";     break;
+        case STATUS_AUTH_FAILED: color = COL_RED; stateLabel = "AUTH FAIL"; break;
+        default:              color = COL_OFFLINE; stateLabel = "OFFLINE"; break;
+    }
+
+    String label = agentDisplay;
+    if (!connected || authFailed) {
+        label = String(stateLabel);
+    } else {
+        label.toUpperCase();
+        label += " ";
+        label += stateLabel;
     }
 
     tft.fillRect(0, Y_BOX, 240, BOX_SIZE, color);
@@ -143,7 +174,13 @@ void displayInit() {
     displayUsable = true;
 }
 
-static DisplayData prev = {-1.0f, -1.0f, "", "", -1, (ClaudeStatus)-1, false, false};
+static DisplayData prev = {
+    -1.0f, -1.0f,
+    "", "",
+    "", "",
+    "", "",
+    -1, (ClaudeStatus)-1, false, false
+};
 static bool firstUpdate = true;
 
 void displayUpdate() {
@@ -161,11 +198,17 @@ void displayUpdate() {
     // fillScreen that erases the title and divider.
     drawChrome();
 
-    if (displayData.weeklyPct != prev.weeklyPct || displayData.weeklyReset != prev.weeklyReset)
-        drawMeterBlock(Y_WMETER, "Weekly", displayData.weeklyPct, displayData.weeklyReset);
+    if (displayData.weeklyPct != prev.weeklyPct
+        || displayData.weeklyReset != prev.weeklyReset
+        || displayData.weeklyTitle != prev.weeklyTitle)
+        drawMeterBlock(Y_WMETER, displayData.weeklyTitle.c_str(),
+                       displayData.weeklyPct, displayData.weeklyReset);
 
-    if (displayData.sessionPct != prev.sessionPct || displayData.sessionReset != prev.sessionReset)
-        drawMeterBlock(Y_SMETER, "Session", displayData.sessionPct, displayData.sessionReset);
+    if (displayData.sessionPct != prev.sessionPct
+        || displayData.sessionReset != prev.sessionReset
+        || displayData.sessionTitle != prev.sessionTitle)
+        drawMeterBlock(Y_SMETER, displayData.sessionTitle.c_str(),
+                       displayData.sessionPct, displayData.sessionReset);
 
     if (displayData.sessions != prev.sessions) {
         tft.setTextFont(2);
@@ -180,8 +223,10 @@ void displayUpdate() {
     }
 
     if (displayData.status != prev.status || displayData.connected != prev.connected ||
-        displayData.authFailed != prev.authFailed)
-        drawStatusBox(displayData.status, displayData.connected, displayData.authFailed);
+        displayData.authFailed != prev.authFailed ||
+        displayData.agentDisplay != prev.agentDisplay)
+        drawStatusBox(displayData.status, displayData.connected,
+                      displayData.authFailed, displayData.agentDisplay);
 
     prev = displayData;
 
@@ -250,6 +295,24 @@ static void svgMeter(String& s, int labelY, const char* label, float pct,
 }
 
 static void appendSleepSvg(String& s);   // defined with the sleep-screen state below
+
+static uint16_t logoColorForAgent(const char* agentId) {
+    if (strcmp(agentId, "copilot") == 0) return COL_COPILOT;
+    if (strcmp(agentId, "codex") == 0) return COL_CODEX;
+    return COL_LOGO;
+}
+
+static const __FlashStringHelper* logoPathForAgent(const char* agentId) {
+    if (strcmp(agentId, "copilot") == 0) return FPSTR(COPILOT_LOGO_PATH);
+    if (strcmp(agentId, "codex") == 0) return FPSTR(CODEX_LOGO_PATH);
+    return FPSTR(LOGO_PATH);
+}
+
+static const uint8_t* logoBitsForAgent(const char* agentId) {
+    if (strcmp(agentId, "copilot") == 0) return COPILOT_LOGO_BITS;
+    if (strcmp(agentId, "codex") == 0) return CODEX_LOGO_BITS;
+    return LOGO_BITS;
+}
 
 String generateScreenSvg() {
     String s;
@@ -326,11 +389,10 @@ void displayUpdateClock() {
     tft.print(buf);
 }
 
-// ── Sleep screen: bouncing logo ───────────────────────────────────────────────
+// ── Sleep screen: bouncing logos + clock ─────────────────────────────────────
 //
-// Two 1-bit sprites (colors applied at push time via setBitmapColor): logo and
-// clock both drift DVD-style, bounce on walls, and collide with each other.
-// Backlight is PWM-dimmed.
+// Three 1-bit logo sprites (Claude/Copilot/Codex) and one clock sprite bounce
+// around simultaneously. Backlight is PWM-dimmed.
 //
 // Velocity is a float vector at a random angle, re-jittered on every wall
 // bounce — with a fixed ±step the path is locked to 45° diagonals and traces
@@ -346,12 +408,24 @@ void displayUpdateClock() {
 #define CLOCK_COLLIDE_INSET_X 2 // trim font-side padding from clock box
 #define CLOCK_COLLIDE_INSET_Y 2
 
-static TFT_eSprite logoSpr(&tft);
+static TFT_eSprite claudeLogoSpr(&tft);
+static TFT_eSprite copilotLogoSpr(&tft);
+static TFT_eSprite codexLogoSpr(&tft);
 static TFT_eSprite clkSpr(&tft);
 static bool sleeping   = false;
 static bool sleepAnim  = false;   // sprites allocated, animation running
-static int  lx, ly;               // integer draw position (also used by the SVG preview)
-static float fx, fy, vx, vy;      // exact position / velocity
+struct SleepLogoState {
+    const char* id;
+    TFT_eSprite* spr;
+    float fx, fy, vx, vy;
+    int x, y;
+    int prevX, prevY;
+};
+static SleepLogoState sleepLogos[3] = {
+    {"claude",  &claudeLogoSpr,  0, 0, 0, 0, 0, 0, 0, 0},
+    {"copilot", &copilotLogoSpr, 0, 0, 0, 0, 0, 0, 0, 0},
+    {"codex",   &codexLogoSpr,   0, 0, 0, 0, 0, 0, 0, 0},
+};
 static int  cx, cy;               // clock integer draw position (also for SVG preview)
 static float cfx, cfy, cvx, cvy;  // clock exact position / velocity
 static int  clkW = 96;
@@ -361,15 +435,7 @@ static int lastClkMin = -1;
 
 bool displaySleeping() { return sleeping; }
 
-// Pick a fresh speed at a random 25°–65° angle, keeping the current direction
-// signs — steep/shallow extremes (edge-scrubbing, pure diagonals) are excluded
-static void sleepRandomizeVelocity() {
-    float ang = (25.0f + (int)(RANDOM_REG32 % 41)) * (PI / 180.0f);
-    vx = (vx < 0 ? -1.0f : 1.0f) * SLEEP_SPEED * cosf(ang);
-    vy = (vy < 0 ? -1.0f : 1.0f) * SLEEP_SPEED * sinf(ang);
-}
-
-static void sleepRandomizeVelocity(float& svx, float& svy) {
+static void sleepInitVelocity(float& svx, float& svy) {
     float ang = (25.0f + (int)(RANDOM_REG32 % 41)) * (PI / 180.0f);
     svx = (svx < 0 ? -1.0f : 1.0f) * SLEEP_SPEED * cosf(ang);
     svy = (svy < 0 ? -1.0f : 1.0f) * SLEEP_SPEED * sinf(ang);
@@ -378,6 +444,90 @@ static void sleepRandomizeVelocity(float& svx, float& svy) {
 static bool sleepOverlap(float ax, float ay, int aw, int ah,
                          float bx, float by, int bw, int bh) {
     return ax < bx + bw && ax + aw > bx && ay < by + bh && ay + ah > by;
+}
+
+static void sleepClearOldDelta(int oldX, int oldY, int newX, int newY,
+                               int w, int h, uint16_t bg) {
+    if (oldX == newX && oldY == newY) return;
+
+    int oldR = oldX + w;
+    int oldB = oldY + h;
+    int newR = newX + w;
+    int newB = newY + h;
+
+    int ix0 = oldX > newX ? oldX : newX;
+    int iy0 = oldY > newY ? oldY : newY;
+    int ix1 = oldR < newR ? oldR : newR;
+    int iy1 = oldB < newB ? oldB : newB;
+
+    // No overlap: clear the entire old rect.
+    if (ix0 >= ix1 || iy0 >= iy1) {
+        tft.fillRect(oldX, oldY, w, h, bg);
+        return;
+    }
+
+    // Clear only exposed bands of the old rect not covered by the new rect.
+    if (oldY < iy0) tft.fillRect(oldX, oldY, w, iy0 - oldY, bg);      // top
+    if (iy1 < oldB) tft.fillRect(oldX, iy1, w, oldB - iy1, bg);       // bottom
+    if (oldX < ix0) tft.fillRect(oldX, iy0, ix0 - oldX, iy1 - iy0, bg); // left
+    if (ix1 < oldR) tft.fillRect(ix1, iy0, oldR - ix1, iy1 - iy0, bg);  // right
+}
+
+static bool sleepOverlapInset(float ax, float ay, int aw, int ah, int aix, int aiy,
+                              float bx, float by, int bw, int bh, int bix, int biy) {
+    float al = ax + aix;
+    float at = ay + aiy;
+    float ar = ax + aw - aix;
+    float ab = ay + ah - aiy;
+    float bl = bx + bix;
+    float bt = by + biy;
+    float br = bx + bw - bix;
+    float bb = by + bh - biy;
+    return al < br && ar > bl && at < bb && ab > bt;
+}
+
+static void sleepResolveCollision(float& ax, float& ay, float& avx, float& avy, int aw, int ah, int aix, int aiy,
+                                  float& bx, float& by, float& bvx, float& bvy, int bw, int bh, int bix, int biy) {
+    float al = ax + aix;
+    float at = ay + aiy;
+    float ar = ax + aw - aix;
+    float ab = ay + ah - aiy;
+    float bl = bx + bix;
+    float bt = by + biy;
+    float br = bx + bw - bix;
+    float bb = by + bh - biy;
+
+    float overlapX = fminf(ar, br) - fmaxf(al, bl);
+    float overlapY = fminf(ab, bb) - fmaxf(at, bt);
+    if (overlapX <= 0.0f || overlapY <= 0.0f) return;
+
+    // Equal-mass elastic collision: swap velocity component on the shallow axis,
+    // and separate both bodies to avoid sticking.
+    if (overlapX < overlapY) {
+        float ta = avx;
+        avx = bvx;
+        bvx = ta;
+        float push = overlapX * 0.5f + 0.05f;
+        if ((ax + aw * 0.5f) < (bx + bw * 0.5f)) {
+            ax -= push;
+            bx += push;
+        } else {
+            ax += push;
+            bx -= push;
+        }
+    } else {
+        float ta = avy;
+        avy = bvy;
+        bvy = ta;
+        float push = overlapY * 0.5f + 0.05f;
+        if ((ay + ah * 0.5f) < (by + bh * 0.5f)) {
+            ay -= push;
+            by += push;
+        } else {
+            ay += push;
+            by -= push;
+        }
+    }
 }
 
 static void renderSleepClock() {
@@ -410,12 +560,37 @@ void displaySleepStart() {
     analogWriteRange(255);
     analogWrite(TFT_BL, 255 - SLEEP_BL_LEVEL);   // active LOW
 
-    // Random start position and direction (hardware RNG)
-    fx = (float)(SLEEP_STEP + (int)(RANDOM_REG32 % (240 - LOGO_W - 2 * SLEEP_STEP)));
-    fy = (float)(SLEEP_STEP + (int)(RANDOM_REG32 % (240 - LOGO_H - 2 * SLEEP_STEP)));
-    vx = (RANDOM_REG32 & 1) ? 1.0f : -1.0f;
-    vy = (RANDOM_REG32 & 1) ? 1.0f : -1.0f;
-    sleepRandomizeVelocity();
+    // Random start positions and directions for all three logos.
+    for (int i = 0; i < 3; i++) {
+        bool placed = false;
+        for (int tries = 0; tries < 32; tries++) {
+            sleepLogos[i].fx = (float)(SLEEP_STEP + (int)(RANDOM_REG32 % (240 - LOGO_W - 2 * SLEEP_STEP)));
+            sleepLogos[i].fy = (float)(SLEEP_STEP + (int)(RANDOM_REG32 % (240 - LOGO_H - 2 * SLEEP_STEP)));
+            bool overlaps = false;
+            for (int j = 0; j < i; j++) {
+                if (sleepOverlap(sleepLogos[i].fx, sleepLogos[i].fy, LOGO_W, LOGO_H,
+                                 sleepLogos[j].fx, sleepLogos[j].fy, LOGO_W, LOGO_H)) {
+                    overlaps = true;
+                    break;
+                }
+            }
+            if (!overlaps) {
+                placed = true;
+                break;
+            }
+        }
+        if (!placed) {
+            sleepLogos[i].fx = (float)(SLEEP_STEP + i * (LOGO_W + 6));
+            sleepLogos[i].fy = (float)(SLEEP_STEP + i * 8);
+        }
+        sleepLogos[i].vx = (RANDOM_REG32 & 1) ? 1.0f : -1.0f;
+        sleepLogos[i].vy = (RANDOM_REG32 & 1) ? 1.0f : -1.0f;
+        sleepInitVelocity(sleepLogos[i].vx, sleepLogos[i].vy);
+        sleepLogos[i].x = (int)sleepLogos[i].fx;
+        sleepLogos[i].y = (int)sleepLogos[i].fy;
+        sleepLogos[i].prevX = sleepLogos[i].x;
+        sleepLogos[i].prevY = sleepLogos[i].y;
+    }
 
     // Derive the larger clock bounds from the active font metrics.
     tft.setTextFont(2);
@@ -423,42 +598,67 @@ void displaySleepStart() {
     clkW = tft.textWidth("00:00") + 4;
     clkH = tft.fontHeight(2);
 
-    // Random clock position, avoiding immediate overlap with the logo.
+    // Random clock position, avoiding immediate overlap with logos.
     bool placed = false;
     for (int tries = 0; tries < 24; tries++) {
         cfx = (float)(SLEEP_STEP + (int)(RANDOM_REG32 % (240 - clkW - 2 * SLEEP_STEP)));
         cfy = (float)(SLEEP_STEP + (int)(RANDOM_REG32 % (240 - clkH - 2 * SLEEP_STEP)));
-        if (!sleepOverlap(fx, fy, LOGO_W, LOGO_H, cfx, cfy, clkW, clkH)) {
+        bool overlaps = false;
+        for (int i = 0; i < 3; i++) {
+            if (sleepOverlap(sleepLogos[i].fx, sleepLogos[i].fy, LOGO_W, LOGO_H, cfx, cfy, clkW, clkH)) {
+                overlaps = true;
+                break;
+            }
+        }
+        if (!overlaps) {
             placed = true;
             break;
         }
     }
     if (!placed) {
-        cfx = (fx < 120.0f) ? (float)(240 - clkW - SLEEP_STEP) : (float)SLEEP_STEP;
-        cfy = (fy < 120.0f) ? (float)(240 - clkH - SLEEP_STEP) : (float)SLEEP_STEP;
+        cfx = (float)(240 - clkW - SLEEP_STEP);
+        cfy = (float)(240 - clkH - SLEEP_STEP);
     }
     cvx = (RANDOM_REG32 & 1) ? 1.0f : -1.0f;
     cvy = (RANDOM_REG32 & 1) ? 1.0f : -1.0f;
-    sleepRandomizeVelocity(cvx, cvy);
+    sleepInitVelocity(cvx, cvy);
 
-    lx = (int)fx;
-    ly = (int)fy;
     cx = (int)cfx;
     cy = (int)cfy;
 
-    logoSpr.setColorDepth(1);
+    // Keep logos in direct-color sprites so each one retains its own tint.
+    // 1-bit palette sprites can end up sharing effective bitmap colors.
+    claudeLogoSpr.setColorDepth(8);
+    copilotLogoSpr.setColorDepth(8);
+    codexLogoSpr.setColorDepth(8);
     clkSpr.setColorDepth(1);
-    sleepAnim = logoSpr.createSprite(LOGO_W + 2 * SLEEP_STEP, LOGO_H + 2 * SLEEP_STEP) != nullptr
+    sleepAnim = claudeLogoSpr.createSprite(LOGO_W + 2 * SLEEP_STEP, LOGO_H + 2 * SLEEP_STEP) != nullptr
+             && copilotLogoSpr.createSprite(LOGO_W + 2 * SLEEP_STEP, LOGO_H + 2 * SLEEP_STEP) != nullptr
+             && codexLogoSpr.createSprite(LOGO_W + 2 * SLEEP_STEP, LOGO_H + 2 * SLEEP_STEP) != nullptr
              && clkSpr.createSprite(clkW + 2 * SLEEP_STEP, clkH + 2 * SLEEP_STEP) != nullptr;
 
-    if (!sleepAnim) {   // heap too tight for sprites: static logo instead
-        logoSpr.deleteSprite();
+    if (!sleepAnim) {   // heap too tight for sprites: static fallback
+        claudeLogoSpr.deleteSprite();
+        copilotLogoSpr.deleteSprite();
+        codexLogoSpr.deleteSprite();
         clkSpr.deleteSprite();
-        tft.drawBitmap(lx, ly, LOGO_BITS, LOGO_W, LOGO_H, COL_LOGO);
+        for (int i = 0; i < 3; i++) {
+            tft.drawBitmap(sleepLogos[i].x, sleepLogos[i].y,
+                           logoBitsForAgent(sleepLogos[i].id), LOGO_W, LOGO_H,
+                           logoColorForAgent(sleepLogos[i].id));
+        }
         return;
     }
 
-    logoSpr.setBitmapColor(COL_LOGO, COL_BG);
+    // Logo pixels never change while sleeping. Render each sprite once so the
+    // 25 fps hot path only moves prebuilt buffers and performs no allocation.
+    for (int i = 0; i < 3; i++) {
+        sleepLogos[i].spr->fillSprite(0);
+        sleepLogos[i].spr->drawBitmap(
+            SLEEP_STEP, SLEEP_STEP, logoBitsForAgent(sleepLogos[i].id),
+            LOGO_W, LOGO_H, logoColorForAgent(sleepLogos[i].id));
+    }
+
     clkSpr.setBitmapColor(COL_GREEN, COL_BG);
 
     lastFrameMs = 0;
@@ -470,91 +670,149 @@ void displaySleepTick(unsigned long now) {
     if (!sleeping || !sleepAnim || now - lastFrameMs < SLEEP_FRAME_MS) return;
     lastFrameMs = now;
 
-    float prevFx = fx, prevFy = fy;
-    float prevCfx = cfx, prevCfy = cfy;
+    int oldX[3], oldY[3];
+    for (int i = 0; i < 3; i++) {
+        oldX[i] = sleepLogos[i].x;
+        oldY[i] = sleepLogos[i].y;
+    }
+    int oldCx = cx;
+    int oldCy = cy;
 
-    fx += vx;
-    fy += vy;
+    for (int i = 0; i < 3; i++) {
+        sleepLogos[i].prevX = sleepLogos[i].x;
+        sleepLogos[i].prevY = sleepLogos[i].y;
+        sleepLogos[i].fx += sleepLogos[i].vx;
+        sleepLogos[i].fy += sleepLogos[i].vy;
+
+        if (sleepLogos[i].fx <= 0.0f) {
+            sleepLogos[i].fx = 0.0f;
+            sleepLogos[i].vx = fabsf(sleepLogos[i].vx);
+        } else if (sleepLogos[i].fx >= 240 - LOGO_W) {
+            sleepLogos[i].fx = 240 - LOGO_W;
+            sleepLogos[i].vx = -fabsf(sleepLogos[i].vx);
+        }
+        if (sleepLogos[i].fy <= 0.0f) {
+            sleepLogos[i].fy = 0.0f;
+            sleepLogos[i].vy = fabsf(sleepLogos[i].vy);
+        } else if (sleepLogos[i].fy >= 240 - LOGO_H) {
+            sleepLogos[i].fy = 240 - LOGO_H;
+            sleepLogos[i].vy = -fabsf(sleepLogos[i].vy);
+        }
+
+        sleepLogos[i].x = (int)sleepLogos[i].fx;
+        sleepLogos[i].y = (int)sleepLogos[i].fy;
+    }
+
     cfx += cvx;
     cfy += cvy;
 
-    bool hitX = false, hitY = false;
-    if (fx <= 0.0f)                { fx = 0.0f;                vx =  fabsf(vx); hitX = true; }
-    else if (fx >= 240 - LOGO_W)   { fx = 240 - LOGO_W;        vx = -fabsf(vx); hitX = true; }
-    if (fy <= 0.0f)                { fy = 0.0f;                vy =  fabsf(vy); hitY = true; }
-    else if (fy >= 240 - LOGO_H)   { fy = 240 - LOGO_H;        vy = -fabsf(vy); hitY = true; }
-    if (hitX || hitY) sleepRandomizeVelocity();   // never settle into an orbit
+    if (cfx <= 0.0f)               { cfx = 0.0f;               cvx =  fabsf(cvx); }
+    else if (cfx >= 240 - clkW)    { cfx = 240 - clkW;         cvx = -fabsf(cvx); }
+    if (cfy <= 0.0f)               { cfy = 0.0f;               cvy =  fabsf(cvy); }
+    else if (cfy >= 240 - clkH)    { cfy = 240 - clkH;         cvy = -fabsf(cvy); }
 
-    bool clkHitX = false, clkHitY = false;
-    if (cfx <= 0.0f)               { cfx = 0.0f;               cvx =  fabsf(cvx); clkHitX = true; }
-    else if (cfx >= 240 - clkW)    { cfx = 240 - clkW;         cvx = -fabsf(cvx); clkHitX = true; }
-    if (cfy <= 0.0f)               { cfy = 0.0f;               cvy =  fabsf(cvy); clkHitY = true; }
-    else if (cfy >= 240 - clkH)    { cfy = 240 - clkH;         cvy = -fabsf(cvy); clkHitY = true; }
-    if (clkHitX || clkHitY) sleepRandomizeVelocity(cvx, cvy);
-
-    const float lfx = fx + LOGO_COLLIDE_INSET_X;
-    const float lfy = fy + LOGO_COLLIDE_INSET_Y;
-    const int lfw = LOGO_W - 2 * LOGO_COLLIDE_INSET_X;
-    const int lfh = LOGO_H - 2 * LOGO_COLLIDE_INSET_Y;
-
-    const float cox = cfx + CLOCK_COLLIDE_INSET_X;
-    const float coy = cfy + CLOCK_COLLIDE_INSET_Y;
-    const int cow = clkW - 2 * CLOCK_COLLIDE_INSET_X;
-    const int coh = clkH - 2 * CLOCK_COLLIDE_INSET_Y;
-
-    if (sleepOverlap(lfx, lfy, lfw, lfh, cox, coy, cow, coh)) {
-        float ox = min(lfx + lfw, cox + cow) - max(lfx, cox);
-        float oy = min(lfy + lfh, coy + coh) - max(lfy, coy);
-        float dx = (lfx + lfw * 0.5f) - (cox + cow * 0.5f);
-        float dy = (lfy + lfh * 0.5f) - (coy + coh * 0.5f);
-        bool collideX = (ox < oy);
-        if (ox == oy) {
-            // Tie-break with dominant movement axis from this frame.
-            float mvx = fabsf((fx - prevFx) - (cfx - prevCfx));
-            float mvy = fabsf((fy - prevFy) - (cfy - prevCfy));
-            collideX = mvx >= mvy;
-        }
-
-        if (collideX) {
-            float push = (ox * 0.5f) + 0.1f;
-            if (dx < 0.0f) { fx -= push; cfx += push; }
-            else           { fx += push; cfx -= push; }
-            vx = -vx;
-            cvx = -cvx;
-        } else {
-            float push = (oy * 0.5f) + 0.1f;
-            if (dy < 0.0f) { fy -= push; cfy += push; }
-            else           { fy += push; cfy -= push; }
-            vy = -vy;
-            cvy = -cvy;
-        }
-
-        fx = constrain(fx, 0.0f, (float)(240 - LOGO_W));
-        fy = constrain(fy, 0.0f, (float)(240 - LOGO_H));
-        cfx = constrain(cfx, 0.0f, (float)(240 - clkW));
-        cfy = constrain(cfy, 0.0f, (float)(240 - clkH));
-    }
-
-    lx = (int)fx;
-    ly = (int)fy;
     cx = (int)cfx;
     cy = (int)cfy;
 
-    // Sprite margin covers the previous position, so one push erases and draws
-    logoSpr.fillSprite(0);
-    logoSpr.setBitmapColor(COL_LOGO, COL_BG);
-    logoSpr.drawBitmap(SLEEP_STEP, SLEEP_STEP, LOGO_BITS, LOGO_W, LOGO_H, 1);
-    logoSpr.pushSprite(lx - SLEEP_STEP, ly - SLEEP_STEP);
+    // Object-to-object collisions: 3 logos + clock all bounce off each other.
+    for (int i = 0; i < 3; i++) {
+        for (int j = i + 1; j < 3; j++) {
+            if (sleepOverlapInset(
+                    sleepLogos[i].fx, sleepLogos[i].fy, LOGO_W, LOGO_H,
+                    LOGO_COLLIDE_INSET_X, LOGO_COLLIDE_INSET_Y,
+                    sleepLogos[j].fx, sleepLogos[j].fy, LOGO_W, LOGO_H,
+                    LOGO_COLLIDE_INSET_X, LOGO_COLLIDE_INSET_Y)) {
+                sleepResolveCollision(
+                    sleepLogos[i].fx, sleepLogos[i].fy, sleepLogos[i].vx, sleepLogos[i].vy,
+                    LOGO_W, LOGO_H, LOGO_COLLIDE_INSET_X, LOGO_COLLIDE_INSET_Y,
+                    sleepLogos[j].fx, sleepLogos[j].fy, sleepLogos[j].vx, sleepLogos[j].vy,
+                    LOGO_W, LOGO_H, LOGO_COLLIDE_INSET_X, LOGO_COLLIDE_INSET_Y);
+            }
+        }
+    }
+    for (int i = 0; i < 3; i++) {
+        if (sleepOverlapInset(
+                sleepLogos[i].fx, sleepLogos[i].fy, LOGO_W, LOGO_H,
+                LOGO_COLLIDE_INSET_X, LOGO_COLLIDE_INSET_Y,
+                cfx, cfy, clkW, clkH,
+                CLOCK_COLLIDE_INSET_X, CLOCK_COLLIDE_INSET_Y)) {
+            sleepResolveCollision(
+                sleepLogos[i].fx, sleepLogos[i].fy, sleepLogos[i].vx, sleepLogos[i].vy,
+                LOGO_W, LOGO_H, LOGO_COLLIDE_INSET_X, LOGO_COLLIDE_INSET_Y,
+                cfx, cfy, cvx, cvy,
+                clkW, clkH, CLOCK_COLLIDE_INSET_X, CLOCK_COLLIDE_INSET_Y);
+        }
+    }
+
+    // Keep objects in bounds after collision separation.
+    for (int i = 0; i < 3; i++) {
+        sleepLogos[i].fx = constrain(sleepLogos[i].fx, 0.0f, (float)(240 - LOGO_W));
+        sleepLogos[i].fy = constrain(sleepLogos[i].fy, 0.0f, (float)(240 - LOGO_H));
+        sleepLogos[i].x = (int)sleepLogos[i].fx;
+        sleepLogos[i].y = (int)sleepLogos[i].fy;
+    }
+    cfx = constrain(cfx, 0.0f, (float)(240 - clkW));
+    cfy = constrain(cfy, 0.0f, (float)(240 - clkH));
+    cx = (int)cfx;
+    cy = (int)cfy;
+
+    // Interleave clear+draw per object to avoid a global blank phase.
+    // Only clear exposed old->new delta bands to minimize pixel churn.
+    for (int i = 0; i < 3; i++) {
+        int oldRectX = oldX[i] - SLEEP_STEP;
+        int oldRectY = oldY[i] - SLEEP_STEP;
+        int newRectX = sleepLogos[i].x - SLEEP_STEP;
+        int newRectY = sleepLogos[i].y - SLEEP_STEP;
+        int rectW = LOGO_W + 2 * SLEEP_STEP;
+        int rectH = LOGO_H + 2 * SLEEP_STEP;
+
+        sleepClearOldDelta(oldRectX, oldRectY, newRectX, newRectY, rectW, rectH, COL_BG);
+
+        sleepLogos[i].spr->pushSprite(sleepLogos[i].x - SLEEP_STEP,
+                                      sleepLogos[i].y - SLEEP_STEP);
+    }
 
     renderSleepClock();
     clkSpr.setBitmapColor(COL_GREEN, COL_BG);
+
+    int oldClkRectX = oldCx - SLEEP_STEP;
+    int oldClkRectY = oldCy - SLEEP_STEP;
+    int newClkRectX = cx - SLEEP_STEP;
+    int newClkRectY = cy - SLEEP_STEP;
+    int clkRectW = clkW + 2 * SLEEP_STEP;
+    int clkRectH = clkH + 2 * SLEEP_STEP;
+    sleepClearOldDelta(oldClkRectX, oldClkRectY, newClkRectX, newClkRectY, clkRectW, clkRectH, COL_BG);
+
     clkSpr.pushSprite(cx - SLEEP_STEP, cy - SLEEP_STEP);
 }
 
 static void appendSleepSvg(String& s) {
     s.reserve(s.length() + 1400);
-    s += "<path transform='translate("; s += lx; s += ","; s += ly;
-    s += ") scale(0.96)' fill='#DE7356' d='"; s += FPSTR(LOGO_PATH); s += "'/>";
+    for (int i = 0; i < 3; i++) {
+        const char* aid = sleepLogos[i].id;
+        const char* fill = "#DE7356";
+        float scale = 0.96f;
+        int dy = 0;
+        if (strcmp(aid, "copilot") == 0) {
+            fill = "#007FFF";
+            scale = 0.1875f;
+            dy = 4;
+        } else if (strcmp(aid, "codex") == 0) {
+            fill = "#FFFFFF";
+            scale = 0.1846f;
+        }
+        s += "<path transform='translate(";
+        s += sleepLogos[i].x;
+        s += ",";
+        s += (sleepLogos[i].y + dy);
+        s += ") scale(";
+        s += String(scale, 4);
+        s += ")' fill='";
+        s += fill;
+        s += "' d='";
+        s += logoPathForAgent(aid);
+        s += "'/>";
+    }
 
     time_t now = time(nullptr);
     struct tm* t = localtime(&now);
@@ -568,7 +826,9 @@ void displayWake() {
     sleeping = false;
 
     if (sleepAnim) {
-        logoSpr.deleteSprite();
+        claudeLogoSpr.deleteSprite();
+        copilotLogoSpr.deleteSprite();
+        codexLogoSpr.deleteSprite();
         clkSpr.deleteSprite();
         sleepAnim = false;
     }
@@ -576,7 +836,13 @@ void displayWake() {
     analogWrite(TFT_BL, 0);      // constant LOW = backlight fully on
     tft.fillScreen(COL_BG);
     drawChrome();
-    prev = {-1.0f, -1.0f, "", "", -1, (ClaudeStatus)-1, false, false};
+    prev = {
+        -1.0f, -1.0f,
+        "", "",
+        "", "",
+        "", "",
+        -1, (ClaudeStatus)-1, false, false
+    };
     displayUpdate();
     displayUpdateClock();
 }

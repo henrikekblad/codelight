@@ -1,8 +1,8 @@
 {
     "uuid": "codelight@sensnology.se",
     "name": "Codelight",
-    "description": "Claude Code session status in the top bar",
-    "version": 5,
+    "description": "Claude, Copilot, and Codex status in the top bar",
+    "version": 6,
     "shell-version": ["45", "46", "47", "48", "49", "50"],
     "url": "https://github.com/henrikekblad/codelight",
     "settings-schema": "org.gnome.shell.extensions.codelight"

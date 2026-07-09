@@ -1,25 +1,35 @@
 # codelight — VSCode extension
 
-Shows the Claude Code status (working / waiting for input / idle, plus usage
-%) from the [codelight companion daemon](../companion/) in the VSCode status
-bar — and, when the daemon runs with `--remote-control`, **answers Claude's
-AskUserQuestion prompts right in the editor**.
+Shows the active Claude, Copilot, or Codex status in the VS Code status bar.
+Hovering shows usage grouped by agent, including optional company Copilot
+monthly credits. When detailed usage is unavailable, that agent remains
+status-only.
 
-## Answering questions
+<table>
+<tr>
+<td><img src="../assets/vscode-status.png" width="269"
+         alt="VS Code status bar and grouped codelight usage tooltip"></td>
+<td><img src="../assets/vscode-permission.png" width="620"
+         alt="VS Code codelight permission review"></td>
+</tr>
+<tr><td align="center">Status and usage</td><td align="center">Permission review</td></tr>
+</table>
+
+## Questions and permissions
 
 When Claude asks a multiple-choice question, a themed **WebView panel** opens
 beside your editor with the question(s), options (radio or checkboxes for
 multi-select), a free-text "Other…" field, and **Submit** / **Skip** buttons.
-The status-bar item turns into a `$(bell-dot) claude — question` you can click
+The status-bar item turns into an agent question indicator you can click
 to reopen the panel if you dismiss it. Whoever answers first (VSCode, the phone,
 or GNOME) wins; the panel closes automatically if the question is answered
 elsewhere or times out.
 
-Permission prompts (Allow / Deny) are **not** shown in VSCode — inside the
-editor you answer Claude Code's own native permission dialog. codelight's remote
-*permission* approval is for when you're away from the computer (the Android app
-and the GNOME panel). See
-[companion/README.md](../companion/README.md#remote-control).
+Permission requests open a separate review webview with **Allow**, **Deny**, and
+fallback actions. A request may also be allowed while trusting the repository
+for narrowly safe edits, or while persisting the exact command in that
+repository. The policy is shared across Claude, Copilot, and Codex; see
+[Persistent folder and command approvals](../companion/README.md#persistent-folder-and-command-approvals).
 
 ## Install
 
@@ -45,9 +55,10 @@ Manual: download `codelight-vX.Y.Z.vsix` from the
 | `codelight.host` | `127.0.0.1` | Daemon host |
 | `codelight.port` | `8765` | Daemon WebSocket port |
 | `codelight.secret` | `""` | Must match the daemon's `--secret` |
-| `codelight.questionPrompts` | `true` | Answer Claude's AskUserQuestion prompts in the editor |
+| `codelight.questionPrompts` | `true` | Answer supported agent questions in the editor |
+| `codelight.permissionPrompts` | `true` | Review supported agent permission requests in the editor |
 
-The extension also contributes a **codelight: Answer Claude's question** command
+The extension also contributes a **codelight: Review pending request** command
 (bound to the status-bar item) that reopens the question panel while one is
 pending.
 

@@ -9,7 +9,7 @@
 #
 # KR_SDP two-step (handled automatically):
 #   1. Flash bootstrap via /update_ota (filename must start with "KR_SDP")
-#   2. Script connects to claude-screen-setup AP, uploads codelight via /flash
+#   2. Script connects to codelight-screen-setup AP, uploads codelight via /flash
 #
 # Requires: curl, nmcli, python3 (Linux).
 #
@@ -30,7 +30,7 @@ while [[ $# -gt 0 ]]; do
         *)               HOST="$1"; shift ;;
     esac
 done
-HOST="${HOST:-claude-screen.local}"
+HOST="${HOST:-codelight-screen.local}"
 BIN=".pio/build/geekmagic_ultra/firmware.bin"
 
 pio run
@@ -39,29 +39,29 @@ pio run
 # Called after codelight boots into AP mode on a first install.
 # Connects to the setup AP, POSTs the WiFi credentials via /api/config,
 # triggers a reboot via /api/reboot, then reconnects to the original network
-# and waits for the device to come up on claude-screen.local.
+# and waits for the device to come up on codelight-screen.local.
 push_wifi_config() {
     local prev_conn
     prev_conn=$(nmcli -t -f active,connection dev status 2>/dev/null \
                 | grep '^yes' | cut -d: -f2 | head -1 || true)
 
-    echo -n "── Waiting for 'claude-screen-setup' AP (up to 40 s) "
+    echo -n "── Waiting for 'codelight-screen-setup' AP (up to 40 s) "
     local ap_seen=""
     for _ in $(seq 20); do
         sleep 2
-        if nmcli dev wifi list --rescan yes 2>/dev/null | grep -q "claude-screen-setup"; then
+        if nmcli dev wifi list --rescan yes 2>/dev/null | grep -q "codelight-screen-setup"; then
             ap_seen=1; echo " found"; break
         fi
         echo -n .
     done
     if [ -z "$ap_seen" ]; then
         echo
-        echo "── 'claude-screen-setup' AP did not appear — configure manually at http://192.168.4.1" >&2
+        echo "── 'codelight-screen-setup' AP did not appear — configure manually at http://192.168.4.1" >&2
         return 1
     fi
 
-    echo "── Connecting to claude-screen-setup..."
-    nmcli dev wifi connect "claude-screen-setup" >/dev/null 2>&1 || true
+    echo "── Connecting to codelight-screen-setup..."
+    nmcli dev wifi connect "codelight-screen-setup" >/dev/null 2>&1 || true
 
     echo -n "── Waiting for config API "
     local api_up=""
@@ -100,16 +100,16 @@ print(json.dumps({'wifi':[{'ssid':sys.argv[1],'password':sys.argv[2]}]}))
         sleep 3
     fi
 
-    echo -n "── Waiting for codelight on claude-screen.local "
+    echo -n "── Waiting for codelight on codelight-screen.local "
     for _ in $(seq 30); do
         sleep 2
-        if curl -sf --max-time 10 -o /dev/null "http://claude-screen.local/" 2>/dev/null; then
-            echo; echo "── Done — http://claude-screen.local/debug"; return 0
+        if curl -sf --max-time 10 -o /dev/null "http://codelight-screen.local/" 2>/dev/null; then
+            echo; echo "── Done — http://codelight-screen.local/debug"; return 0
         fi
         echo -n .
     done
     echo
-    echo "── Device did not appear as claude-screen.local within 60 s — check it manually" >&2
+    echo "── Device did not appear as codelight-screen.local within 60 s — check it manually" >&2
     return 1
 }
 
@@ -121,8 +121,8 @@ bootstrap_page=$(curl -sf --max-time 10 "http://$HOST/" 2>/dev/null || true)
 if [ "$HOST" = "192.168.4.1" ] && [ -z "$bootstrap_page" ]; then
     prev_conn=$(nmcli -t -f active,connection dev status 2>/dev/null \
                 | grep '^yes' | cut -d: -f2 | head -1 || true)
-    echo "── 192.168.4.1 not reachable — connecting to 'claude-screen-setup'..."
-    nmcli dev wifi connect "claude-screen-setup" >/dev/null 2>&1 &
+    echo "── 192.168.4.1 not reachable — connecting to 'codelight-screen-setup'..."
+    nmcli dev wifi connect "codelight-screen-setup" >/dev/null 2>&1 &
     sleep 1
     echo -n "── Waiting for bootstrap at 192.168.4.1 "
     for _ in $(seq 20); do
@@ -157,8 +157,8 @@ if echo "$bootstrap_page" | grep -qi "bootstrap"; then
                         | grep '^yes' | cut -d: -f2 | head -1 || true)
         fi
         sleep 3
-        echo "── Connecting to claude-screen-setup for v8 bootstrap..."
-        nmcli dev wifi connect "claude-screen-setup" >/dev/null 2>&1 || true
+        echo "── Connecting to codelight-screen-setup for v8 bootstrap..."
+        nmcli dev wifi connect "codelight-screen-setup" >/dev/null 2>&1 || true
         HOST="192.168.4.1"
         echo -n "── Waiting for bootstrap v8 at 192.168.4.1 "
         bootstrap_page=""
@@ -192,20 +192,20 @@ if echo "$bootstrap_page" | grep -qi "bootstrap"; then
         sleep 3
     fi
 
-    echo -n "── Waiting for codelight on claude-screen.local "
+    echo -n "── Waiting for codelight on codelight-screen.local "
     for _ in $(seq 30); do
         sleep 2
-        if curl -sf --max-time 10 -o /dev/null "http://claude-screen.local/" 2>/dev/null; then
-            echo; echo "── Done — http://claude-screen.local/debug"; exit 0
+        if curl -sf --max-time 10 -o /dev/null "http://codelight-screen.local/" 2>/dev/null; then
+            echo; echo "── Done — http://codelight-screen.local/debug"; exit 0
         fi
         echo -n .
     done
     echo
-    echo "── Did not appear as claude-screen.local — first-run AP mode."
+    echo "── Did not appear as codelight-screen.local — first-run AP mode."
     if [ -n "$WIFI_SSID" ]; then
         push_wifi_config
     else
-        echo "   Connect to 'claude-screen-setup' and open http://192.168.4.1"
+        echo "   Connect to 'codelight-screen-setup' and open http://192.168.4.1"
     fi
     exit 0
 fi
@@ -266,18 +266,18 @@ if [ "$probe_code" != "404" ] && [ -n "$probe_code" ]; then
         "http://$HOST/update_ota" 2>/dev/null || true)
     echo "   /update_ota response: ${ota_resp:-(empty)}"
 
-    echo -n "── Waiting for 'claude-screen-setup' AP (up to 40 s) "
+    echo -n "── Waiting for 'codelight-screen-setup' AP (up to 40 s) "
     bootstrap_ap=""
     for _ in $(seq 20); do
         sleep 2
-        if nmcli dev wifi list --rescan yes 2>/dev/null | grep -q "claude-screen-setup"; then
+        if nmcli dev wifi list --rescan yes 2>/dev/null | grep -q "codelight-screen-setup"; then
             bootstrap_ap=1; break
         fi
         echo -n .
     done
     echo
     if [ -z "$bootstrap_ap" ]; then
-        echo "error: claude-screen-setup AP did not appear — bootstrap flash may have failed" >&2
+        echo "error: codelight-screen-setup AP did not appear — bootstrap flash may have failed" >&2
         exit 1
     fi
 
@@ -285,7 +285,7 @@ if [ "$probe_code" != "404" ] && [ -n "$probe_code" ]; then
     echo "── Step 2/2: connecting to bootstrap AP..."
     prev_conn=$(nmcli -t -f active,connection dev status 2>/dev/null \
                 | grep '^yes' | cut -d: -f2 | head -1 || true)
-    nmcli dev wifi connect "claude-screen-setup" >/dev/null 2>&1 &
+    nmcli dev wifi connect "codelight-screen-setup" >/dev/null 2>&1 &
     sleep 1
     echo -n "── Waiting for bootstrap to respond "
     for _ in $(seq 20); do
@@ -314,22 +314,22 @@ if [ "$probe_code" != "404" ] && [ -n "$probe_code" ]; then
         exit 1
     fi
 
-    echo -n "── Waiting for codelight to come up on claude-screen.local "
+    echo -n "── Waiting for codelight to come up on codelight-screen.local "
     for _ in $(seq 30); do
         sleep 2
-        if curl -sf --max-time 2 -o /dev/null "http://claude-screen.local/" 2>/dev/null; then
+        if curl -sf --max-time 2 -o /dev/null "http://codelight-screen.local/" 2>/dev/null; then
             echo
-            echo "── Done — codelight is up: http://claude-screen.local/debug"
+            echo "── Done — codelight is up: http://codelight-screen.local/debug"
             exit 0
         fi
         echo -n .
     done
     echo
-    echo "── Device did not appear as claude-screen.local within 60 s."
+    echo "── Device did not appear as codelight-screen.local within 60 s."
     if [ -n "$WIFI_SSID" ]; then
         push_wifi_config
     else
-        echo "   Connect to 'claude-screen-setup' WiFi and open http://192.168.4.1 to configure."
+        echo "   Connect to 'codelight-screen-setup' WiFi and open http://192.168.4.1 to configure."
     fi
     exit 0
 fi
@@ -363,7 +363,7 @@ echo "── Uploaded $(stat -c %s "$BIN.gz") bytes, device is rebooting"
 if [ -n "$WIFI_SSID" ]; then
     push_wifi_config
 else
-    echo "── First flash: connect to the 'claude-screen-setup' WiFi AP and"
+    echo "── First flash: connect to the 'codelight-screen-setup' WiFi AP and"
     echo "   open http://192.168.4.1 to configure. See README.md."
 fi
 exit 0

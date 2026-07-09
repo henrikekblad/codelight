@@ -43,6 +43,74 @@ object Palette {
     val muted  = Color(0xFF888888)
 }
 
+@Composable
+fun StatusScreen() {
+    val context = LocalContext.current
+    val state = context.getSharedPreferences(CodelightService.STATE_PREFS, 0)
+    var revision by remember { mutableIntStateOf(0) }
+    DisposableEffect(Unit) {
+        val listener = SharedPreferences.OnSharedPreferenceChangeListener { _, key ->
+            if (key == CodelightService.KEY_PER_AGENT_USAGE ||
+                key == CodelightService.KEY_PER_AGENT_STATUS ||
+                key == CodelightService.KEY_STATUS ||
+                key == CodelightService.KEY_CONNECTED
+            ) revision++
+        }
+        state.registerOnSharedPreferenceChangeListener(listener)
+        onDispose { state.unregisterOnSharedPreferenceChangeListener(listener) }
+    }
+    @Suppress("UNUSED_EXPRESSION")
+    revision
+    val agents = loadAgentUsage(state, System.currentTimeMillis() / 1000)
+    val connected = state.getBoolean(CodelightService.KEY_CONNECTED, false)
+
+    Column(
+        Modifier.fillMaxSize().verticalScroll(rememberScrollState())
+            .padding(horizontal = 16.dp, vertical = 12.dp),
+        verticalArrangement = Arrangement.spacedBy(12.dp),
+    ) {
+        agents.forEach { agent ->
+            Column(
+                Modifier.fillMaxWidth()
+                    .background(Palette.card, RoundedCornerShape(10.dp))
+                    .padding(14.dp),
+                verticalArrangement = Arrangement.spacedBy(8.dp),
+            ) {
+                Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+                    Text(agent.display, color = Palette.text, fontWeight = FontWeight.Bold,
+                        modifier = Modifier.weight(1f))
+                    Text(if (connected) agent.status.uppercase() else "OFFLINE",
+                        color = Palette.muted, fontSize = 11.sp)
+                }
+                agent.limits.forEach { limit ->
+                    Row(Modifier.fillMaxWidth()) {
+                        Text("${limit.label} — ${(limit.pct.coerceIn(0f, 1f) * 100).toInt()}%",
+                            color = Palette.text, fontSize = 12.sp,
+                            modifier = Modifier.weight(1f))
+                        Text("↻ ${limit.reset}", color = Palette.muted, fontSize = 11.sp)
+                    }
+                    LinearProgressIndicator(
+                        progress = { limit.pct.coerceIn(0f, 1f) },
+                        modifier = Modifier.fillMaxWidth().height(6.dp),
+                        color = usageColor(limit.pct),
+                        trackColor = Color(0xFF444444),
+                    )
+                }
+            }
+        }
+    }
+}
+
+private fun usageColor(pct: Float): Color {
+    val p = pct.coerceIn(0f, 1f)
+    return when {
+        p < .5f -> Color(0xFF00C800)
+        p < .75f -> Color(0xFFFFFF00)
+        p < 1f -> Color(0xFFFF8C00)
+        else -> Color(0xFFFF2200)
+    }
+}
+
 // ── Settings ────────────────────────────────────────────────────────────────
 
 /**
@@ -230,7 +298,7 @@ fun SettingsScreen(onClose: (() -> Unit)? = null) {
 
         // ── Notifications ─────────────────────────────────────────────────
         SettingsCard(card, muted, label = "Notifications") {
-            Text("Notify when Claude Code changes to:", style = TextStyle(color = muted, fontSize = 11.sp))
+            Text("Notify when ${currentAgentDisplayName(context, state)} changes to:", style = TextStyle(color = muted, fontSize = 11.sp))
             Spacer(Modifier.height(4.dp))
             CheckRow("IDLE",    notifyIdle,    accent, text) { notifyIdle    = it }
             CheckRow("WAITING", notifyWaiting, accent, text) { notifyWaiting = it }
@@ -347,14 +415,15 @@ internal fun fieldColors(accent: Color, muted: Color, text: Color) =
 /**
  * Shows the last N lines of the active session's conversation, mirrored to
  * STATE_PREFS by the service from the companion's `conversation` feed. Read-only:
- * injecting into a live interactive `claude` session isn't supported (see the
- * Phase-0 spike), so there is no send box.
+ * injecting into a live interactive agent session isn't supported, so there is
+ * no send box.
  */
 @Composable
 fun ConversationScreen() {
     val context  = LocalContext.current
     val state    = context.getSharedPreferences(CodelightService.STATE_PREFS, 0)
     val settings = context.getSharedPreferences(CodelightService.SETTINGS_PREFS, 0)
+    val agentDisplay = currentAgentDisplayName(context, state)
     val maxLines = settings.getInt(CodelightService.KEY_CONV_LINES, 50)
 
     var lines by remember { mutableStateOf(loadConversation(state)) }
@@ -381,7 +450,7 @@ fun ConversationScreen() {
 
     if (shown.isEmpty()) {
         Box(Modifier.fillMaxSize().padding(24.dp), contentAlignment = Alignment.Center) {
-            Text("No conversation yet. It appears here once Claude Code is active on the companion.",
+              Text("No conversation yet. It appears here once $agentDisplay is active on the companion.",
                  style = TextStyle(color = muted, fontSize = 13.sp))
         }
         return
@@ -396,7 +465,7 @@ fun ConversationScreen() {
                 "user"   -> "you"
                 "tool"   -> "tool"
                 "output" -> "output"
-                else     -> "claude"
+                else     -> agentDisplay.lowercase()
             }
             val labelColor = when (role) {
                 "user"   -> Palette.accent
@@ -418,7 +487,7 @@ fun ConversationScreen() {
                     Text(body, style = TextStyle(color = if (role == "output") muted else text,
                                                  fontSize = 12.sp, fontFamily = FontFamily.Monospace))
                 } else {
-                    // user / claude prose may contain markdown — render it.
+                    // user / assistant prose may contain markdown — render it.
                     MarkdownText(body, Palette.accent, text)
                 }
             }
@@ -607,22 +676,17 @@ fun RequestScreen(requestedId: String?, onDone: () -> Unit) {
 @Composable
 private fun PermissionContent(req: JSONObject, card: Color, text: Color, muted: Color, onDone: () -> Unit) {
     val context = LocalContext.current
+    val state = context.getSharedPreferences(CodelightService.STATE_PREFS, Context.MODE_PRIVATE)
+    val agentDisplay = req.optString("agent_display", currentAgentDisplayName(context, state))
     val id = req.optString("id")
     val tool = req.optString("tool_name", "tool")
+    val canAllowFolder = !req.has("allow_folder_available") || req.optBoolean("allow_folder_available", true)
+    val canAllowCommand = req.optBoolean("allow_command_available", false)
     val ti = req.optJSONObject("tool_input")
     val detail = req.optString("summary", tool)
+    val body = formatPermissionBody(tool, detail, ti)
 
-    // Show the most meaningful field for the tool rather than the raw JSON blob:
-    // a plan (ExitPlanMode), a command (Bash), a path (Edit/Read/Write)…
-    val body = when {
-        ti == null                     -> detail
-        ti.optString("plan").isNotEmpty()      -> ti.optString("plan")
-        ti.optString("command").isNotEmpty()   -> ti.optString("command")
-        ti.optString("file_path").isNotEmpty() -> ti.optString("file_path")
-        else                           -> ti.toString(2)
-    }
-
-    Text("Claude Code asks", style = TextStyle(color = text, fontSize = 18.sp, fontWeight = FontWeight.Bold))
+    Text("$agentDisplay asks", style = TextStyle(color = text, fontSize = 18.sp, fontWeight = FontWeight.Bold))
     Spacer(Modifier.height(4.dp))
     Text("Allow $tool?", style = TextStyle(color = muted, fontSize = 13.sp))
     Spacer(Modifier.height(12.dp))
@@ -639,15 +703,110 @@ private fun PermissionContent(req: JSONObject, card: Color, text: Color, muted: 
                colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF6E2B2B)),
                modifier = Modifier.weight(1f)) { Text("Deny") }
     }
+    if (canAllowFolder) {
+        Spacer(Modifier.height(12.dp))
+        Text(
+            "Trusting this folder auto-allows read-only inspection and safe, non-delete patches inside it.",
+            style = TextStyle(color = Color(0xFFFFB74D), fontSize = 11.sp),
+        )
+        Spacer(Modifier.height(6.dp))
+        Button(
+            onClick = { respondPermission(context, id, "allow_folder"); onDone() },
+            colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF2F6F9F)),
+            modifier = Modifier.fillMaxWidth(),
+        ) {
+            Text("Allow + Trust Folder for Safe Edits")
+        }
+    }
+    if (canAllowCommand) {
+        Spacer(Modifier.height(12.dp))
+        Text(
+            "Allow this exact command automatically in this repository in future sessions and agents.",
+            style = TextStyle(color = Color(0xFFFFB74D), fontSize = 11.sp),
+        )
+        Spacer(Modifier.height(6.dp))
+        Button(
+            onClick = { respondPermission(context, id, "allow_command"); onDone() },
+            colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF2F6F9F)),
+            modifier = Modifier.fillMaxWidth(),
+        ) {
+            Text("Allow + Always Allow Exact Command Here")
+        }
+    }
+}
+
+private fun extractPatchTarget(patchText: String): String {
+    patchText.lineSequence().forEach { raw ->
+        val line = raw.trim()
+        when {
+            line.startsWith("*** Update File:") -> return line.removePrefix("*** Update File:").trim()
+            line.startsWith("*** Add File:") -> return line.removePrefix("*** Add File:").trim()
+            line.startsWith("*** Delete File:") -> return line.removePrefix("*** Delete File:").trim()
+        }
+    }
+    return ""
+}
+
+private fun compactWs(s: String): String = s.trim().replace(Regex("\\s+"), " ")
+
+private fun formatPermissionBody(toolName: String, summary: String, toolInput: JSONObject?): String {
+    val tool = toolName.trim().ifEmpty { "tool use" }
+
+    if (toolInput != null) {
+        val plan = toolInput.optString("plan").trim()
+        if (plan.isNotEmpty()) return plan
+
+        val command = toolInput.optString("command").trim()
+        if (command.isNotEmpty()) return command
+
+        val filePath = toolInput.optString("file_path").ifBlank {
+            toolInput.optString("filePath")
+        }.trim()
+        if (filePath.isNotEmpty()) return filePath
+
+        if (tool == "apply_patch") {
+            val explanation = compactWs(toolInput.optString("explanation"))
+            val target = extractPatchTarget(toolInput.optString("input"))
+            val parts = buildList {
+                if (explanation.isNotEmpty()) add(explanation)
+                if (target.isNotEmpty()) add("target=$target")
+            }
+            if (parts.isNotEmpty()) return parts.joinToString("\n")
+        }
+
+        if (tool == "run_in_terminal") {
+            val goal = toolInput.optString("goal").trim()
+            val explanation = compactWs(toolInput.optString("explanation"))
+            val parts = listOf(goal, explanation).filter { it.isNotEmpty() }
+            if (parts.isNotEmpty()) return parts.joinToString("\n")
+        }
+    }
+
+    // If summary looks like "Tool: {json}", drop the prefix and pretty-print JSON payloads.
+    var detail = summary.trim()
+    Regex("^[^:]{1,80}:\\s*(.*)$").matchEntire(detail)?.groupValues?.getOrNull(1)?.let { tail ->
+        if (tail.isNotBlank()) detail = tail.trim()
+    }
+    if ((detail.startsWith("{") && detail.endsWith("}")) ||
+        (detail.startsWith("[") && detail.endsWith("]"))) {
+        try {
+            return if (detail.startsWith("{")) JSONObject(detail).toString(2)
+                   else JSONArray(detail).toString(2)
+        } catch (_: Exception) {}
+    }
+
+    return detail.ifEmpty { tool }
 }
 
 @Composable
 private fun QuestionContent(req: JSONObject, card: Color, text: Color, muted: Color, onDone: () -> Unit) {
     val context = LocalContext.current
+    val state = context.getSharedPreferences(CodelightService.STATE_PREFS, Context.MODE_PRIVATE)
+    val agentDisplay = req.optString("agent_display", currentAgentDisplayName(context, state))
     val id = req.optString("id")
     val questions = req.optJSONArray("questions")
 
-    Text("Claude asks", style = TextStyle(color = text, fontSize = 18.sp, fontWeight = FontWeight.Bold))
+    Text("$agentDisplay asks", style = TextStyle(color = text, fontSize = 18.sp, fontWeight = FontWeight.Bold))
     Spacer(Modifier.height(12.dp))
 
     val selected = remember { List(questions?.length() ?: 0) { mutableStateListOf<String>() } }
@@ -739,4 +898,9 @@ internal fun loadPending(prefs: SharedPreferences): List<JSONObject> {
         val all = JSONObject(prefs.getString(CodelightService.KEY_PENDING_REQUESTS, "{}") ?: "{}")
         all.keys().asSequence().map { all.getJSONObject(it) }.toList()
     } catch (_: Exception) { emptyList() }
+}
+
+private fun currentAgentDisplayName(context: Context, state: SharedPreferences? = null): String {
+    val prefs = state ?: context.getSharedPreferences(CodelightService.STATE_PREFS, Context.MODE_PRIVATE)
+    return prefs.getString(CodelightService.KEY_AGENT_DISPLAY, "Claude") ?: "Claude"
 }

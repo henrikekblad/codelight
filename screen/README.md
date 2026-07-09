@@ -3,9 +3,12 @@
 <img src="../assets/demo.jpg" width="600" alt="GeekMagic Ultra showing the codelight IDLE screen">
 
 Custom ESP8266 firmware for the **GeekMagic Ultra** that turns it into a live
-Claude Code dashboard. The screen connects outbound to the companion daemon as a
+coding-agent dashboard. The screen connects outbound to the companion daemon as a
 WebSocket client, discovers it automatically via mDNS, and re-renders on every
 push.
+
+The compact 240×240 layout follows the latest active Claude, Copilot, or Codex
+agent rather than attempting the multi-agent groups used by larger clients.
 
 ## Hardware
 
@@ -48,7 +51,7 @@ Two stock firmware variants exist:
 **KR_SDP** (most common on devices bought after mid-2024): the script does a
 two-step install — it flashes a small bootstrap image first, then uploads the
 full codelight firmware. No manual steps required; just make sure your computer
-is connected to the device's WiFi AP (`claude-screen-setup` or the stock AP).
+is connected to the device's WiFi AP (`codelight-screen-setup` or the stock AP).
 
 **Legacy stock** (older devices, `/update` page): the script uploads a gzipped
 binary directly. The stock flash layout only leaves ~520 KB of OTA staging room,
@@ -58,7 +61,7 @@ which is why the compressed image is required; the plain `.bin` is rejected with
 Once codelight is running, the same command updates it over the network:
 
 ```bash
-./buildAndOTAUpdate.sh              # defaults to claude-screen.local
+./buildAndOTAUpdate.sh              # defaults to codelight-screen.local
 ./buildAndOTAUpdate.sh my-screen.local
 ```
 
@@ -130,13 +133,13 @@ step using the same endpoint.
 On first boot (or when no configured network is reachable) the device starts in AP
 mode and shows setup instructions on screen:
 
-1. Connect your computer to the WiFi AP **`claude-screen-setup`**.
+1. Connect your computer to the WiFi AP **`codelight-screen-setup`**.
 2. Open `http://192.168.4.1` in a browser.
 3. Enter your WiFi credentials (up to 3 networks, tried in order on every boot).
 4. Set a **device name** — it becomes the mDNS hostname, e.g. `my-screen`
    → reachable as `http://my-screen.local` for config and OTA.
 5. Set a **companion name** — the `--name` value of the `codelight.py` daemon you
-   want to connect to (e.g. `henrik-laptop`). Leave blank to connect to the first
+   want to connect to (e.g. `my-laptop`). Leave blank to connect to the first
    companion found on the network.
 6. Optionally set a **companion host** — the IP address of the machine running
    `codelight.py` (e.g. `192.168.1.100`). When set, mDNS discovery is skipped and

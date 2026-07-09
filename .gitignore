@@ -16,6 +16,9 @@ android/local.properties
 # Claude Code local settings
 .claude/
 
+# Editor-local tasks and approval settings
+.vscode/
+
 # OS
 .DS_Store
 Thumbs.db

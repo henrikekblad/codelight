@@ -50,6 +50,12 @@ class CodelightService : LifecycleService() {
         const val KEY_SESSION_RESET_AT = "session_reset_at"   // epoch seconds
         const val KEY_WEEKLY_RESET_AT  = "weekly_reset_at"
         const val KEY_STATUS          = "status"
+        const val KEY_AGENT_ID        = "agent_id"
+        const val KEY_AGENT_DISPLAY   = "agent_display"
+        const val KEY_WEEKLY_TITLE    = "weekly_title"
+        const val KEY_SESSION_TITLE   = "session_title"
+        const val KEY_PER_AGENT_USAGE = "per_agent_usage"
+        const val KEY_PER_AGENT_STATUS = "per_agent_status"
         const val KEY_CONNECTED       = "connected"
         const val KEY_CONNECTED_HOST  = "connected_host"
         const val KEY_CONNECTED_PORT  = "connected_port"
@@ -366,6 +372,12 @@ class CodelightService : LifecycleService() {
                 "conversation"        -> { storeConversation(obj); return }
             }
             val edit = getSharedPreferences(STATE_PREFS, MODE_PRIVATE).edit()
+            if (obj.has("agent_id"))      edit.putString(KEY_AGENT_ID, obj.optString("agent_id", "claude"))
+            if (obj.has("agent_display")) edit.putString(KEY_AGENT_DISPLAY, obj.optString("agent_display", "Claude"))
+            if (obj.has("weekly_title"))  edit.putString(KEY_WEEKLY_TITLE, obj.optString("weekly_title", "Claude Weekly"))
+            if (obj.has("session_title")) edit.putString(KEY_SESSION_TITLE, obj.optString("session_title", "Claude Session"))
+            if (obj.has("per_agent_usage")) edit.putString(KEY_PER_AGENT_USAGE, obj.getJSONObject("per_agent_usage").toString())
+            if (obj.has("per_agent_status")) edit.putString(KEY_PER_AGENT_STATUS, obj.getJSONObject("per_agent_status").toString())
             if (obj.has("session_pct"))   edit.putFloat(KEY_SESSION_PCT,   obj.getDouble("session_pct").toFloat())
             if (obj.has("weekly_pct"))    edit.putFloat(KEY_WEEKLY_PCT,    obj.getDouble("weekly_pct").toFloat())
             if (obj.has("session_reset")) edit.putString(KEY_SESSION_RESET, obj.getString("session_reset"))
@@ -415,9 +427,10 @@ class CodelightService : LifecycleService() {
     }
 
     private fun sendAlertNotification(status: String) {
+        val agent = currentAgentDisplayName()
         val text = when (status) {
-            "waiting" -> "Claude is waiting for your input"
-            "idle"    -> "Claude is idle — session ended"
+            "waiting" -> "$agent is waiting for your input"
+            "idle"    -> "$agent is idle — session ended"
             else      -> return
         }
         val pi = PendingIntent.getActivity(
@@ -441,6 +454,7 @@ class CodelightService : LifecycleService() {
 
     private fun onRequest(obj: JSONObject, kind: String) {
         val id = obj.optString("id")
+        val agent = obj.optString("agent_display", currentAgentDisplayName())
         val prefs = getSharedPreferences(SETTINGS_PREFS, MODE_PRIVATE)
         val enabled = if (kind == "question") prefs.getBoolean(KEY_QUESTION_PROMPTS, true)
                       else prefs.getBoolean(KEY_PERMISSION_PROMPTS, true)
@@ -473,11 +487,11 @@ class CodelightService : LifecycleService() {
             PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT)
 
         val summary = if (kind == "question")
-            obj.optJSONArray("questions")?.optJSONObject(0)?.optString("question") ?: "Claude has a question"
+            obj.optJSONArray("questions")?.optJSONObject(0)?.optString("question") ?: "$agent has a question"
         else obj.optString("summary", obj.optString("tool_name", "tool use"))
         val builder = NotificationCompat.Builder(this, PERM_CHANNEL_ID)
             .setSmallIcon(android.R.drawable.stat_sys_warning)
-            .setContentTitle(if (kind == "question") "Claude asks a question" else "Claude Code asks")
+            .setContentTitle(if (kind == "question") "$agent asks a question" else "$agent asks")
             .setContentText(summary)
             .setStyle(NotificationCompat.BigTextStyle().bigText(summary))
             .setContentIntent(pi)
@@ -496,9 +510,15 @@ class CodelightService : LifecycleService() {
     private fun storeConversation(obj: JSONObject) {
         // Mirror the companion's conversation feed to STATE_PREFS for the tab.
         val lines = obj.optJSONArray("lines") ?: JSONArray()
-        getSharedPreferences(STATE_PREFS, MODE_PRIVATE).edit()
+        val edit = getSharedPreferences(STATE_PREFS, MODE_PRIVATE).edit()
             .putString(KEY_CONVERSATION, lines.toString())
-            .apply()
+        if (obj.has("agent_id")) {
+            edit.putString(KEY_AGENT_ID, obj.optString("agent_id", "claude"))
+        }
+        if (obj.has("agent_display")) {
+            edit.putString(KEY_AGENT_DISPLAY, obj.optString("agent_display", "Claude"))
+        }
+        edit.apply()
     }
 
     private fun resolveRequest(id: String) {
@@ -597,6 +617,11 @@ class CodelightService : LifecycleService() {
                 buildServiceNotification("Searching for ${selected ?: "codelight"}…"))
         }
         pushWidgetUpdate()
+    }
+
+    private fun currentAgentDisplayName(): String {
+        return getSharedPreferences(STATE_PREFS, MODE_PRIVATE)
+            .getString(KEY_AGENT_DISPLAY, "Claude") ?: "Claude"
     }
 
     private fun pushWidgetUpdate() {

@@ -1,20 +1,27 @@
 # codelight — GNOME Shell extension
 
-A GNOME Shell extension that shows Claude Code status in the top bar.
+A GNOME Shell extension that shows the active Claude, Copilot, or Codex status
+in the top bar.
 
-<img src="../assets/gnome-extension.png" width="600" alt="codelight GNOME Shell extension">
+<img src="../assets/gnome-extension-grouped.png" width="624"
+     alt="codelight GNOME popup with grouped Claude, Copilot, and Codex status and usage">
 
-The panel indicator shows **WORKING** (orange), **WAITING** (red), or **IDLE** (green).
-Click it to see a popup with session and weekly token usage bars and the number of active
-sessions. The extension connects to the companion daemon via **D-Bus** — no network socket
-or configuration needed.
+The panel indicator shows the active agent plus **WORKING**, **WAITING**, or
+**IDLE**. Click it to see usage grouped by agent and the number of active
+sessions. Agents without detailed usage permission still appear with status
+only. The extension connects to the companion daemon via **D-Bus**.
 
 When the companion runs with `--remote-control`, the same popup also lets you
-answer Claude Code's prompts: **Allow / Deny** for a permission request, or the
+answer agent prompts: **Allow / Deny** for a permission request, or the
 options + an "Other…" free-text field for an AskUserQuestion. Whoever answers
 first (GNOME, the phone, or VSCode) wins. Turn each kind on or off in the
 extension's preferences (*Permission prompts* / *Question prompts*, both default
 on).
+
+Permission prompts can also trust the repository for narrowly safe edits or
+persist the exact command for that repository. Rules are enforced across all
+agents by the companion; see
+[Persistent folder and command approvals](../companion/README.md#persistent-folder-and-command-approvals).
 
 Requires **GNOME 45 or later** and the companion daemon from
 [companion/README.md](../companion/README.md) running on the same machine.

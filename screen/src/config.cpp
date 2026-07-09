@@ -5,7 +5,7 @@ Config cfg;
 
 void configDefaults() {
     cfg.wifiCount = 0;
-    cfg.deviceName = "claude-screen";
+    cfg.deviceName = "codelight-screen";
     cfg.companionName   = "";
     cfg.companionHost   = "";
     cfg.companionSecret = "";
@@ -36,7 +36,7 @@ bool configLoad() {
     f.close();
     if (err) { configDefaults(); return false; }
 
-    cfg.deviceName      = doc["deviceName"]      | "claude-screen";
+    cfg.deviceName      = doc["deviceName"]      | "codelight-screen";
     cfg.companionName   = doc["companionName"]   | "";
     cfg.companionHost   = doc["companionHost"]   | "";
     cfg.companionSecret = doc["companionSecret"] | "";

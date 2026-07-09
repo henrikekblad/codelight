@@ -86,6 +86,37 @@ function toHex([r, g, b]) {
     return '#' + [r, g, b].map(v => Math.round(v * 255).toString(16).padStart(2, '0')).join('');
 }
 
+function agentName(data) {
+    const raw = String(data?.agent_display ?? data?.agent_id ?? 'Claude').trim();
+    if (!raw) return 'Claude';
+    return raw.charAt(0).toUpperCase() + raw.slice(1);
+}
+
+function agentIconKey(data) {
+    const raw = String(data?.agent_id ?? '').trim().toLowerCase();
+    return raw || 'claude';
+}
+
+function normalizedStatus(status) {
+    const value = String(status || 'idle').trim().toLowerCase();
+    return value === 'inactive' ? 'idle' : value;
+}
+
+function usageLimits(usage) {
+    if (Array.isArray(usage?.limits)) return usage.limits.slice(0, 2);
+    if (!usage) return [];
+    return [
+        {
+            label: 'Weekly', pct: usage.weekly_pct,
+            reset: usage.weekly_reset,
+        },
+        {
+            label: 'Session', pct: usage.session_pct,
+            reset: usage.session_reset,
+        },
+    ];
+}
+
 // Draw a full-width rounded progress bar via Cairo
 function drawBar(area, pct, fill, bg) {
     const cr = area.get_context();
@@ -119,6 +150,7 @@ function drawBar(area, pct, fill, bg) {
 
 function makeMeterItem(label) {
     const item = new PopupMenu.PopupBaseMenuItem({ reactive: false });
+    item.set_style('padding: 2px 12px 3px;');
 
     const col = new St.BoxLayout({ vertical: true, x_expand: true });
 
@@ -144,7 +176,7 @@ function makeMeterItem(label) {
     row.add_child(pct);
     row.add_child(rst);
 
-    const bar = new St.DrawingArea({ height: 7, x_expand: true, style: 'margin-top: 5px;' });
+    const bar = new St.DrawingArea({ height: 7, x_expand: true, style: 'margin-top: 3px;' });
     bar._pct = 0;
     bar.connect('repaint', a => drawBar(a, a._pct, usageColor(a._pct), C.barBg));
 
@@ -155,6 +187,33 @@ function makeMeterItem(label) {
     item._pctLabel = pct;
     item._rstLabel = rst;
     item._bar      = bar;
+    item._label    = lbl;
+    return item;
+}
+
+function makeAgentHeader(name, separated = false) {
+    const item = new PopupMenu.PopupBaseMenuItem({ reactive: false });
+    item.set_style(separated ? 'padding: 12px 12px 3px;' : 'padding: 4px 12px 3px;');
+    const row = new St.BoxLayout({
+        x_expand: true,
+        style: 'padding-bottom: 3px; border-bottom: 1px solid #555555;',
+    });
+    const label = new St.Label({
+        text: name,
+        style: 'color: #eeeeee; font-size: 12px; font-weight: bold;',
+        x_expand: true,
+    });
+    const status = new St.Label({
+        text: 'IDLE',
+        style: 'color: #888888; font-size: 10px; font-weight: bold;',
+        x_align: Clutter.ActorAlign.END,
+        y_align: Clutter.ActorAlign.CENTER,
+    });
+    row.add_child(label);
+    row.add_child(status);
+    item.add_child(row);
+    item._nameLabel = label;
+    item._statusLabel = status;
     return item;
 }
 
@@ -167,6 +226,62 @@ function wrapLabel(text, style) {
     l.clutter_text.line_wrap_mode = Pango.WrapMode.WORD_CHAR;
     l.clutter_text.ellipsize = Pango.EllipsizeMode.NONE;
     return l;
+}
+
+function _extractPatchTarget(patchText) {
+    for (const raw of String(patchText || '').split('\n')) {
+        const line = raw.trim();
+        if (line.startsWith('*** Update File:')) return line.slice('*** Update File:'.length).trim();
+        if (line.startsWith('*** Add File:')) return line.slice('*** Add File:'.length).trim();
+        if (line.startsWith('*** Delete File:')) return line.slice('*** Delete File:'.length).trim();
+    }
+    return '';
+}
+
+function _formatPermissionBody(req) {
+    const tool = String(req?.tool_name || req?.toolName || 'tool use').trim() || 'tool use';
+    const summary = String(req?.summary || '').trim();
+    const ti = (req && typeof req.tool_input === 'object' && req.tool_input) ? req.tool_input : null;
+
+    if (ti) {
+        const plan = String(ti.plan || '').trim();
+        if (plan) return plan;
+
+        const command = String(ti.command || '').trim();
+        if (command) return command;
+
+        const filePath = String(ti.file_path || ti.filePath || '').trim();
+        if (filePath) return filePath;
+
+        if (tool === 'apply_patch') {
+            const explanation = String(ti.explanation || '').trim();
+            const target = _extractPatchTarget(ti.input || '');
+            const parts = [];
+            if (explanation) parts.push(explanation);
+            if (target) parts.push(`target=${target}`);
+            if (parts.length) return parts.join('\n');
+        }
+
+        if (tool === 'run_in_terminal') {
+            const goal = String(ti.goal || '').trim();
+            const explanation = String(ti.explanation || '').trim();
+            if (goal || explanation) return [goal, explanation].filter(Boolean).join('\n');
+        }
+    }
+
+    // Try to strip "Tool: ..." prefix and pretty-print JSON-ish payloads.
+    let detail = summary;
+    const m = summary.match(/^[^:]{1,80}:\s*(.*)$/);
+    if (m && m[1]) detail = m[1].trim();
+
+    const looksJson = (detail.startsWith('{') && detail.endsWith('}')) ||
+                      (detail.startsWith('[') && detail.endsWith(']'));
+    if (looksJson) {
+        try { return JSON.stringify(JSON.parse(detail), null, 2); }
+        catch (_) {}
+    }
+
+    return detail || tool;
 }
 
 export default class CodelightExtension extends Extension {
@@ -220,15 +335,28 @@ export default class CodelightExtension extends Extension {
         hdrItem.add_child(hdrBox);
         this._indicator.menu.addMenuItem(hdrItem);
 
-        // Meter rows
-        this._weeklyItem  = makeMeterItem('Weekly');
-        this._sessionItem = makeMeterItem('Session');
-        this._indicator.menu.addMenuItem(this._weeklyItem);
-        this._indicator.menu.addMenuItem(this._sessionItem);
+        // Meter rows. Keep both desktop agents visible; compact clients can
+        // continue using the active-agent compatibility fields.
+        this._usageItems = {};
+        for (const [index, [agent, display]] of
+            [['claude', 'Claude'], ['copilot', 'Copilot'], ['codex', 'Codex']].entries()) {
+            const header = makeAgentHeader(display, index > 0);
+            const weekly = makeMeterItem('Weekly');
+            const session = makeMeterItem('Session');
+            const meters = [weekly, session];
+            this._usageItems[agent] = {header, weekly, session, meters};
+            this._indicator.menu.addMenuItem(header);
+            this._indicator.menu.addMenuItem(weekly);
+            this._indicator.menu.addMenuItem(session);
+        }
 
         // Status/limits rows — hidden while a request is being answered so the
         // popup shows only the question/permission.
-        this._statusItems = [hdrItem, this._weeklyItem, this._sessionItem];
+        this._statusItems = [
+            hdrItem,
+            ...Object.values(this._usageItems)
+                .flatMap(items => [items.header, items.weekly, items.session]),
+        ];
 
         // Question section (populated when Claude asks; empty otherwise)
         this._qSection = new PopupMenu.PopupMenuSection();
@@ -381,7 +509,7 @@ export default class CodelightExtension extends Extension {
 
         const head = new PopupMenu.PopupBaseMenuItem({ reactive: false });
         head.add_child(new St.Label({
-            text: 'Claude asks', style: 'font-weight: bold; color: #eeeeee;' }));
+            text: `${agentName(req)} asks`, style: 'font-weight: bold; color: #eeeeee;' }));
         this._qSection.addMenuItem(head);
 
         if (req.kind === 'permission')
@@ -415,7 +543,12 @@ export default class CodelightExtension extends Extension {
     _buildPermission(req) {
         const item = new PopupMenu.PopupBaseMenuItem({ reactive: false });
         const box  = new St.BoxLayout({ vertical: true, x_expand: true, style: 'spacing: 8px; width: 380px;' });
-        box.add_child(wrapLabel(req.summary || req.tool_name || 'tool use',
+        const canAllowFolder = req?.allow_folder_available !== false;
+        const canAllowCommand = req?.allow_command_available === true;
+        const tool = String(req.tool_name || req.toolName || 'tool use');
+        const body = _formatPermissionBody(req);
+        box.add_child(wrapLabel(`Allow ${tool}?`, 'font-size: 12px; color: #bbbbbb;'));
+        box.add_child(wrapLabel(body,
             'font-family: monospace; font-size: 11px; color: #c8c8c8;'));
 
         const row = new St.BoxLayout({ x_expand: true, style: 'spacing: 8px; padding-top: 4px;' });
@@ -426,6 +559,41 @@ export default class CodelightExtension extends Extension {
         row.add_child(allow);
         row.add_child(deny);
         box.add_child(row);
+
+        if (canAllowFolder) {
+            box.add_child(wrapLabel(
+                'Trusting this folder auto-allows read-only inspection and safe, non-delete patches inside it.',
+                'font-size: 11px; color: #ffb74d;'
+            ));
+
+            const trustRow = new St.BoxLayout({ x_expand: true, style: 'padding-top: 2px;' });
+            const allowFolder = new St.Button({
+                x_expand: true,
+                style: 'padding: 6px; border-radius: 6px; background-color: #2f6f9f; color: #fff;',
+                child: new St.Label({ text: 'Allow + Trust Folder for Safe Edits' }),
+            });
+            allowFolder.connect('clicked', () => this._finishRequest({ decision: 'allow_folder' }));
+            trustRow.add_child(allowFolder);
+            box.add_child(trustRow);
+        }
+
+        if (canAllowCommand) {
+            box.add_child(wrapLabel(
+                'Allow this exact command automatically in this repository in future sessions and agents.',
+                'font-size: 11px; color: #ffb74d;'
+            ));
+            const commandRow = new St.BoxLayout({ x_expand: true, style: 'padding-top: 2px;' });
+            const allowCommand = new St.Button({
+                x_expand: true,
+                style: 'padding: 6px; border-radius: 6px; background-color: #2f6f9f; color: #fff;',
+                child: new St.Label({ text: 'Allow + Always Allow Exact Command Here' }),
+            });
+            allowCommand.connect('clicked',
+                () => this._finishRequest({ decision: 'allow_command' }));
+            commandRow.add_child(allowCommand);
+            box.add_child(commandRow);
+        }
+
         item.add_child(box);
         this._qSection.addMenuItem(item);
     }
@@ -555,29 +723,67 @@ export default class CodelightExtension extends Extension {
     }
 
     _handleMessage(data) {
-        let status = data?.status ?? 'offline';
-        if (status === 'inactive') status = 'idle';   // companions < 1.0.9
+        // Don't update meters while a permission/question request is active.
+        // Meter updates can visually leak into/behind the request popup.
+        const hasActiveRequest = this._reqActiveId !== null;
+
+        const status = normalizedStatus(data?.status ?? 'offline');
         const color    = C[status] ?? C.offline;
         const hex      = toHex(color);
         const sessions = data?.sessions ?? 0;
-        const label    = status.toUpperCase();
+        const activeName = agentName(data);
 
         // statuses without an icon of their own fall back to the offline icon
-        this._panelIcon.gicon = Gio.icon_new_for_string(
-            `${this.path}/icons/claude-${C[status] ? status : 'offline'}.svg`);
+        const agent = agentIconKey(data);
+        const iconStatus = C[status] ? status : 'offline';
+        const preferred = `${this.path}/icons/${agent}-${iconStatus}.svg`;
+        const fallback = `${this.path}/icons/claude-${iconStatus}.svg`;
+        const iconPath = GLib.file_test(preferred, GLib.FileTest.EXISTS) ? preferred : fallback;
+        this._panelIcon.gicon = Gio.icon_new_for_string(iconPath);
 
         this._hdrDot.set_style(`color: ${hex};`);
         this._hdrDot.set_text('●');
-        this._hdrStatus.set_text(label);
-        this._hdrSessions.set_text(
-            sessions === 1 ? '1 session' : `${sessions} sessions`
-        );
+        this._hdrStatus.set_text(`${activeName} ${status.toUpperCase()}`);
+        this._hdrSessions.set_text(sessions === 1 ? '1 session' : `${sessions} sessions`);
 
-        this._setMeter(this._weeklyItem,  data?.weekly_pct,  data?.weekly_reset);
-        this._setMeter(this._sessionItem, data?.session_pct, data?.session_reset);
+        if (!hasActiveRequest) {
+            const perAgent = data?.per_agent_usage;
+            const perAgentStatus = data?.per_agent_status;
+            if (perAgent && typeof perAgent === 'object') {
+                for (const [agentId, items] of Object.entries(this._usageItems)) {
+                    const usage = perAgent[agentId];
+                    const hasStatus = perAgentStatus && Object.hasOwn(perAgentStatus, agentId);
+                    const display = usage?.agent_display ??
+                        agentId.charAt(0).toUpperCase() + agentId.slice(1);
+                    items.header.visible = !!usage || !!hasStatus;
+                    items.header._nameLabel.set_text(display);
+                    items.header._statusLabel.set_text(
+                        normalizedStatus(perAgentStatus?.[agentId]).toUpperCase());
+                    const limits = usageLimits(usage);
+                    items.meters.forEach((meter, index) => {
+                        const limit = limits[index];
+                        meter.visible = !!limit;
+                        if (limit)
+                            this._setMeter(meter, limit.pct, limit.reset, limit.label);
+                    });
+                }
+            } else {
+                const items = this._usageItems[agent] ?? this._usageItems.claude;
+                for (const [agentId, candidate] of Object.entries(this._usageItems)) {
+                    candidate.header.visible = agentId === agent;
+                    candidate.weekly.visible = agentId === agent;
+                    candidate.session.visible = agentId === agent;
+                }
+                items.header._nameLabel.set_text(activeName);
+                items.header._statusLabel.set_text(status.toUpperCase());
+                this._setMeter(items.weekly, data?.weekly_pct, data?.weekly_reset, 'Weekly');
+                this._setMeter(items.session, data?.session_pct, data?.session_reset, 'Session');
+            }
+        }
     }
 
-    _setMeter(item, pct, reset) {
+    _setMeter(item, pct, reset, title = null) {
+        if (title) item._label.set_text(`${title} — `);
         item._pctLabel.set_text(`${Math.round((pct ?? 0) * 100)}%`);
         item._rstLabel.set_text(`↻ ${reset || '--'}`);
         item._bar._pct = pct ?? 0;
@@ -591,8 +797,14 @@ export default class CodelightExtension extends Extension {
         this._hdrDot.set_text('●');
         this._hdrStatus.set_text('OFFLINE');
         this._hdrSessions.set_text('daemon offline');
-        this._setMeter(this._weeklyItem,  null, null);
-        this._setMeter(this._sessionItem, null, null);
+        for (const [agent, items] of Object.entries(this._usageItems)) {
+            items.header.visible = agent === 'claude';
+            items.weekly.visible = false;
+            items.session.visible = false;
+            items.header._statusLabel.set_text('OFFLINE');
+            this._setMeter(items.weekly, null, null);
+            this._setMeter(items.session, null, null);
+        }
     }
 
     disable() {

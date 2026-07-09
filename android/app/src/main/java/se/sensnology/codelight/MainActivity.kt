@@ -68,6 +68,7 @@ class MainActivity : ComponentActivity() {
 }
 
 private enum class Tab(val key: String, val title: String) {
+    STATUS("status", "Status"),
     CONVERSATION("conversation", "Conversation"),
     REQUEST("request", "Request"),
     SETTINGS("settings", "Settings"),
@@ -98,7 +99,7 @@ private fun MainScreen(initialTab: String?) {
                 Tab.REQUEST.key      -> Tab.REQUEST
                 Tab.CONVERSATION.key -> Tab.CONVERSATION
                 Tab.SETTINGS.key     -> Tab.SETTINGS
-                else -> Tab.SETTINGS
+                else -> Tab.STATUS
             }
         )
     }
@@ -110,11 +111,12 @@ private fun MainScreen(initialTab: String?) {
 
     val visibleTabs = if (remoteControl) {
         buildList {
+            add(Tab.STATUS)
             add(Tab.CONVERSATION)
             if (hasRequest) add(Tab.REQUEST)
             add(Tab.SETTINGS)
         }
-    } else listOf(Tab.SETTINGS)
+    } else listOf(Tab.STATUS, Tab.SETTINGS)
 
     // Never leave the selection on a tab that is no longer visible.
     if (current !in visibleTabs) current = visibleTabs.first()
@@ -153,6 +155,7 @@ private fun MainScreen(initialTab: String?) {
     ) { inner ->
         Box(Modifier.fillMaxSize().padding(inner).background(Palette.bg)) {
             when (current) {
+                Tab.STATUS       -> StatusScreen()
                 Tab.CONVERSATION -> ConversationScreen()
                 Tab.REQUEST      -> RequestScreen(null) { /* stay in the tab after answering */ }
                 Tab.SETTINGS     -> SettingsScreen(onClose = null)

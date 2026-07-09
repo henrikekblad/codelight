@@ -1,12 +1,28 @@
 # codelight — Android app
 
-A home-screen widget that shows weekly and session token usage bars plus the
-current Claude Code status, updated instantly via WebSocket. When the companion
+A home-screen widget and app that show grouped Claude, Copilot, and Codex status
+and available usage limits, updated instantly via WebSocket. The widget adapts
+to its size: compact layouts show the latest agent, while taller or wider
+layouts show more agent groups. When the companion
 runs with `--remote-control`, the app also becomes a small **control surface**:
-approve permission prompts, answer Claude's questions, and follow the live
+approve permission prompts, answer agent questions, and follow the live
 conversation — all from your phone.
 
-<img src="../assets/android.jpg" width="360" alt="codelight Android widget">
+<table>
+<tr>
+<td><img src="../assets/android-widget-compact.jpg" width="260"
+         alt="Compact codelight Android widget showing the latest agent"></td>
+<td><img src="../assets/android-widget-expanded.jpg" width="260"
+         alt="Expanded codelight Android widget showing multiple agents"></td>
+<td><img src="../assets/android-status.jpg" width="260"
+         alt="codelight Android grouped agent Status tab"></td>
+</tr>
+<tr>
+<td align="center">Compact widget</td>
+<td align="center">Expanded widget</td>
+<td align="center">Status tab</td>
+</tr>
+</table>
 
 ## Setup
 
@@ -34,12 +50,13 @@ The widget connects automatically and stays updated in the background.
 
 ## Remote control
 
-When the companion runs with `--remote-control` (and you've set the matching
-password), the app opens onto a bottom tab bar:
+The app uses a bottom tab bar:
 
+- **Status** — grouped agent state and every usage window exposed by the
+  companion, including optional company Copilot monthly credits.
 - **Conversation** — the last N lines of the active session (configurable),
-  with tool calls and output; read-only.
-- **Request** — appears when Claude is waiting on you: **Allow / Deny** for a
+  with tool calls and output from Claude, Copilot, or Codex; read-only.
+- **Request** — appears when an agent is waiting on you: **Allow / Deny** for a
   permission, or the options + an "Other…" free-text field for an
   AskUserQuestion. Whoever answers first (phone, GNOME, or VSCode) wins.
 - **Settings** — everything below.
@@ -50,7 +67,23 @@ prompt arrives — this needs the "draw over other apps" permission, which the
 app will prompt for. Toggle **Permission prompts** / **Question prompts** to
 choose which kinds you want to handle on the phone.
 
-Without `--remote-control` the app is just the Settings screen (and the widget).
+Permission requests can also trust a repository for narrowly safe edits or
+persist the exact requested command for that repository. These choices are
+shared across agents; see the companion's
+[permission policy](../companion/README.md#persistent-folder-and-command-approvals).
+
+Without `--remote-control`, Status, Settings, and the widget remain available;
+Conversation and Request require the companion features that feed them.
+
+<table>
+<tr>
+<td><img src="../assets/android-conversation.jpg" width="300"
+         alt="codelight Android read-only conversation with tool activity"></td>
+<td><img src="../assets/android-permission.jpg" width="300"
+         alt="codelight Android permission review and persistent policy actions"></td>
+</tr>
+<tr><td align="center">Conversation following</td><td align="center">Permission review</td></tr>
+</table>
 
 ## Hiding the persistent notification
 

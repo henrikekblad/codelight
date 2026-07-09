@@ -3,7 +3,7 @@
 #include <ESP8266WebServer.h>
 #include <Updater.h>
 
-static const char* AP_SSID = "claude-screen-setup";
+static const char* AP_SSID = "codelight-screen-setup";
 static ESP8266WebServer server(80);
 
 static const char INDEX_HTML[] PROGMEM = R"(

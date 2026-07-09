@@ -72,8 +72,8 @@ jobs:
       - name: Build and package extension
         working-directory: vscode-extension
         run: |
-          npm install
-          npx vsce package --out codelight-${{ github.ref_name }}.vsix
+          npm ci
+          npx vsce package --no-dependencies --out codelight-${{ github.ref_name }}.vsix
 
       - name: Upload to release
         uses: softprops/action-gh-release@v2
@@ -128,8 +128,8 @@ jobs:
             | `codelight-${{ github.ref_name }}.bin` | ESP8266 firmware for GeekMagic Ultra |
             | `codelight-${{ github.ref_name }}.bin.gz` | Same firmware, gzipped for legacy stock firmware OTA |
             | `codelight-bootstrap-${{ github.ref_name }}.bin` | Bootstrap image for KR_SDP two-step install |
-            | `codelight-${{ github.ref_name }}.apk` | Android home-screen widget |
-            | `codelight-${{ github.ref_name }}.vsix` | VSCode extension (status bar + remote permission approval) |
+            | `codelight-${{ github.ref_name }}.apk` | Android app + adaptive multi-agent widget |
+            | `codelight-${{ github.ref_name }}.vsix` | VS Code extension (status, usage, questions, and permission review) |
 
             See the [README](https://github.com/${{ github.repository }}/blob/main/README.md) for full setup instructions.
 

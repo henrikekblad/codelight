@@ -15,6 +15,10 @@ struct DisplayData {
     float    sessionPct;      // 0.0–1.0
     String   weeklyReset;     // e.g. "3d 1h"
     String   sessionReset;    // e.g. "2h 15m"
+    String   weeklyTitle;     // e.g. "Claude Weekly"
+    String   sessionTitle;    // e.g. "Claude Session"
+    String   agentDisplay;    // e.g. "Claude"
+    String   agentId;         // e.g. "claude"
     int      sessions;
     ClaudeStatus status;
     bool     connected;       // companion reachable
