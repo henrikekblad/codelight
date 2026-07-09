@@ -148,7 +148,19 @@ mode and shows setup instructions on screen:
 8. Click **Save & apply**. The device reboots, connects to your network, and
    discovers the companion automatically via mDNS (or directly if a host is set).
 
+<img src="../assets/screen-settings.png" width="520" alt="codelight screen web configuration UI">
+
 Config is stored in LittleFS and survives firmware OTA updates.
+
+## Screensaver
+
+The optional low-brightness screensaver starts after 10 minutes without a
+companion connection or after one hour of idle status. Both triggers can be
+enabled independently in the web UI. The agent logos and clock drift around the
+display to avoid static pixels; new working or waiting activity wakes the
+dashboard automatically.
+
+<img src="../assets/screen-screensaver.jpg" width="600" alt="GeekMagic Ultra showing the animated codelight screensaver">
 
 ## How it connects
 
