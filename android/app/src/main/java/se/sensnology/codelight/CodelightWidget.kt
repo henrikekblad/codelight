@@ -87,7 +87,7 @@ class CodelightWidget : GlanceAppWidget() {
             else                -> Color(0xFF00C800)
         }
         val statusLabel = when {
-            !connected          -> "OFF"
+            !connected          -> "OFFLINE"
             else -> "$agentDisplay ${status.uppercase()}"
         }
         val statusTextColor = if (!connected) Color(0xFF555555) else Color.Black
