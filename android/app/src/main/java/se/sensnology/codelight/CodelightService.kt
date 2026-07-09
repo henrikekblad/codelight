@@ -52,8 +52,6 @@ class CodelightService : LifecycleService() {
         const val KEY_STATUS          = "status"
         const val KEY_AGENT_ID        = "agent_id"
         const val KEY_AGENT_DISPLAY   = "agent_display"
-        const val KEY_WEEKLY_TITLE    = "weekly_title"
-        const val KEY_SESSION_TITLE   = "session_title"
         const val KEY_PER_AGENT_USAGE = "per_agent_usage"
         const val KEY_PER_AGENT_STATUS = "per_agent_status"
         const val KEY_CONNECTED       = "connected"
@@ -374,8 +372,6 @@ class CodelightService : LifecycleService() {
             val edit = getSharedPreferences(STATE_PREFS, MODE_PRIVATE).edit()
             if (obj.has("agent_id"))      edit.putString(KEY_AGENT_ID, obj.optString("agent_id", "claude"))
             if (obj.has("agent_display")) edit.putString(KEY_AGENT_DISPLAY, obj.optString("agent_display", "Claude"))
-            if (obj.has("weekly_title"))  edit.putString(KEY_WEEKLY_TITLE, obj.optString("weekly_title", "Claude Weekly"))
-            if (obj.has("session_title")) edit.putString(KEY_SESSION_TITLE, obj.optString("session_title", "Claude Session"))
             if (obj.has("per_agent_usage")) edit.putString(KEY_PER_AGENT_USAGE, obj.getJSONObject("per_agent_usage").toString())
             if (obj.has("per_agent_status")) edit.putString(KEY_PER_AGENT_STATUS, obj.getJSONObject("per_agent_status").toString())
             if (obj.has("session_pct"))   edit.putFloat(KEY_SESSION_PCT,   obj.getDouble("session_pct").toFloat())

@@ -205,14 +205,9 @@ class PermissionPolicyTests(unittest.TestCase):
         self.repo = os.path.join(self.tmp.name, "repo")
         os.makedirs(os.path.join(self.repo, ".git"))
         self.policy_patch = mock.patch.object(codelight, "POLICY_PATH", self.policy)
-        self.vscode_patch = mock.patch.object(
-            codelight, "VSCODE_SETTINGS_CANDIDATES",
-            [os.path.join(self.tmp.name, "missing-settings.json")])
         self.policy_patch.start()
-        self.vscode_patch.start()
 
     def tearDown(self):
-        self.vscode_patch.stop()
         self.policy_patch.stop()
         self.tmp.cleanup()
 

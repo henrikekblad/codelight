@@ -59,13 +59,6 @@ CODEX_HOME        = os.path.expanduser(os.environ.get("CODEX_HOME", "~/.codex"))
 CODELIGHT_CONFIG_HOME = os.path.expanduser(
     os.environ.get("CODELIGHT_CONFIG_HOME", "~/.config/codelight"))
 POLICY_PATH       = os.path.join(CODELIGHT_CONFIG_HOME, "policy.json")
-VSCODE_SETTINGS_CANDIDATES = [
-    "~/.config/Code/User/settings.json",
-    "~/.config/Code - OSS/User/settings.json",
-    "~/.config/Code - Insiders/User/settings.json",
-    "~/.config/VSCodium/User/settings.json",
-    "~/.config/Cursor/User/settings.json",
-]
 USAGE_INTERVAL      = 60   # seconds between usage API polls
 IDLE_WINDOW         = 600  # seconds before a silent "working" session is dropped
 IDLE_WINDOW_WAITING = 30   # seconds before a "waiting" session is dropped (subagents resolve quickly)
@@ -1065,11 +1058,6 @@ def _permission_waiter(entry: dict) -> None:
         "policy_kind": (persistence or {}).get("kind", ""),
         "policy_value": (persistence or {}).get("value", ""),
         "policy_persisted": bool((persistence or {}).get("persisted")),
-        "trusted_folder": ((persistence or {}).get("value", "")
-                           if (persistence or {}).get("kind") == "folder" else ""),
-        "trusted_folder_persisted": bool(
-            (persistence or {}).get("persisted")
-            and (persistence or {}).get("kind") == "folder"),
     }, "PermissionResolved")
     _push()
 
@@ -1628,48 +1616,6 @@ def _norm_path(path: str) -> str:
         return ""
 
 
-def _vscode_settings_paths() -> list[str]:
-    paths = [_norm_path(p) for p in VSCODE_SETTINGS_CANDIDATES]
-    existing = [p for p in paths if p and os.path.isfile(p)]
-    return existing if existing else [p for p in paths if p]
-
-
-def _load_vscode_settings(settings_path: str) -> dict:
-    try:
-        with open(settings_path) as f:
-            data = json.load(f)
-        return data if isinstance(data, dict) else {}
-    except Exception:
-        return {}
-
-
-def _legacy_vscode_trusted_folders() -> list[str]:
-    """Read old codelight trust entries without ever rewriting VS Code JSONC."""
-    out: list[str] = []
-    seen: set[str] = set()
-    for settings_path in _vscode_settings_paths():
-        settings = _load_vscode_settings(settings_path)
-        raw = settings.get("security.workspace.trust.allowedFolders", [])
-        if not isinstance(raw, list):
-            continue
-        for item in raw:
-            if not isinstance(item, str):
-                continue
-            s = item.strip()
-            if not s:
-                continue
-            if s.startswith("file://"):
-                try:
-                    s = urllib.parse.unquote(urllib.parse.urlparse(s).path or "")
-                except Exception:
-                    continue
-            p = _norm_path(s)
-            if p and p not in seen:
-                seen.add(p)
-                out.append(p)
-    return out
-
-
 def _load_policy() -> dict:
     try:
         with open(POLICY_PATH) as stream:
@@ -1706,15 +1652,12 @@ def _write_policy(policy: dict) -> bool:
 
 
 def _trusted_folders() -> list[str]:
-    """Return codelight policy roots plus read-only legacy VS Code roots."""
+    """Return normalized trusted roots from codelight's policy."""
     out: list[str] = []
     seen: set[str] = set()
     policy = _load_policy()
     raw = policy.get("trusted_folders", [])
     candidates = raw if isinstance(raw, list) else []
-    # Compatibility only: folders trusted by older codelight releases remain
-    # effective, but all new decisions are stored in policy.json.
-    candidates = [*candidates, *_legacy_vscode_trusted_folders()]
     for item in candidates:
         if not isinstance(item, str):
             continue
@@ -1765,7 +1708,7 @@ def _allow_folder(cwd: str) -> tuple[bool, str]:
         raw = policy.get("trusted_folders", [])
         allowed = [_norm_path(x) for x in raw if isinstance(x, str)] \
             if isinstance(raw, list) else []
-        for existing in [*allowed, *_legacy_vscode_trusted_folders()]:
+        for existing in allowed:
             if existing and _path_is_within(folder, existing):
                 return True, existing
         policy["trusted_folders"] = [*filter(None, allowed), folder]
@@ -2085,7 +2028,7 @@ def run_permission_hook(wait_secs: int, copilot_mode: bool = False,
         return
 
     # Trusted-folder short-circuit: only allow explicit trust/read-only probes
-    # under allowedFolders. Mutating tools must still ask for approval.
+    # under codelight policy roots. Mutating tools must still ask for approval.
     if _is_trusted_repo_cwd(cwd) and _is_trusted_auto_allow_tool(tool_name):
         _emit_permission_decision(
             "allow", copilot_mode, vscode_prettool_mode,
@@ -3335,10 +3278,6 @@ def main():
     parser.add_argument("--permission-timeout", type=int, default=60,
                         help="Seconds to wait for a remote decision/answer before "
                              "falling back to the agent's built-in prompt (default: 60)")
-    parser.add_argument("--copilot-hooks", action="store_true",
-                        help=argparse.SUPPRESS)
-    parser.add_argument("--codex-hooks", action="store_true",
-                        help=argparse.SUPPRESS)
     parser.add_argument("--agents", default=None, help=argparse.SUPPRESS)
     parser.add_argument("--vscode", action="store_true",
                         help="With --install: also install the codelight VSCode "
@@ -3418,11 +3357,6 @@ def main():
 
     enabled_agents = (_parse_agent_set(args.agents)
                       if args.agents is not None else detect_installed_agents())
-    # Hidden legacy flags keep an existing unit alive until the next --install.
-    if args.copilot_hooks:
-        enabled_agents.add("copilot")
-    if args.codex_hooks:
-        enabled_agents.add("codex")
     print("[agents] enabled: " + (", ".join(sorted(enabled_agents)) or "none"),
           flush=True)
 

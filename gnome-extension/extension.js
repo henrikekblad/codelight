@@ -104,17 +104,7 @@ function normalizedStatus(status) {
 
 function usageLimits(usage) {
     if (Array.isArray(usage?.limits)) return usage.limits.slice(0, 2);
-    if (!usage) return [];
-    return [
-        {
-            label: 'Weekly', pct: usage.weekly_pct,
-            reset: usage.weekly_reset,
-        },
-        {
-            label: 'Session', pct: usage.session_pct,
-            reset: usage.session_reset,
-        },
-    ];
+    return [];
 }
 
 // Draw a full-width rounded progress bar via Cairo

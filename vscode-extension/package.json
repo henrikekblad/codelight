@@ -2,7 +2,7 @@
   "name": "codelight",
   "displayName": "codelight",
   "description": "Claude, Copilot, and Codex status in the VS Code status bar",
-  "version": "1.3.0",
+  "version": "1.3.1",
   "publisher": "sensnology",
   "license": "MIT",
   "repository": {

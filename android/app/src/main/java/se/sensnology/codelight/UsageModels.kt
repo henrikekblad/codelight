@@ -48,13 +48,10 @@ internal fun loadAgentUsage(prefs: SharedPreferences, now: Long): List<AgentUsag
                         resetAt,
                     ))
                 }
-            } else if (value != null) {
-                addLegacyLimit(this, value, "Weekly", "weekly", now)
-                addLegacyLimit(this, value, "Session", "session", now)
             } else if (id == activeId && !prefs.contains(CodelightService.KEY_PER_AGENT_USAGE)) {
                 add(UsageLimit(
                     "Weekly",
-                    legacyPct(prefs, CodelightService.KEY_WEEKLY_PCT,
+                    topLevelPct(prefs, CodelightService.KEY_WEEKLY_PCT,
                         CodelightService.KEY_WEEKLY_RESET_AT, now),
                     countdown(prefs.getLong(CodelightService.KEY_WEEKLY_RESET_AT, 0), now)
                         ?: prefs.getString(CodelightService.KEY_WEEKLY_RESET, "--") ?: "--",
@@ -62,7 +59,7 @@ internal fun loadAgentUsage(prefs: SharedPreferences, now: Long): List<AgentUsag
                 ))
                 add(UsageLimit(
                     "Session",
-                    legacyPct(prefs, CodelightService.KEY_SESSION_PCT,
+                    topLevelPct(prefs, CodelightService.KEY_SESSION_PCT,
                         CodelightService.KEY_SESSION_RESET_AT, now),
                     countdown(prefs.getLong(CodelightService.KEY_SESSION_RESET_AT, 0), now)
                         ?: prefs.getString(CodelightService.KEY_SESSION_RESET, "--") ?: "--",
@@ -83,7 +80,7 @@ internal fun loadAgentUsage(prefs: SharedPreferences, now: Long): List<AgentUsag
     }
 }
 
-private fun legacyPct(
+private fun topLevelPct(
     prefs: SharedPreferences,
     pctKey: String,
     resetKey: String,
@@ -91,23 +88,6 @@ private fun legacyPct(
 ): Float {
     val resetAt = prefs.getLong(resetKey, 0)
     return if (resetAt in 1 until now) 0f else prefs.getFloat(pctKey, 0f)
-}
-
-private fun addLegacyLimit(
-    target: MutableList<UsageLimit>,
-    value: JSONObject,
-    label: String,
-    prefix: String,
-    now: Long,
-) {
-    val resetAt = value.optLong("${prefix}_reset_at", 0)
-    target.add(UsageLimit(
-        label,
-        if (resetAt in 1 until now) 0f
-        else value.optDouble("${prefix}_pct", 0.0).toFloat(),
-        countdown(resetAt, now) ?: value.optString("${prefix}_reset", "--"),
-        resetAt,
-    ))
 }
 
 internal fun countdown(resetAt: Long, now: Long): String? {

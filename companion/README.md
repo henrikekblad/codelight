@@ -194,9 +194,8 @@ happens in the common codelight hook path. They live in:
 ~/.config/codelight/policy.json
 ```
 
-Edit that file to review or revoke rules. Older releases wrote folder trust to
-VS Code's `security.workspace.trust.allowedFolders`; those entries remain
-readable for compatibility, but codelight no longer modifies VS Code settings.
+Edit that file to review or revoke rules. Codelight does not read or modify VS
+Code workspace-trust settings; its execution policy is intentionally separate.
 The policy file is removed by `--uninstall`.
 
 ## Multiple companions on the same network

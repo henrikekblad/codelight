@@ -35,7 +35,10 @@ function availableUsage(p: any): Array<[string, any]> {
     return [[String(p?.agent_id ?? 'claude'), p]];
 }
 
-function usageLimits(value: any): Array<{label: string; pct: number; reset: string}> {
+function usageLimits(
+    value: any,
+    allowTopLevel = false,
+): Array<{label: string; pct: number; reset: string}> {
     if (Array.isArray(value?.limits)) {
         return value.limits.map((limit: any) => ({
             label: String(limit?.label ?? 'Limit'),
@@ -43,7 +46,7 @@ function usageLimits(value: any): Array<{label: string; pct: number; reset: stri
             reset: String(limit?.reset ?? '--'),
         }));
     }
-    if (!value) { return []; }
+    if (!value || !allowTopLevel) { return []; }
     return [
         { label: 'Weekly', pct: value.weekly_pct ?? 0, reset: value.weekly_reset ?? '--' },
         { label: 'Session', pct: value.session_pct ?? 0, reset: value.session_reset ?? '--' },
@@ -67,7 +70,7 @@ function applyStatus(p: any): void {
             (id === p?.agent_id ? status : 'idle')).toUpperCase();
         return [
             `${index ? '\n' : ''}${name} — ${agentStatus}`,
-            ...usageLimits(value).map(limit =>
+            ...usageLimits(value, !p?.per_agent_usage).map(limit =>
                 `  ${limit.label} ${Math.round(limit.pct * 100)}% ` +
                 `(resets ${limit.reset})`),
         ];
