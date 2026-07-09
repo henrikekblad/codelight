@@ -19,10 +19,19 @@ static bool          wsConnected      = false;
 static bool          wsBegun          = false;
 static bool          wsAuthFailed     = false;
 static unsigned long wsLastDiscoverMs = 0;
+static IPAddress     wsLastEndpointIp;
+static uint16_t      wsLastEndpointPort = 8765;
+static bool          wsHaveLastEndpoint = false;
 #define WS_DISCOVER_MS 15000UL
+#define WS_SLEEP_DISCOVER_MS 60000UL
+#define WS_MDNS_TIMEOUT_MS 2000
+#define WS_SLEEP_MDNS_TIMEOUT_MS 1000
+#define WS_RECONNECT_MS 15000UL
+#define WS_SLEEP_CONNECT_WINDOW_MS 5000UL
 
 static unsigned long lastClockMs = 0;
 static bool          displayReady = false;
+static unsigned long wsSleepProbeUntilMs = 0;
 
 // Sleep screen triggers (both individually configurable on the config page)
 static unsigned long lastCompanionMs = 0;   // last time a companion connection was up
@@ -58,6 +67,8 @@ static void applyStatus(uint8_t* payload, size_t length) {
     if (deserializeJson(doc, payload, length)) return;
 
     ClaudeStatus prevStatus = displayData.status;
+    bool wasConnected = displayData.connected;
+    bool wasSleeping = displayReady && displaySleeping();
 
     displayData.weeklyPct    = doc["weekly_pct"]   | 0.0f;
     displayData.sessionPct   = doc["session_pct"]  | 0.0f;
@@ -87,9 +98,12 @@ static void applyStatus(uint8_t* payload, size_t length) {
     if (displayData.status != STATUS_INACTIVE) lastActiveMs = millis();
 
     if (displayReady) {
-        // Only a status *change* to working/waiting wakes the sleep screen;
-        // rebroadcasts of an unchanged status (usage polls, hook events) don't
-        if (displayData.status != STATUS_INACTIVE && displayData.status != prevStatus)
+        // Wake when a disconnected screen receives its first status after
+        // reconnect ("person comes home"), even if the status is idle. For an
+        // already-connected sleeping screen, only working/waiting status
+        // changes wake it; routine usage polls stay quiet.
+        if ((wasSleeping && !wasConnected)
+            || (displayData.status != STATUS_INACTIVE && displayData.status != prevStatus))
             displayWake();
         displayUpdate();
     }
@@ -108,6 +122,7 @@ static void wsEvent(WStype_t type, uint8_t* payload, size_t length) {
                 wsBegun = false;
                 wsLastDiscoverMs = millis();  // reset timer; retry after WS_DISCOVER_MS
             }
+            wsSleepProbeUntilMs = 0;
             displayData.connected = false;
             displayData.authFailed = wsAuthFailed;
             if (wsAuthFailed) {
@@ -121,6 +136,7 @@ static void wsEvent(WStype_t type, uint8_t* payload, size_t length) {
             dbgLog(F("[ws] connected"));
             wsConnected = true;
             wsAuthFailed = false;
+            wsSleepProbeUntilMs = 0;
             displayData.authFailed = false;
             lastActiveMs = millis();
             if (displayReady) displayWake();
@@ -283,20 +299,40 @@ static void sanitiseMdnsName(const String& name, String& out) {
     if (out.length() == 0) out = "codelight-screen";
 }
 
-static void tryDiscover() {
+static void beginWs(IPAddress ip, uint16_t port, const String& label) {
+    dbgLog("[ws] connecting to " + label + " at " + ip.toString() + ":" + String(port));
+    wsClient.begin(ip, port, "/");
+    wsClient.onEvent(wsEvent);
+    wsClient.setReconnectInterval(WS_RECONNECT_MS);
+    wsClient.enableHeartbeat(15000, 3000, 2);
+    wsBegun = true;
+}
+
+static void beginWsHost(const String& host) {
+    dbgLog("[ws] direct connect to " + host);
+    wsClient.begin(host, 8765, "/");
+    wsClient.onEvent(wsEvent);
+    wsClient.setReconnectInterval(WS_RECONNECT_MS);
+    wsClient.enableHeartbeat(15000, 3000, 2);
+    wsBegun = true;
+}
+
+static bool tryLastEndpoint() {
+    if (!wsHaveLastEndpoint || wsAuthFailed) return false;
+    beginWs(wsLastEndpointIp, wsLastEndpointPort, "last-known companion");
+    return true;
+}
+
+static void tryDiscover(uint16_t mdnsTimeoutMs = WS_MDNS_TIMEOUT_MS) {
     if (wsAuthFailed) return;
 
     if (cfg.companionHost.length() > 0) {
-        dbgLog("[ws] direct connect to " + cfg.companionHost);
-        wsClient.begin(cfg.companionHost, 8765, "/");
-        wsClient.onEvent(wsEvent);
-        wsClient.enableHeartbeat(15000, 3000, 2);
-        wsBegun = true;
+        beginWsHost(cfg.companionHost);
         return;
     }
 
-    dbgLog(F("[ws] querying mDNS _codelight._tcp (2s timeout)..."));
-    int n = MDNS.queryService("codelight", "tcp", 2000);
+    dbgLog("[ws] querying mDNS _codelight._tcp (" + String(mdnsTimeoutMs) + "ms timeout)...");
+    int n = MDNS.queryService("codelight", "tcp", mdnsTimeoutMs);
     dbgLog("[ws] mDNS query returned n=" + String(n));
     if (n <= 0) {
         dbgLog(F("[ws] not found, will retry"));
@@ -328,11 +364,10 @@ static void tryDiscover() {
 
     IPAddress ip   = MDNS.IP(idx);
     uint16_t  port = MDNS.port(idx);
-    dbgLog("[ws] connecting to " + MDNS.hostname(idx) + " at " + ip.toString() + ":" + String(port));
-    wsClient.begin(ip, port, "/");
-    wsClient.onEvent(wsEvent);
-    wsClient.enableHeartbeat(15000, 3000, 2);
-    wsBegun = true;
+    wsLastEndpointIp = ip;
+    wsLastEndpointPort = port;
+    wsHaveLastEndpoint = true;
+    beginWs(ip, port, MDNS.hostname(idx));
 }
 
 void setup() {
@@ -444,11 +479,40 @@ void loop() {
 
     if (WiFi.status() == WL_CONNECTED) {
         // Re-discover companion via mDNS when not yet connected
-        if (!wsAuthFailed && !wsBegun && (now - wsLastDiscoverMs >= WS_DISCOVER_MS)) {
+        bool sleepProbe = false;
+        unsigned long discoverInterval = displaySleeping() ? WS_SLEEP_DISCOVER_MS : WS_DISCOVER_MS;
+        if (!wsAuthFailed && !wsBegun && (now - wsLastDiscoverMs >= discoverInterval)) {
             wsLastDiscoverMs = now;
-            tryDiscover();
+            if (displaySleeping() && tryLastEndpoint()) {
+                // mDNS can miss a freshly restarted companion. During sleep,
+                // first try the last endpoint that was known to work; if it no
+                // longer answers, the bounded probe window below resets state
+                // and the next interval can discover again.
+            } else {
+                tryDiscover(displaySleeping() ? WS_SLEEP_MDNS_TIMEOUT_MS : WS_MDNS_TIMEOUT_MS);
+            }
+            sleepProbe = displaySleeping();
+            if (sleepProbe && wsBegun)
+                wsSleepProbeUntilMs = now + WS_SLEEP_CONNECT_WINDOW_MS;
         }
-        wsClient.loop();
+        // WebSocketsClient reconnect attempts are synchronous on ESP8266. When
+        // the companion is offline a failed TCP connect can block for several
+        // seconds; if this runs during the sleep animation the screen appears
+        // frozen. While asleep and disconnected, let the lightweight discovery
+        // timer above decide when to try again. After a sleep discovery/direct-
+        // host probe, allow a short handshake window so a found companion can
+        // finish TCP + WebSocket setup and deliver the status that wakes us.
+        bool sleepConnectWindow = displaySleeping()
+            && wsBegun && !wsConnected
+            && wsSleepProbeUntilMs != 0
+            && now < wsSleepProbeUntilMs;
+        if (!displaySleeping() || wsConnected || sleepProbe || sleepConnectWindow)
+            wsClient.loop();
+        else if (displaySleeping() && wsBegun && !wsConnected && wsSleepProbeUntilMs != 0) {
+            wsBegun = false;
+            wsSleepProbeUntilMs = 0;
+            dbgLog(F("[ws] sleep probe timed out, will retry"));
+        }
     }
 
     yield();
