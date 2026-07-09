@@ -22,7 +22,7 @@ DisplayData displayData = {
 #define COL_RED      0xF840   // #FF2200
 #define COL_OFFLINE  0x4208   // dim grey
 #define COL_LOGO     0xDB8A   // #DE7356 Claude terracotta
-#define COL_COPILOT  0x051F   // #007FFF
+#define COL_COPILOT  0x03FF   // #007FFF
 #define COL_CODEX    0xFFFF   // white
 
 // Linearly interpolate between two RGB565 colours (t in 0..1).
@@ -263,113 +263,16 @@ static String usageColorHex(float pct) {
     return "#ff2200";
 }
 
-static void svgText(String& s, int x, int y, const char* fill, int sz,
-                    const char* anchor, const String& text) {
-    s += "<text x='"; s += x; s += "' y='"; s += y;
-    s += "' fill='"; s += fill;
-    s += "' font-family='monospace' font-size='"; s += sz; s += "'";
-    if (anchor) { s += " text-anchor='"; s += anchor; s += "'"; }
-    s += '>'; s += text; s += "</text>";
-}
-
-static void svgMeter(String& s, int labelY, const char* label, float pct,
-                     const String& resetStr) {
-    int barY  = labelY + H_LABEL + 2;
-    int barW  = 240 - X_MARGIN * 2 - 30;
-    int filled = constrain((int)(pct * barW), 0, barW);
-
-    svgText(s, X_MARGIN,      labelY + 13, "#c0c0c0", 13, nullptr,  label);
-    svgText(s, 234,           labelY + 13, "#808080", 13, "end",     resetStr);
-
-    s += "<rect x='"; s += X_MARGIN; s += "' y='"; s += barY;
-    s += "' width='"; s += barW;     s += "' height='"; s += H_BAR; s += "' fill='#202020'/>";
-
-    if (filled > 0) {
-        s += "<rect x='"; s += X_MARGIN; s += "' y='"; s += barY;
-        s += "' width='"; s += filled; s += "' height='"; s += H_BAR;
-        s += "' fill='"; s += usageColorHex(pct); s += "'/>";
-    }
-
-    char buf[6]; snprintf(buf, sizeof(buf), "%d%%", (int)(pct * 100));
-    svgText(s, 234, barY + 14, "#ffffff", 13, "end", buf);
-}
-
-static void appendSleepSvg(String& s);   // defined with the sleep-screen state below
-
 static uint16_t logoColorForAgent(const char* agentId) {
     if (strcmp(agentId, "copilot") == 0) return COL_COPILOT;
     if (strcmp(agentId, "codex") == 0) return COL_CODEX;
     return COL_LOGO;
 }
 
-static const __FlashStringHelper* logoPathForAgent(const char* agentId) {
-    if (strcmp(agentId, "copilot") == 0) return FPSTR(COPILOT_LOGO_PATH);
-    if (strcmp(agentId, "codex") == 0) return FPSTR(CODEX_LOGO_PATH);
-    return FPSTR(LOGO_PATH);
-}
-
 static const uint8_t* logoBitsForAgent(const char* agentId) {
     if (strcmp(agentId, "copilot") == 0) return COPILOT_LOGO_BITS;
     if (strcmp(agentId, "codex") == 0) return CODEX_LOGO_BITS;
     return LOGO_BITS;
-}
-
-String generateScreenSvg() {
-    String s;
-    s.reserve(1500);
-
-    s  = "<svg xmlns='http://www.w3.org/2000/svg' width='240' height='240'>";
-    s += "<rect width='240' height='240' fill='#000'/>";
-
-    if (displaySleeping()) {
-        appendSleepSvg(s);
-        s += "</svg>";
-        return s;
-    }
-
-    // Title + clock
-    svgText(s, X_MARGIN, Y_TITLE + 13, "#ffffff", 13, nullptr, "codelight");
-    time_t now = time(nullptr);
-    struct tm* tm_ = localtime(&now);
-    char clk[10];
-    snprintf(clk, sizeof(clk), "%02d:%02d:%02d", tm_->tm_hour, tm_->tm_min, tm_->tm_sec);
-    svgText(s, 234, Y_TITLE + 13, "#ffffff", 13, "end", clk);
-
-    // Meter bars
-    svgMeter(s, Y_WMETER, "Weekly",  displayData.weeklyPct,  displayData.weeklyReset);
-    svgMeter(s, Y_SMETER, "Session", displayData.sessionPct, displayData.sessionReset);
-
-    // Session count
-    char sbuf[24];
-    snprintf(sbuf, sizeof(sbuf), "%d session%s active",
-             displayData.sessions, displayData.sessions == 1 ? "" : "s");
-    svgText(s, X_MARGIN, Y_SESSIONS + 13, "#c0c0c0", 13, nullptr, sbuf);
-
-    // Divider
-    s += "<line x1='0' y1='"; s += Y_DIVIDER;
-    s += "' x2='240' y2='"; s += Y_DIVIDER; s += "' stroke='#202020'/>";
-
-    // Status box
-    const char* sc; const char* sl;
-    if (displayData.authFailed) {
-        sc = "#ff2200"; sl = "AUTH FAIL";
-    } else if (!displayData.connected) {
-        sc = "#404040"; sl = "OFFLINE";
-    } else switch (displayData.status) {
-        case STATUS_WORKING:  sc = "#ff8c00"; sl = "WORKING";  break;
-        case STATUS_WAITING:  sc = "#ff2200"; sl = "WAITING";  break;
-        case STATUS_INACTIVE: sc = "#00c800"; sl = "IDLE";     break;
-        default:              sc = "#404040"; sl = "OFFLINE";  break;
-    }
-    s += "<rect x='0' y='"; s += Y_BOX;
-    s += "' width='240' height='"; s += BOX_SIZE;
-    s += "' fill='"; s += sc; s += "'/>";
-    s += "<text x='120' y='"; s += (Y_BOX + BOX_SIZE/2 + 8);
-    s += "' fill='#000' font-family='sans-serif' font-size='20' font-weight='bold'"
-         " text-anchor='middle'>"; s += sl; s += "</text>";
-
-    s += "</svg>";
-    return s;
 }
 
 void displayUpdateClock() {
@@ -408,23 +311,20 @@ void displayUpdateClock() {
 #define CLOCK_COLLIDE_INSET_X 2 // trim font-side padding from clock box
 #define CLOCK_COLLIDE_INSET_Y 2
 
-static TFT_eSprite claudeLogoSpr(&tft);
-static TFT_eSprite copilotLogoSpr(&tft);
-static TFT_eSprite codexLogoSpr(&tft);
+static TFT_eSprite logoSpr(&tft);   // reused per logo on each frame
 static TFT_eSprite clkSpr(&tft);
 static bool sleeping   = false;
 static bool sleepAnim  = false;   // sprites allocated, animation running
 struct SleepLogoState {
     const char* id;
-    TFT_eSprite* spr;
     float fx, fy, vx, vy;
     int x, y;
     int prevX, prevY;
 };
 static SleepLogoState sleepLogos[3] = {
-    {"claude",  &claudeLogoSpr,  0, 0, 0, 0, 0, 0, 0, 0},
-    {"copilot", &copilotLogoSpr, 0, 0, 0, 0, 0, 0, 0, 0},
-    {"codex",   &codexLogoSpr,   0, 0, 0, 0, 0, 0, 0, 0},
+    {"claude",  0, 0, 0, 0, 0, 0, 0, 0},
+    {"copilot", 0, 0, 0, 0, 0, 0, 0, 0},
+    {"codex",   0, 0, 0, 0, 0, 0, 0, 0},
 };
 static int  cx, cy;               // clock integer draw position (also for SVG preview)
 static float cfx, cfy, cvx, cvy;  // clock exact position / velocity
@@ -626,21 +526,14 @@ void displaySleepStart() {
     cx = (int)cfx;
     cy = (int)cfy;
 
-    // Keep logos in direct-color sprites so each one retains its own tint.
-    // 1-bit palette sprites can end up sharing effective bitmap colors.
-    claudeLogoSpr.setColorDepth(8);
-    copilotLogoSpr.setColorDepth(8);
-    codexLogoSpr.setColorDepth(8);
+    // 8-bit depth so each logo can render with its own tint via drawBitmap color.
+    logoSpr.setColorDepth(8);
     clkSpr.setColorDepth(1);
-    sleepAnim = claudeLogoSpr.createSprite(LOGO_W + 2 * SLEEP_STEP, LOGO_H + 2 * SLEEP_STEP) != nullptr
-             && copilotLogoSpr.createSprite(LOGO_W + 2 * SLEEP_STEP, LOGO_H + 2 * SLEEP_STEP) != nullptr
-             && codexLogoSpr.createSprite(LOGO_W + 2 * SLEEP_STEP, LOGO_H + 2 * SLEEP_STEP) != nullptr
+    sleepAnim = logoSpr.createSprite(LOGO_W + 2 * SLEEP_STEP, LOGO_H + 2 * SLEEP_STEP) != nullptr
              && clkSpr.createSprite(clkW + 2 * SLEEP_STEP, clkH + 2 * SLEEP_STEP) != nullptr;
 
     if (!sleepAnim) {   // heap too tight for sprites: static fallback
-        claudeLogoSpr.deleteSprite();
-        copilotLogoSpr.deleteSprite();
-        codexLogoSpr.deleteSprite();
+        logoSpr.deleteSprite();
         clkSpr.deleteSprite();
         for (int i = 0; i < 3; i++) {
             tft.drawBitmap(sleepLogos[i].x, sleepLogos[i].y,
@@ -648,15 +541,6 @@ void displaySleepStart() {
                            logoColorForAgent(sleepLogos[i].id));
         }
         return;
-    }
-
-    // Logo pixels never change while sleeping. Render each sprite once so the
-    // 25 fps hot path only moves prebuilt buffers and performs no allocation.
-    for (int i = 0; i < 3; i++) {
-        sleepLogos[i].spr->fillSprite(0);
-        sleepLogos[i].spr->drawBitmap(
-            SLEEP_STEP, SLEEP_STEP, logoBitsForAgent(sleepLogos[i].id),
-            LOGO_W, LOGO_H, logoColorForAgent(sleepLogos[i].id));
     }
 
     clkSpr.setBitmapColor(COL_GREEN, COL_BG);
@@ -766,10 +650,11 @@ void displaySleepTick(unsigned long now) {
         int rectW = LOGO_W + 2 * SLEEP_STEP;
         int rectH = LOGO_H + 2 * SLEEP_STEP;
 
+        logoSpr.fillSprite(0);
+        logoSpr.drawBitmap(SLEEP_STEP, SLEEP_STEP, logoBitsForAgent(sleepLogos[i].id),
+                           LOGO_W, LOGO_H, logoColorForAgent(sleepLogos[i].id));
         sleepClearOldDelta(oldRectX, oldRectY, newRectX, newRectY, rectW, rectH, COL_BG);
-
-        sleepLogos[i].spr->pushSprite(sleepLogos[i].x - SLEEP_STEP,
-                                      sleepLogos[i].y - SLEEP_STEP);
+        logoSpr.pushSprite(sleepLogos[i].x - SLEEP_STEP, sleepLogos[i].y - SLEEP_STEP);
     }
 
     renderSleepClock();
@@ -786,49 +671,12 @@ void displaySleepTick(unsigned long now) {
     clkSpr.pushSprite(cx - SLEEP_STEP, cy - SLEEP_STEP);
 }
 
-static void appendSleepSvg(String& s) {
-    s.reserve(s.length() + 1400);
-    for (int i = 0; i < 3; i++) {
-        const char* aid = sleepLogos[i].id;
-        const char* fill = "#DE7356";
-        float scale = 0.96f;
-        int dy = 0;
-        if (strcmp(aid, "copilot") == 0) {
-            fill = "#007FFF";
-            scale = 0.1875f;
-            dy = 4;
-        } else if (strcmp(aid, "codex") == 0) {
-            fill = "#FFFFFF";
-            scale = 0.1846f;
-        }
-        s += "<path transform='translate(";
-        s += sleepLogos[i].x;
-        s += ",";
-        s += (sleepLogos[i].y + dy);
-        s += ") scale(";
-        s += String(scale, 4);
-        s += ")' fill='";
-        s += fill;
-        s += "' d='";
-        s += logoPathForAgent(aid);
-        s += "'/>";
-    }
-
-    time_t now = time(nullptr);
-    struct tm* t = localtime(&now);
-    char buf[8];
-    snprintf(buf, sizeof(buf), "%02d:%02d", t->tm_hour, t->tm_min);
-    svgText(s, cx + (clkW / 2), cy + clkH - 6, "#00c800", 39, "middle", buf);
-}
-
 void displayWake() {
     if (!sleeping) return;
     sleeping = false;
 
     if (sleepAnim) {
-        claudeLogoSpr.deleteSprite();
-        copilotLogoSpr.deleteSprite();
-        codexLogoSpr.deleteSprite();
+        logoSpr.deleteSprite();
         clkSpr.deleteSprite();
         sleepAnim = false;
     }

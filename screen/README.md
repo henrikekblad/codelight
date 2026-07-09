@@ -178,8 +178,7 @@ companion on every new connection so the clock always shows the correct local ti
 
 Every device running the custom firmware exposes a live debug log at
 `http://<device>.local/debug`. It shows timestamped internal events (WiFi,
-WebSocket, incoming status) and includes a live screenshot of the current display
-state in the top-right corner, updated every second.
+WebSocket, incoming status).
 
 ## Multiple screens or companions on one network
 

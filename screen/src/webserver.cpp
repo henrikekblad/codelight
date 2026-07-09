@@ -194,15 +194,13 @@ h1{font-size:.85rem;color:#58a6ff;margin-bottom:8px;flex-shrink:0}
 #slp:hover{background:#30363d}
 #log{flex:1;overflow-y:auto;font-size:.78rem;line-height:1.5;white-space:pre-wrap;word-break:break-all}
 .err{color:#f85149}
-#screen{position:fixed;top:8px;right:8px;width:160px;height:160px;border:1px solid #30363d;border-radius:4px;background:#000}
 </style>
 </head>
 <body>
 <h1>codelight debug &mdash; <span id="st">connecting&hellip;</span><button id="slp">sleep</button></h1>
-<img id="screen" src="/screendump" alt="screen">
 <div id="log"></div>
 <script>
-let seq=0,el=document.getElementById('log'),st=document.getElementById('st'),sc=document.getElementById('screen');
+let seq=0,el=document.getElementById('log'),st=document.getElementById('st');
 let slp=document.getElementById('slp');
 slp.onclick=()=>fetch('/api/debug/sleep',{method:'POST'})
   .then(r=>r.text()).then(t=>{slp.textContent=t==='sleeping'?'wake':'sleep';});
@@ -221,7 +219,6 @@ function poll(){
         seq=d.seq;
         if(atBottom)el.scrollTop=el.scrollHeight;
       }
-      sc.src='/screendump?t='+Date.now();
     })
     .catch(()=>{st.textContent='disconnected';st.className='err';})
     .finally(()=>setTimeout(poll,1000));
@@ -378,10 +375,6 @@ void webserverInit(AsyncWebServer& server) {
             dbgLog(F("[debug] sleep triggered"));
             req->send(200, "text/plain", displaySleeping() ? "sleeping" : "no display");
         }
-    });
-
-    server.on("/screendump", HTTP_GET, [](AsyncWebServerRequest* req) {
-            req->send(200, "image/svg+xml", generateScreenSvg());
     });
 
     // Firmware updates live on the synchronous :81 server (see syncota.h);
