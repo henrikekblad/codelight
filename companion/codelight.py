@@ -316,7 +316,10 @@ def _copilot_events_path_for_session(session_id: str) -> str:
     sid = str(session_id or "").strip()
     if not sid:
         return ""
-    p = os.path.join(COPILOT_HOME, "session-state", sid, "events.jsonl")
+    base = os.path.realpath(os.path.join(COPILOT_HOME, "session-state"))
+    p = os.path.realpath(os.path.join(base, sid, "events.jsonl"))
+    if not p.startswith(base + os.sep):
+        return ""
     return p if os.path.isfile(p) else ""
 
 
@@ -347,12 +350,14 @@ def _codex_rollout_path_for_session(session_id: str) -> str:
     if not sid or sid == "unknown":
         return ""
     try:
-        base = os.path.join(CODEX_HOME, "sessions")
+        base = os.path.realpath(os.path.join(CODEX_HOME, "sessions"))
         suffix = f"-{sid}.jsonl"
         for root, _, files in os.walk(base):
             for name in files:
                 if name.endswith(suffix):
-                    return os.path.join(root, name)
+                    candidate = os.path.realpath(os.path.join(root, name))
+                    if candidate.startswith(base + os.sep):
+                        return candidate
     except Exception:
         pass
     return ""
@@ -699,51 +704,56 @@ def _overall_status() -> tuple[int, str, dict[str, str], str]:
 def _status_snapshot() -> dict:
     sessions, status, per_agent_status, last_agent = _overall_status()
 
+    with _lock:
+        usage_snap   = dict(_usage_cache)
+        codex_snap   = dict(_codex_usage_cache)
+        copilot_snap = dict(_copilot_usage_cache)
+
     # Pick which agent's limits drive the top-level meter fields read by the
     # ESP screen (weekly_pct / session_pct).  Copilot only has a monthly limit
     # so we map it to the weekly slot and leave session blank.
-    if last_agent == "copilot" and _copilot_usage_cache:
+    if last_agent == "copilot" and copilot_snap:
         meter_agent = "copilot"
         usage = {
-            "weekly_pct":      _copilot_usage_cache.get("monthly_pct", 0.0),
-            "weekly_reset":    _copilot_usage_cache.get("monthly_reset", "--"),
-            "weekly_reset_at": _copilot_usage_cache.get("monthly_reset_at", 0),
+            "weekly_pct":      copilot_snap.get("monthly_pct", 0.0),
+            "weekly_reset":    copilot_snap.get("monthly_reset", "--"),
+            "weekly_reset_at": copilot_snap.get("monthly_reset_at", 0),
             "session_pct":     0.0,
             "session_reset":   "--",
             "session_reset_at": 0,
         }
         weekly_title  = "Copilot Monthly"
         session_title = ""
-    elif last_agent == "codex" and _codex_usage_cache:
+    elif last_agent == "codex" and codex_snap:
         meter_agent = "codex"
-        usage = _codex_usage_cache
+        usage = codex_snap
         weekly_title, session_title = _agent_meter_titles(meter_agent)
     else:
         meter_agent = DEFAULT_AGENT_ID
-        usage = _usage_cache
+        usage = usage_snap
         weekly_title, session_title = _agent_meter_titles(meter_agent)
     per_agent_usage = {
         "claude": {
-            **_usage_cache,
+            **usage_snap,
             "agent_display": _agent_display_name("claude"),
             "limits": [
-                _usage_limit("Weekly", _usage_cache, "weekly"),
-                _usage_limit("Session", _usage_cache, "session"),
+                _usage_limit("Weekly", usage_snap, "weekly"),
+                _usage_limit("Session", usage_snap, "session"),
             ],
         },
     }
-    if _codex_usage_cache:
+    if codex_snap:
         per_agent_usage["codex"] = {
-            **_codex_usage_cache,
+            **codex_snap,
             "agent_display": _agent_display_name("codex"),
             "limits": [
-                _usage_limit("Weekly", _codex_usage_cache, "weekly"),
-                _usage_limit("Session", _codex_usage_cache, "session"),
+                _usage_limit("Weekly", codex_snap, "weekly"),
+                _usage_limit("Session", codex_snap, "session"),
             ],
         }
-    if _copilot_usage_cache:
+    if copilot_snap:
         per_agent_usage["copilot"] = {
-            **_copilot_usage_cache,
+            **copilot_snap,
             "agent_display": _agent_display_name("copilot"),
         }
     return {
@@ -1476,19 +1486,23 @@ def install_copilot_hooks(script_path: str, remote_permissions: bool = False,
             "UserPromptSubmit": [
                 {"type": "command", "command": f"{cmd_base} working"},
             ],
-            "PreToolUse": [
-                {"type": "command", "command": f"{cmd_base} working"},
-                {
-                    "type": "command",
-                    "command": f"{cmd_base} permission-vscode --permission-timeout {permission_timeout}",
-                    "timeoutSec": HOOK_WAIT_CEILING + 15,
-                },
-                {
-                    "type": "command",
-                    "command": f"{cmd_base} question-vscode --permission-timeout {permission_timeout}",
-                    "timeoutSec": HOOK_WAIT_CEILING + 15,
-                },
-            ],
+            "PreToolUse": (
+                [
+                    {"type": "command", "command": f"{cmd_base} working"},
+                    {
+                        "type": "command",
+                        "command": f"{cmd_base} permission-vscode --permission-timeout {permission_timeout}",
+                        "timeoutSec": HOOK_WAIT_CEILING + 15,
+                    },
+                    {
+                        "type": "command",
+                        "command": f"{cmd_base} question-vscode --permission-timeout {permission_timeout}",
+                        "timeoutSec": HOOK_WAIT_CEILING + 15,
+                    },
+                ] if remote_permissions else [
+                    {"type": "command", "command": f"{cmd_base} working"},
+                ]
+            ),
             "PostToolUse": [
                 {"type": "command", "command": f"{cmd_base} working"},
             ],
@@ -1511,6 +1525,14 @@ def install_copilot_hooks(script_path: str, remote_permissions: bool = False,
         },
     }
 
+    try:
+        with open(hooks_path) as _f:
+            existing = json.load(_f)
+    except Exception:
+        existing = {}
+    if existing == doc:
+        print(f"[copilot-hooks] already up to date in {hooks_path}", flush=True)
+        return
     _write_json_object(hooks_path, doc)
     print(f"[copilot-hooks] installed in {hooks_path}", flush=True)
 
@@ -2383,15 +2405,21 @@ def get_copilot_usage(org: str | None = None, token: str | None = None,
         billing = _github_api(
             f"organizations/{urllib.parse.quote(org)}/settings/billing/"
             f"ai_credit/usage?{query}", token)
+    except urllib.error.HTTPError as e:
+        vprint(f"[copilot-usage] billing unavailable for {org}: HTTP {e.code}")
+        return None
+    except Exception as e:
+        vprint(f"[copilot-usage] billing request failed: {e}")
+        return None
+    try:
         subscription = _github_api(
             f"orgs/{urllib.parse.quote(org)}/copilot/billing", token)
     except urllib.error.HTTPError as e:
-        # 403 is expected for ordinary users who can run Copilot but cannot
-        # inspect company billing; 404/503 also mean "no detailed limit".
-        vprint(f"[copilot-usage] unavailable for {org}: HTTP {e.code}")
+        # 403 is expected for ordinary users who can access Copilot but not org billing
+        vprint(f"[copilot-usage] subscription unavailable for {org}: HTTP {e.code}")
         return None
     except Exception as e:
-        vprint(f"[copilot-usage] request failed: {e}")
+        vprint(f"[copilot-usage] subscription request failed: {e}")
         return None
 
     try:
@@ -2900,14 +2928,18 @@ def _usage_thread() -> None:
             codex_fresh = None
             copilot_fresh = None
 
+        with _lock:
+            if fresh is not None:
+                _usage_cache.update(fresh)
+            if codex_fresh is not None:
+                _codex_usage_cache.update(codex_fresh)
+            else:
+                _codex_usage_cache.clear()
+            if copilot_fresh is not None:
+                _copilot_usage_cache.update(copilot_fresh)
+            else:
+                _copilot_usage_cache.clear()
         if fresh is not None or codex_fresh is not None or copilot_fresh is not None:
-            with _lock:
-                if fresh is not None:
-                    _usage_cache.update(fresh)
-                if codex_fresh is not None:
-                    _codex_usage_cache.update(codex_fresh)
-                if copilot_fresh is not None:
-                    _copilot_usage_cache.update(copilot_fresh)
             parts = []
             if fresh is not None:
                 parts.append(f"Claude {fresh['session_pct']:.0%}/{fresh['weekly_pct']:.0%}")
@@ -2919,7 +2951,7 @@ def _usage_thread() -> None:
                 parts.append(f"Copilot {copilot_fresh['monthly_pct']:.0%}")
             _log("[usage] " + "  ".join(parts))
         else:
-            _log("[usage] no data – keeping cached values")
+            _log("[usage] no data from any agent")
 
         _push()
         _shutdown.wait(USAGE_INTERVAL)
