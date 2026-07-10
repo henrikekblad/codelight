@@ -2,6 +2,12 @@
 #include <Arduino.h>
 #include <TFT_eSPI.h>
 
+// Agent logos arrive over the wire (config message) as 48x48 1-bit bitmaps.
+#define LOGO_W 48
+#define LOGO_H 48
+#define LOGO_BYTES (LOGO_W * LOGO_H / 8)
+#define MAX_AGENT_LOGOS 6
+
 enum ClaudeStatus {
     STATUS_INACTIVE = 0,
     STATUS_WORKING  = 1,
@@ -32,7 +38,11 @@ void displayInit();
 void displayUpdate();          // full redraw
 void displayUpdateClock();     // clock-only partial update (called every second)
 
-// Sleep screen: bouncing logo shown after prolonged disconnection.
+// Wire-delivered agent logos, used by the sleep screen.
+void displayClearAgentLogos();
+bool displayAddAgentLogo(uint16_t color565, const uint8_t* bits /*LOGO_BYTES*/);
+
+// Sleep screen: clock + a random selection of agent logos bouncing around.
 void displaySleepStart();
 void displaySleepTick(unsigned long now);  // call every loop(); paces itself
 void displayWake();                        // exit sleep + full redraw

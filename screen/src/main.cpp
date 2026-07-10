@@ -5,6 +5,7 @@
 #include <WebSocketsClient.h>
 #include <ArduinoJson.h>
 #include <Crypto.h>
+#include <libb64/cdecode.h>
 #include <time.h>
 #include "config.h"
 #include "display.h"
@@ -18,6 +19,7 @@ static String mdnsName;
 static bool          wsConnected      = false;
 static bool          wsBegun          = false;
 static bool          wsAuthFailed     = false;
+static bool          wsHelloSent      = false;
 static unsigned long wsLastDiscoverMs = 0;
 static IPAddress     wsLastEndpointIp;
 static uint16_t      wsLastEndpointPort = 8765;
@@ -62,6 +64,53 @@ static String hmacHex(const String& secret, const String& nonce) {
     return hex;
 }
 
+// Identify as a screen so the companion sends the screen config variant
+// (bitmap logos instead of SVGs). The config message is its reply.
+static void sendHello() {
+    if (wsHelloSent) return;
+    wsClient.sendTXT("{\"type\":\"subscribe\",\"client\":\"screen\"}");
+    wsHelloSent = true;
+}
+
+// #rrggbb → RGB565.
+static uint16_t parseColor565(const char* hex) {
+    if (!hex || hex[0] != '#' || strlen(hex) != 7) return 0xFFFF;
+    long v = strtol(hex + 1, nullptr, 16);
+    uint8_t r = (v >> 16) & 0xFF, g = (v >> 8) & 0xFF, b = v & 0xFF;
+    return ((r & 0xF8) << 8) | ((g & 0xFC) << 3) | (b >> 3);
+}
+
+// Base64 → exactly LOGO_BYTES, else reject.
+static bool decodeLogoBitmap(const char* b64, uint8_t* out) {
+    if (!b64 || !*b64) return false;
+    char decoded[LOGO_BYTES + 4];
+    base64_decodestate state;
+    base64_init_decodestate(&state);
+    int n = base64_decode_block(b64, strlen(b64), decoded, &state);
+    if (n != LOGO_BYTES) return false;
+    memcpy(out, decoded, LOGO_BYTES);
+    return true;
+}
+
+static void applyConfig(JsonDocument& doc) {
+    if (doc["utc_offset"].is<long>()) {
+        long off = doc["utc_offset"].as<long>();
+        configTime(off, 0L, ntpServer);
+        dbgLog("[ws] utc_offset=" + String(off) + "s");
+    }
+    JsonObjectConst agents = doc["agents"];
+    if (agents.isNull()) return;
+    displayClearAgentLogos();
+    uint8_t bits[LOGO_BYTES];
+    int added = 0;
+    for (JsonPairConst kv : agents) {
+        JsonObjectConst meta = kv.value();
+        if (!decodeLogoBitmap(meta["logo_bitmap"] | "", bits)) continue;
+        if (displayAddAgentLogo(parseColor565(meta["color"] | ""), bits)) added++;
+    }
+    dbgLog("[ws] config: " + String(added) + " agent logos");
+}
+
 static void applyStatus(uint8_t* payload, size_t length) {
     JsonDocument doc;
     if (deserializeJson(doc, payload, length)) return;
@@ -75,13 +124,11 @@ static void applyStatus(uint8_t* payload, size_t length) {
     displayData.weeklyReset  = doc["weekly_reset"].as<String>();
     displayData.sessionReset = doc["session_reset"].as<String>();
     displayData.agentId      = doc["agent_id"].as<String>();
-    if (displayData.agentId.length() == 0) displayData.agentId = "claude";
     displayData.agentDisplay = doc["agent_display"].as<String>();
-    if (displayData.agentDisplay.length() == 0) displayData.agentDisplay = "Claude";
+    // Empty titles mean the server has no limit info for this agent (e.g.
+    // Copilot without billing data) — the bars are hidden, not synthesized.
     displayData.weeklyTitle  = doc["weekly_title"].as<String>();
-    if (displayData.weeklyTitle.length() == 0) displayData.weeklyTitle = displayData.agentDisplay + " Weekly";
     displayData.sessionTitle = doc["session_title"].as<String>();
-    if (displayData.sessionTitle.length() == 0) displayData.sessionTitle = displayData.agentDisplay + " Session";
     displayData.sessions     = doc["sessions"]     | 0;
     displayData.connected    = true;
     displayData.authFailed   = false;
@@ -112,6 +159,7 @@ static void applyStatus(uint8_t* payload, size_t length) {
 static void wsEvent(WStype_t type, uint8_t* payload, size_t length) {
     switch (type) {
         case WStype_DISCONNECTED:
+            wsHelloSent = false;
             if (!wsConnected && !wsAuthFailed) break;  // suppress library retry spam
             wsConnected = false;
             if (wsAuthFailed) {
@@ -136,6 +184,7 @@ static void wsEvent(WStype_t type, uint8_t* payload, size_t length) {
             dbgLog(F("[ws] connected"));
             wsConnected = true;
             wsAuthFailed = false;
+            wsHelloSent = false;
             wsSleepProbeUntilMs = 0;
             displayData.authFailed = false;
             lastActiveMs = millis();
@@ -158,8 +207,8 @@ static void wsEvent(WStype_t type, uint8_t* payload, size_t length) {
                     displayData.sessionPct = 0.0f;
                     displayData.weeklyReset = "--";
                     displayData.sessionReset = "--";
-                    displayData.weeklyTitle = "Weekly";
-                    displayData.sessionTitle = "Session";
+                    displayData.weeklyTitle = "";
+                    displayData.sessionTitle = "";
                     displayData.agentDisplay = "";
                     displayData.agentId = "";
                     displayData.sessions = 0;
@@ -176,16 +225,17 @@ static void wsEvent(WStype_t type, uint8_t* payload, size_t length) {
                         String proof = hmacHex(cfg.companionSecret, nonce);
                         String reply = "{\"auth_hmac\":\"" + proof + "\"}";
                         wsClient.sendTXT(reply);
+                        sendHello();
                     }
                     break;
                 }
 
+                // Any non-challenge frame means the auth phase is over; an
+                // unsecured daemon sends no challenge, so say hello here.
+                sendHello();
+
                 if (strcmp(doc["type"] | "", "config") == 0) {
-                    if (doc["utc_offset"].is<long>()) {
-                        long off = doc["utc_offset"].as<long>();
-                        configTime(off, 0L, ntpServer);
-                        dbgLog("[ws] utc_offset=" + String(off) + "s");
-                    }
+                    applyConfig(doc);
                     break;
                 }
 

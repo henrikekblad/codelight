@@ -1,14 +1,31 @@
 #include "display.h"
-#include "logo.h"
 
 TFT_eSPI tft = TFT_eSPI();
 DisplayData displayData = {
     0, 0,
     "--", "--",
-    "Claude Weekly", "Claude Session",
-    "Claude", "claude",
+    "", "",
+    "", "",
     0, STATUS_OFFLINE, false, false
 };
+
+// Agent logos + brand colors received in the companion's config message.
+struct AgentLogo {
+    uint16_t color;
+    uint8_t  bits[LOGO_BYTES];
+};
+static AgentLogo agentLogos[MAX_AGENT_LOGOS];
+static uint8_t   agentLogoCount = 0;
+
+void displayClearAgentLogos() { agentLogoCount = 0; }
+
+bool displayAddAgentLogo(uint16_t color565, const uint8_t* bits) {
+    if (agentLogoCount >= MAX_AGENT_LOGOS) return false;
+    agentLogos[agentLogoCount].color = color565;
+    memcpy(agentLogos[agentLogoCount].bits, bits, LOGO_BYTES);
+    agentLogoCount++;
+    return true;
+}
 
 // Palette
 #define COL_BG       TFT_BLACK
@@ -21,9 +38,6 @@ DisplayData displayData = {
 #define COL_ORANGE   0xFC40   // #FF8C00
 #define COL_RED      0xF840   // #FF2200
 #define COL_OFFLINE  0x4208   // dim grey
-#define COL_LOGO     0xDB8A   // #DE7356 Claude terracotta
-#define COL_COPILOT  0x03FF   // #007FFF
-#define COL_CODEX    0xFFFF   // white
 
 // Linearly interpolate between two RGB565 colours (t in 0..1).
 static uint16_t lerpColor565(uint16_t c0, uint16_t c1, float t) {
@@ -113,6 +127,11 @@ static void drawMeterBlock(int labelY, const char* label, float pct,
     tft.print(buf);
 }
 
+// A meter without server info (empty title) is hidden, not drawn at 0%.
+static void clearMeterBlock(int labelY) {
+    tft.fillRect(0, labelY, 240, H_LABEL + 2 + H_BAR, COL_BG);
+}
+
 static void drawStatusBox(ClaudeStatus status, bool connected, bool authFailed,
                           const String& agentDisplay) {
     uint16_t color;
@@ -134,7 +153,7 @@ static void drawStatusBox(ClaudeStatus status, bool connected, bool authFailed,
         label = String(stateLabel);
     } else {
         label.toUpperCase();
-        label += " ";
+        if (label.length() > 0) label += " ";
         label += stateLabel;
     }
 
@@ -200,15 +219,23 @@ void displayUpdate() {
 
     if (displayData.weeklyPct != prev.weeklyPct
         || displayData.weeklyReset != prev.weeklyReset
-        || displayData.weeklyTitle != prev.weeklyTitle)
-        drawMeterBlock(Y_WMETER, displayData.weeklyTitle.c_str(),
-                       displayData.weeklyPct, displayData.weeklyReset);
+        || displayData.weeklyTitle != prev.weeklyTitle) {
+        if (displayData.weeklyTitle.length() > 0)
+            drawMeterBlock(Y_WMETER, displayData.weeklyTitle.c_str(),
+                           displayData.weeklyPct, displayData.weeklyReset);
+        else
+            clearMeterBlock(Y_WMETER);
+    }
 
     if (displayData.sessionPct != prev.sessionPct
         || displayData.sessionReset != prev.sessionReset
-        || displayData.sessionTitle != prev.sessionTitle)
-        drawMeterBlock(Y_SMETER, displayData.sessionTitle.c_str(),
-                       displayData.sessionPct, displayData.sessionReset);
+        || displayData.sessionTitle != prev.sessionTitle) {
+        if (displayData.sessionTitle.length() > 0)
+            drawMeterBlock(Y_SMETER, displayData.sessionTitle.c_str(),
+                           displayData.sessionPct, displayData.sessionReset);
+        else
+            clearMeterBlock(Y_SMETER);
+    }
 
     if (displayData.sessions != prev.sessions) {
         tft.setTextFont(2);
@@ -263,18 +290,6 @@ static String usageColorHex(float pct) {
     return "#ff2200";
 }
 
-static uint16_t logoColorForAgent(const char* agentId) {
-    if (strcmp(agentId, "copilot") == 0) return COL_COPILOT;
-    if (strcmp(agentId, "codex") == 0) return COL_CODEX;
-    return COL_LOGO;
-}
-
-static const uint8_t* logoBitsForAgent(const char* agentId) {
-    if (strcmp(agentId, "copilot") == 0) return COPILOT_LOGO_BITS;
-    if (strcmp(agentId, "codex") == 0) return CODEX_LOGO_BITS;
-    return LOGO_BITS;
-}
-
 void displayUpdateClock() {
     if (displaySleeping()) return;
 
@@ -294,8 +309,8 @@ void displayUpdateClock() {
 
 // ── Sleep screen: bouncing logos + clock ─────────────────────────────────────
 //
-// Three 1-bit logo sprites (Claude/Copilot/Codex) and one clock sprite bounce
-// around simultaneously. Backlight is PWM-dimmed.
+// A random selection of up to three wire-delivered agent logos and one clock
+// sprite bounce around simultaneously. Backlight is PWM-dimmed.
 //
 // Velocity is a float vector at a random angle, re-jittered on every wall
 // bounce — with a fixed ±step the path is locked to 45° diagonals and traces
@@ -311,21 +326,20 @@ void displayUpdateClock() {
 #define CLOCK_COLLIDE_INSET_X 2 // trim font-side padding from clock box
 #define CLOCK_COLLIDE_INSET_Y 2
 
+#define MAX_SLEEP_LOGOS 3
+
 static TFT_eSprite logoSpr(&tft);   // reused per logo on each frame
 static TFT_eSprite clkSpr(&tft);
 static bool sleeping   = false;
 static bool sleepAnim  = false;   // sprites allocated, animation running
 struct SleepLogoState {
-    const char* id;
+    const AgentLogo* logo;
     float fx, fy, vx, vy;
     int x, y;
     int prevX, prevY;
 };
-static SleepLogoState sleepLogos[3] = {
-    {"claude",  0, 0, 0, 0, 0, 0, 0, 0},
-    {"copilot", 0, 0, 0, 0, 0, 0, 0, 0},
-    {"codex",   0, 0, 0, 0, 0, 0, 0, 0},
-};
+static SleepLogoState sleepLogos[MAX_SLEEP_LOGOS];
+static int sleepLogoCount = 0;
 static int  cx, cy;               // clock integer draw position (also for SVG preview)
 static float cfx, cfy, cvx, cvy;  // clock exact position / velocity
 static int  clkW = 96;
@@ -460,8 +474,20 @@ void displaySleepStart() {
     analogWriteRange(255);
     analogWrite(TFT_BL, 255 - SLEEP_BL_LEVEL);   // active LOW
 
-    // Random start positions and directions for all three logos.
-    for (int i = 0; i < 3; i++) {
+    // Random selection of up to MAX_SLEEP_LOGOS of the configured agent
+    // logos (Fisher-Yates over the indices).
+    uint8_t pick[MAX_AGENT_LOGOS];
+    for (uint8_t i = 0; i < agentLogoCount; i++) pick[i] = i;
+    for (uint8_t i = agentLogoCount; i > 1; i--) {
+        uint8_t j = RANDOM_REG32 % i;
+        uint8_t tmp = pick[i - 1]; pick[i - 1] = pick[j]; pick[j] = tmp;
+    }
+    sleepLogoCount = agentLogoCount < MAX_SLEEP_LOGOS
+        ? agentLogoCount : MAX_SLEEP_LOGOS;
+
+    // Random start positions and directions for the selected logos.
+    for (int i = 0; i < sleepLogoCount; i++) {
+        sleepLogos[i].logo = &agentLogos[pick[i]];
         bool placed = false;
         for (int tries = 0; tries < 32; tries++) {
             sleepLogos[i].fx = (float)(SLEEP_STEP + (int)(RANDOM_REG32 % (240 - LOGO_W - 2 * SLEEP_STEP)));
@@ -504,7 +530,7 @@ void displaySleepStart() {
         cfx = (float)(SLEEP_STEP + (int)(RANDOM_REG32 % (240 - clkW - 2 * SLEEP_STEP)));
         cfy = (float)(SLEEP_STEP + (int)(RANDOM_REG32 % (240 - clkH - 2 * SLEEP_STEP)));
         bool overlaps = false;
-        for (int i = 0; i < 3; i++) {
+        for (int i = 0; i < sleepLogoCount; i++) {
             if (sleepOverlap(sleepLogos[i].fx, sleepLogos[i].fy, LOGO_W, LOGO_H, cfx, cfy, clkW, clkH)) {
                 overlaps = true;
                 break;
@@ -535,10 +561,10 @@ void displaySleepStart() {
     if (!sleepAnim) {   // heap too tight for sprites: static fallback
         logoSpr.deleteSprite();
         clkSpr.deleteSprite();
-        for (int i = 0; i < 3; i++) {
+        for (int i = 0; i < sleepLogoCount; i++) {
             tft.drawBitmap(sleepLogos[i].x, sleepLogos[i].y,
-                           logoBitsForAgent(sleepLogos[i].id), LOGO_W, LOGO_H,
-                           logoColorForAgent(sleepLogos[i].id));
+                           sleepLogos[i].logo->bits, LOGO_W, LOGO_H,
+                           sleepLogos[i].logo->color);
         }
         return;
     }
@@ -554,15 +580,15 @@ void displaySleepTick(unsigned long now) {
     if (!sleeping || !sleepAnim || now - lastFrameMs < SLEEP_FRAME_MS) return;
     lastFrameMs = now;
 
-    int oldX[3], oldY[3];
-    for (int i = 0; i < 3; i++) {
+    int oldX[MAX_SLEEP_LOGOS], oldY[MAX_SLEEP_LOGOS];
+    for (int i = 0; i < sleepLogoCount; i++) {
         oldX[i] = sleepLogos[i].x;
         oldY[i] = sleepLogos[i].y;
     }
     int oldCx = cx;
     int oldCy = cy;
 
-    for (int i = 0; i < 3; i++) {
+    for (int i = 0; i < sleepLogoCount; i++) {
         sleepLogos[i].prevX = sleepLogos[i].x;
         sleepLogos[i].prevY = sleepLogos[i].y;
         sleepLogos[i].fx += sleepLogos[i].vx;
@@ -598,9 +624,9 @@ void displaySleepTick(unsigned long now) {
     cx = (int)cfx;
     cy = (int)cfy;
 
-    // Object-to-object collisions: 3 logos + clock all bounce off each other.
-    for (int i = 0; i < 3; i++) {
-        for (int j = i + 1; j < 3; j++) {
+    // Object-to-object collisions: logos + clock all bounce off each other.
+    for (int i = 0; i < sleepLogoCount; i++) {
+        for (int j = i + 1; j < sleepLogoCount; j++) {
             if (sleepOverlapInset(
                     sleepLogos[i].fx, sleepLogos[i].fy, LOGO_W, LOGO_H,
                     LOGO_COLLIDE_INSET_X, LOGO_COLLIDE_INSET_Y,
@@ -614,7 +640,7 @@ void displaySleepTick(unsigned long now) {
             }
         }
     }
-    for (int i = 0; i < 3; i++) {
+    for (int i = 0; i < sleepLogoCount; i++) {
         if (sleepOverlapInset(
                 sleepLogos[i].fx, sleepLogos[i].fy, LOGO_W, LOGO_H,
                 LOGO_COLLIDE_INSET_X, LOGO_COLLIDE_INSET_Y,
@@ -629,7 +655,7 @@ void displaySleepTick(unsigned long now) {
     }
 
     // Keep objects in bounds after collision separation.
-    for (int i = 0; i < 3; i++) {
+    for (int i = 0; i < sleepLogoCount; i++) {
         sleepLogos[i].fx = constrain(sleepLogos[i].fx, 0.0f, (float)(240 - LOGO_W));
         sleepLogos[i].fy = constrain(sleepLogos[i].fy, 0.0f, (float)(240 - LOGO_H));
         sleepLogos[i].x = (int)sleepLogos[i].fx;
@@ -642,7 +668,7 @@ void displaySleepTick(unsigned long now) {
 
     // Interleave clear+draw per object to avoid a global blank phase.
     // Only clear exposed old->new delta bands to minimize pixel churn.
-    for (int i = 0; i < 3; i++) {
+    for (int i = 0; i < sleepLogoCount; i++) {
         int oldRectX = oldX[i] - SLEEP_STEP;
         int oldRectY = oldY[i] - SLEEP_STEP;
         int newRectX = sleepLogos[i].x - SLEEP_STEP;
@@ -651,8 +677,8 @@ void displaySleepTick(unsigned long now) {
         int rectH = LOGO_H + 2 * SLEEP_STEP;
 
         logoSpr.fillSprite(0);
-        logoSpr.drawBitmap(SLEEP_STEP, SLEEP_STEP, logoBitsForAgent(sleepLogos[i].id),
-                           LOGO_W, LOGO_H, logoColorForAgent(sleepLogos[i].id));
+        logoSpr.drawBitmap(SLEEP_STEP, SLEEP_STEP, sleepLogos[i].logo->bits,
+                           LOGO_W, LOGO_H, sleepLogos[i].logo->color);
         sleepClearOldDelta(oldRectX, oldRectY, newRectX, newRectY, rectW, rectH, COL_BG);
         logoSpr.pushSprite(sleepLogos[i].x - SLEEP_STEP, sleepLogos[i].y - SLEEP_STEP);
     }
