@@ -13,6 +13,7 @@ import asyncio
 import collections
 import json
 import os
+import secrets
 import shutil
 import signal
 import socket
@@ -41,13 +42,27 @@ from codelight_core import transcript as transcript_core
 from codelight_core import timefmt
 from codelight_core.usage import UsageFetchers, UsagePoller
 from codelight_core import vscode as vscode_core
-from codelight_core.ws_server import CodelightWebsocketHub
 
 try:
     import websockets as _websockets
     _have_websockets = True
 except ImportError:
     _have_websockets = False
+
+try:
+    from zeroconf import Zeroconf, ServiceInfo
+    _have_zeroconf = True
+except ImportError:
+    _have_zeroconf = False
+
+try:
+    from dbus_fast.aio import MessageBus as _DbusMessageBus
+    from dbus_fast.service import ServiceInterface as _DbusServiceInterface
+    from dbus_fast.service import signal as _dbus_signal, method as _dbus_method
+    from dbus_fast import BusType as _DbusBusType
+    _have_dbus = True
+except ImportError:
+    _have_dbus = False
 
 # ── Config ────────────────────────────────────────────────────────────────────
 
@@ -78,7 +93,10 @@ _policy_lock: threading.Lock = threading.Lock()
 _github_org: str = ""
 _github_token_file: str = ""
 
-_ws_hub: CodelightWebsocketHub | None = None
+_ws_loop:    asyncio.AbstractEventLoop | None = None
+_ws_clients: set = set()
+_last_ws_status: str = "idle"   # updated by _broadcast; watched by timeout-watchdog
+_dbus_iface: object | None = None   # CodelightDbusInterface instance when D-Bus is available
 
 # Remote control (armed via --remote-control, requires --secret):
 # approve tool permissions AND answer AskUserQuestion prompts remotely.
@@ -91,6 +109,9 @@ _pending_perms: dict[str, dict] = {}
 # request_id → {"conn", "id", "session_id", "tool_input", "questions",
 #               "event", "answers", "by", "expires"}
 _pending_questions: dict[str, dict] = {}
+_perm_clients: set = set()   # WS clients subscribed to remote-control events
+_conv_clients: set = set()   # WS clients subscribed to the conversation feed
+_question_clients: set = set()  # WS clients that will answer AskUserQuestion prompts
 # GNOME answers over D-Bus (not a WS subscriber), so it announces its presence:
 # question fall-through must not fire while a GNOME extension is listening.
 GNOME_PRESENCE_TTL = 90
@@ -162,20 +183,37 @@ def _agent_meter_titles(agent_id: str | None) -> tuple[str, str]:
     return _state.agent_meter_titles(agent_id)
 
 
-def _get_local_ip() -> str:
-    return discovery_core.get_local_ip()
-
-
 def _valid_auth_response(data: dict, secret: str, nonce: str) -> bool:
     if not isinstance(data, dict) or "auth_hmac" not in data:
         return False
     return auth_core.valid_auth_response(data, secret, nonce)
 
 
+def _get_local_ip() -> str:
+    return discovery_core.get_local_ip()
+
+
 def _broadcast(payload: dict) -> None:
     """Thread-safe push to all WebSocket clients and the D-Bus signal."""
-    if _ws_hub is not None:
-        _ws_hub.broadcast_status(payload)
+    global _last_ws_status
+    _last_ws_status = payload.get("status", _last_ws_status)
+    if _ws_loop is None:
+        return
+    msg = json.dumps(payload)
+
+    async def _send_all() -> None:
+        if _ws_clients:
+            await asyncio.gather(
+                *[c.send(msg) for c in list(_ws_clients)],
+                return_exceptions=True,
+            )
+        if _dbus_iface is not None:
+            try:
+                _dbus_iface.StatusChanged(msg)  # type: ignore[union-attr]
+            except Exception:
+                pass
+
+    asyncio.run_coroutine_threadsafe(_send_all(), _ws_loop)
 
 
 # ── Session state ─────────────────────────────────────────────────────────────
@@ -279,7 +317,7 @@ def _active_conversation_path() -> str:
 
 
 def _has_conversation_clients() -> bool:
-    return _ws_hub.has_conversation_clients() if _ws_hub is not None else False
+    return bool(_conv_clients)
 
 
 def _conversation_refresh_thread() -> None:
@@ -294,8 +332,20 @@ def _notify_conversation_changed() -> None:
 
 def _broadcast_conversation() -> None:
     """Push the conversation feed to subscribed clients (thread-safe)."""
-    if _ws_hub is not None:
-        _ws_hub.broadcast_conversation()
+    if _ws_loop is None or not _conv_clients:
+        return
+    payload = _conversation_payload()
+    if payload is None:
+        return
+    msg = json.dumps(payload)
+
+    async def _send() -> None:
+        targets = [c for c in list(_conv_clients) if c in _ws_clients]
+        if targets:
+            await asyncio.gather(*[c.send(msg) for c in targets],
+                                 return_exceptions=True)
+
+    asyncio.run_coroutine_threadsafe(_send(), _ws_loop)
 
 
 def _status_rank(status: str) -> int:
@@ -320,8 +370,8 @@ def _status_snapshot() -> dict:
     payload = _state.status_snapshot(pending_sids)
     payload["activity"] = list(_log_lines)
     payload["clients"] = {
-        "websocket": _ws_hub.client_count() if _ws_hub is not None else 0,
-        "dbus": _ws_hub.dbus_exported() if _ws_hub is not None else False,
+        "websocket": len(_ws_clients),
+        "dbus": _dbus_iface is not None,
     }
     return payload
 
@@ -329,6 +379,70 @@ def _status_snapshot() -> dict:
 def _usage_limit(label: str, usage: dict, prefix: str) -> dict:
     """Return the generic limit shape understood by multi-agent clients."""
     return CodelightState._usage_limit(label, usage, prefix)
+
+# ── D-Bus interface ───────────────────────────────────────────────────────────
+
+if _have_dbus:
+    class CodelightDbusInterface(_DbusServiceInterface):  # type: ignore[misc]
+        def __init__(self):
+            super().__init__('se.sensnology.codelight')
+
+        @_dbus_signal()
+        def StatusChanged(self, status_json: str) -> 's':  # type: ignore[return]
+            return status_json
+
+        @_dbus_method()
+        def GetStatus(self) -> 's':  # type: ignore[return]
+            return json.dumps(_status_snapshot())
+
+        @_dbus_signal()
+        def PermissionRequest(self, request_json: str) -> 's':  # type: ignore[return]
+            return request_json
+
+        @_dbus_signal()
+        def PermissionResolved(self, resolved_json: str) -> 's':  # type: ignore[return]
+            return resolved_json
+
+        @_dbus_method()
+        def RespondPermission(self, request_id: 's', decision: 's') -> 'b':  # type: ignore[return]
+            # Session bus = same local user → inside the trust boundary
+            return _resolve_permission(request_id, decision, 'gnome')
+
+        @_dbus_signal()
+        def QuestionRequest(self, request_json: str) -> 's':  # type: ignore[return]
+            return request_json
+
+        @_dbus_signal()
+        def QuestionResolved(self, resolved_json: str) -> 's':  # type: ignore[return]
+            return resolved_json
+
+        @_dbus_method()
+        def RespondQuestion(self, request_id: 's', answers_json: 's') -> 'b':  # type: ignore[return]
+            try:
+                answers = json.loads(answers_json)
+            except Exception:
+                return False
+            return _resolve_question(request_id, answers, 'gnome')
+
+        @_dbus_method()
+        def ExtendRequest(self, request_id: 's') -> 'b':  # type: ignore[return]
+            # Keepalive while the GNOME prompt is open, so it doesn't time out
+            return _extend_request(request_id)
+
+        @_dbus_method()
+        def Announce(self, features_json: 's') -> 'b':  # type: ignore[return]
+            # The GNOME extension announces (on enable + a periodic heartbeat)
+            # which features it can answer, so question fall-through doesn't fire
+            # while it's listening. Not a WS subscriber, so it can't be counted
+            # any other way.
+            global _gnome_last_seen, _gnome_features
+            try:
+                feats = json.loads(features_json)
+            except Exception:
+                feats = []
+            _gnome_last_seen = time.time()
+            _gnome_features = set(feats) if isinstance(feats, list) else set()
+            return True
 
 # ── Remote permission approval ────────────────────────────────────────────────
 #
@@ -342,8 +456,23 @@ def _usage_limit(label: str, usage: dict, prefix: str) -> dict:
 def _broadcast_rc(payload: dict, dbus_signal: str) -> None:
     """Send a remote-control event (permission/question) to subscribed WS
     clients and emit the named D-Bus signal."""
-    if _ws_hub is not None:
-        _ws_hub.broadcast_remote(payload, dbus_signal)
+    if _ws_loop is None:
+        return
+    msg = json.dumps(payload)
+
+    async def _send() -> None:
+        if _perm_clients:
+            await asyncio.gather(
+                *[c.send(msg) for c in list(_perm_clients)],
+                return_exceptions=True,
+            )
+        if _dbus_iface is not None:
+            try:
+                getattr(_dbus_iface, dbus_signal)(msg)   # type: ignore[union-attr]
+            except Exception:
+                pass
+
+    asyncio.run_coroutine_threadsafe(_send(), _ws_loop)
 
 
 def _perm_request_payload(entry: dict) -> dict:
@@ -558,12 +687,6 @@ def _question_request_payload(entry: dict) -> dict:
     )
 
 
-def _pending_remote_payloads() -> list[dict]:
-    with _lock:
-        return ([_perm_request_payload(e) for e in _pending_perms.values()]
-                + [_question_request_payload(e) for e in _pending_questions.values()])
-
-
 def _resolve_question(request_id: str, answers, by: str) -> bool:
     """Resolve a pending question. First response wins. A non-empty dict of
     {question: answer_string} answers it; an empty/None answers is an explicit
@@ -614,18 +737,9 @@ def _gnome_present(feature: str) -> bool:
             and feature in _gnome_features)
 
 
-def _announce_gnome(features: list[str]) -> bool:
-    """Record a GNOME extension feature heartbeat received over D-Bus."""
-    global _gnome_last_seen, _gnome_features
-    _gnome_last_seen = time.time()
-    _gnome_features = set(features)
-    return True
-
-
 def _can_answer_questions() -> bool:
     """True if any client (WS or GNOME) is currently able to answer questions."""
-    ws_can_answer = _ws_hub.has_question_clients() if _ws_hub is not None else False
-    return ws_can_answer or _gnome_present("questions")
+    return bool(_question_clients) or _gnome_present("questions")
 
 
 def _note_qclient_gone() -> None:
@@ -1152,42 +1266,175 @@ def run_dashboard(host: str, ws_port: int, secret: str) -> None:
 
 def _ws_thread(port: int, secret: str) -> None:
     """Run a WebSocket server; screen and Android clients connect here for live updates."""
-    global _ws_hub
+    global _ws_loop, _ws_clients
 
     if not _have_websockets:
         print("[ws] websockets not installed — clients unavailable", file=sys.stderr)
         print("[ws] Install: pip install websockets", file=sys.stderr)
         return
 
-    _ws_hub = CodelightWebsocketHub(
-        websockets_module=_websockets,
-        shutdown=_shutdown,
-        remote_permissions=lambda: _remote_permissions,
-        remote_questions=lambda: _remote_questions,
-        status_snapshot=_status_snapshot,
-        overall_status=_overall_status,
-        pending_payloads=_pending_remote_payloads,
-        conversation_payload=_conversation_payload,
-        notify_conversation_changed=_notify_conversation_changed,
-        note_question_client_gone=_note_qclient_gone,
-        respond_permission=_resolve_permission,
-        respond_question=_resolve_question,
-        extend_request=_extend_request,
-        announce_gnome=_announce_gnome,
-        log=_log,
-        verbose_log=vprint,
-    )
+    async def handler(ws, *_) -> None:
+        if secret:
+            # Challenge-response: the client proves it knows the secret by
+            # returning HMAC-SHA256(secret, nonce), so the secret itself never
+            # crosses the (plaintext ws://) wire.
+            try:
+                nonce = secrets.token_hex(16)
+                await ws.send(json.dumps({"type": "challenge", "nonce": nonce}))
+                msg = await asyncio.wait_for(ws.recv(), timeout=5.0)
+                data = json.loads(msg)
+                ok = _valid_auth_response(data, secret, nonce)
+                if not ok:
+                    _log(f"[ws] auth failed from {ws.remote_address}")
+                    try:
+                        await ws.send(json.dumps({"error": "unauthorized", "message": "Wrong password"}))
+                    except Exception:
+                        pass
+                    await ws.close(1008, "Unauthorized")
+                    return
+            except Exception:
+                _log(f"[ws] auth error from {ws.remote_address}")
+                try:
+                    await ws.send(json.dumps({"error": "unauthorized", "message": "Wrong password"}))
+                except Exception:
+                    pass
+                await ws.close(1008, "Unauthorized")
+                return
+
+        _ws_clients.add(ws)
+        _log(f"[ws] client connected ({len(_ws_clients)} total)")
+        try:
+            # Push timezone offset so the screen can configure NTP correctly,
+            # and tell clients whether remote-control (permissions/questions/
+            # conversation) is armed so the app can show its control tabs.
+            utc_offset = int(datetime.now().astimezone().utcoffset().total_seconds())
+            await ws.send(json.dumps({"type": "config", "utc_offset": utc_offset,
+                                      "remote_control": _remote_permissions}))
+
+            # Send current state immediately so the client isn't blank on connect
+            await ws.send(json.dumps(_status_snapshot()))
+
+            client_name = "ws"
+            try:
+                async for raw in ws:
+                    try:
+                        m = json.loads(raw)
+                    except Exception:
+                        continue
+                    mtype = m.get("type")
+
+                    if mtype == "subscribe":
+                        client_name = str(m.get("client") or "ws")
+                        feats = m.get("features") or []
+                        # A client that wants permissions and/or questions joins
+                        # the remote-control subscriber set and gets both replays.
+                        wants = (("permissions" in feats and _remote_permissions)
+                                 or ("questions" in feats and _remote_questions))
+                        if wants:
+                            _perm_clients.add(ws)
+                            # Track question-answering clients separately so the
+                            # fall-through gate knows if anyone can answer.
+                            if "questions" in feats and _remote_questions:
+                                _question_clients.add(ws)
+                            _log(f"[ws] remote-control subscriber: {client_name}")
+                            with _lock:
+                                pending = ([_perm_request_payload(e) for e in _pending_perms.values()]
+                                           + [_question_request_payload(e) for e in _pending_questions.values()])
+                            for p in pending:
+                                await ws.send(json.dumps(p))
+                        # Conversation feed: gated on remote-control being armed.
+                        if "conversation" in feats and _remote_permissions:
+                            _conv_clients.add(ws)
+                            _log(f"[ws] conversation subscriber: {client_name}")
+                            snapshot = _conversation_payload()
+                            if snapshot is not None:
+                                await ws.send(json.dumps(snapshot))
+                            _notify_conversation_changed()
+
+                    elif mtype == "permission_response":
+                        rid      = str(m.get("id", ""))
+                        decision = str(m.get("decision", ""))
+                        if _resolve_permission(rid, decision, client_name):
+                            _log(f"[perm] {decision} by {client_name}")
+
+                    elif mtype == "question_response":
+                        rid     = str(m.get("id", ""))
+                        answers = m.get("answers")
+                        if _resolve_question(rid, answers, client_name):
+                            _log(f"[question] answered by {client_name}")
+
+                    elif mtype == "extend":
+                        _extend_request(str(m.get("id", "")))
+            except Exception:
+                pass  # connection reset without close frame — normal on app restart
+        finally:
+            _ws_clients.discard(ws)
+            _perm_clients.discard(ws)
+            _conv_clients.discard(ws)
+            if ws in _question_clients:
+                _note_qclient_gone()
+            _question_clients.discard(ws)
+            _log(f"[ws] client disconnected ({len(_ws_clients)} remaining)")
+
+    async def serve() -> None:
+        global _last_ws_status, _dbus_iface
+
+        if _have_dbus:
+            try:
+                dbus_bus = await _DbusMessageBus(bus_type=_DbusBusType.SESSION).connect()
+                iface = CodelightDbusInterface()  # type: ignore[name-defined]
+                dbus_bus.export('/se/sensnology/codelight', iface)
+                await dbus_bus.request_name('se.sensnology.codelight')
+                _dbus_iface = iface
+                _log("[dbus] service exported")
+            except Exception as e:
+                print(f"[dbus] setup failed: {e}", file=sys.stderr, flush=True)
+
+        async with _websockets.serve(handler, "0.0.0.0", port):
+            vprint(f"[ws] listening on :{port}")
+            while not _shutdown.is_set():
+                await asyncio.sleep(2)
+                if not _ws_clients and _dbus_iface is None:
+                    continue
+                # Detect status changes caused by session timeouts (no hook fires for those).
+                _, current_status, _, _ = _overall_status()
+                if current_status != _last_ws_status:
+                    _last_ws_status = current_status
+                    payload = _status_snapshot()
+                    msg = json.dumps(payload)
+                    _log(f"[ws] timeout → {current_status}")
+                    if _ws_clients:
+                        await asyncio.gather(
+                            *[c.send(msg) for c in list(_ws_clients)],
+                            return_exceptions=True,
+                        )
+                    if _dbus_iface is not None:
+                        try:
+                            _dbus_iface.StatusChanged(msg)  # type: ignore[union-attr]
+                        except Exception:
+                            pass
+
+    _ws_loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(_ws_loop)
     try:
-        _ws_hub.run(port=port, secret=secret)
+        _ws_loop.run_until_complete(serve())
+    except Exception as e:
+        print(f"[ws] server error: {e}", file=sys.stderr)
     finally:
-        _ws_hub = None
+        _ws_loop.close()
+        _ws_loop = None
 
 
 def _mdns_thread(port: int, name: str) -> None:
+    if not _have_zeroconf:
+        discovery_core.unavailable_message()
+        return
     discovery_core.advertise_mdns(
         port=port,
         name=name,
         shutdown=_shutdown,
+        zeroconf_cls=Zeroconf,
+        service_info_cls=ServiceInfo,
         log=_log,
         verbose_log=vprint,
     )

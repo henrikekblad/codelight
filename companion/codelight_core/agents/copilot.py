@@ -10,6 +10,7 @@ import urllib.request
 from datetime import datetime, timezone
 from typing import Callable
 
+from codelight_core import hooks as hooks_core
 from codelight_core.timefmt import format_epoch_countdown
 
 
@@ -43,6 +44,10 @@ def latest_events_path(copilot_home: str) -> str:
         return newest_path
     except Exception:
         return ""
+
+
+def hooks_path(copilot_home: str) -> str:
+    return os.path.join(copilot_home, "hooks", "codelight.json")
 
 
 class CopilotAgent:
@@ -214,3 +219,82 @@ def get_usage(
             "reset_at": reset_at,
         }],
     }
+
+
+def install_hooks(
+    hooks_file: str,
+    script_path: str,
+    *,
+    hook_wait_ceiling: int,
+    remote_permissions: bool = False,
+    permission_timeout: int = 60,
+) -> None:
+    cmd_base = hooks_core.hook_command_base(script_path, "copilot")
+
+    permission_hook = {
+        "type": "command",
+        "command": f"{cmd_base} permission-copilot --permission-timeout {permission_timeout}",
+        "timeoutSec": hook_wait_ceiling + 15,
+    } if remote_permissions else {
+        "type": "command",
+        "command": f"{cmd_base} waiting",
+    }
+
+    doc = {
+        "version": 1,
+        "hooks": {
+            "SessionStart": [
+                {"type": "command", "command": f"{cmd_base} working"},
+            ],
+            "UserPromptSubmit": [
+                {"type": "command", "command": f"{cmd_base} working"},
+            ],
+            "PreToolUse": (
+                [
+                    {"type": "command", "command": f"{cmd_base} working"},
+                    {
+                        "type": "command",
+                        "command": f"{cmd_base} permission-vscode --permission-timeout {permission_timeout}",
+                        "timeoutSec": hook_wait_ceiling + 15,
+                    },
+                    {
+                        "type": "command",
+                        "command": f"{cmd_base} question-vscode --permission-timeout {permission_timeout}",
+                        "timeoutSec": hook_wait_ceiling + 15,
+                    },
+                ] if remote_permissions else [
+                    {"type": "command", "command": f"{cmd_base} working"},
+                ]
+            ),
+            "PostToolUse": [
+                {"type": "command", "command": f"{cmd_base} working"},
+            ],
+            "PermissionRequest": [
+                permission_hook,
+            ],
+            "Notification": [
+                {
+                    "type": "command",
+                    "matcher": "permission_prompt|elicitation_dialog|agent_idle",
+                    "command": f"{cmd_base} waiting",
+                },
+            ],
+            "Stop": [
+                {"type": "command", "command": f"{cmd_base} ended"},
+            ],
+            "SessionEnd": [
+                {"type": "command", "command": f"{cmd_base} ended"},
+            ],
+        },
+    }
+
+    try:
+        with open(hooks_file) as stream:
+            existing = json.load(stream)
+    except Exception:
+        existing = {}
+    if existing == doc:
+        print(f"[copilot-hooks] already up to date in {hooks_file}", flush=True)
+        return
+    hooks_core.write_json_object(hooks_file, doc)
+    print(f"[copilot-hooks] installed in {hooks_file}", flush=True)

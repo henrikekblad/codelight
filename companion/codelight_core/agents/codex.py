@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import json
 import os
+from typing import Callable
 
+from codelight_core import hooks as hooks_core
 from codelight_core.timefmt import format_epoch_countdown
 
 
@@ -120,4 +122,75 @@ def usage_from_rollout(path: str) -> dict | None:
 
 
 def get_usage(code_home: str) -> dict | None:
-    return usage_from_rollout(latest_rollout_path(code_home))
+    """Return rate-limit data from the most recent rollout that contains it.
+
+    A session that was cut off (e.g. hit the 5-hour cap on the first turn) may
+    produce a rollout file with no token_count events.  Fall back through up to
+    five recent files so a single empty session doesn't hide the last known limit.
+    """
+    try:
+        base = os.path.join(code_home, "sessions")
+        candidates: list[tuple[float, str]] = []
+        for root, _, files in os.walk(base):
+            for name in files:
+                if not name.endswith(".jsonl"):
+                    continue
+                path = os.path.join(root, name)
+                try:
+                    mtime = os.path.getmtime(path)
+                except OSError:
+                    continue
+                candidates.append((mtime, path))
+        for _, path in sorted(candidates, reverse=True)[:5]:
+            result = usage_from_rollout(path)
+            if result is not None:
+                return result
+    except Exception:
+        pass
+    return None
+
+
+def hooks_path(code_home: str) -> str:
+    return os.path.join(code_home, "hooks.json")
+
+
+def install_hooks(
+    hooks_file: str,
+    script_path: str,
+    *,
+    hook_wait_ceiling: int,
+    remote_permissions: bool = False,
+    remote_questions: bool = False,
+    permission_timeout: int = 60,
+    vprint: Callable[[str], None] | None = None,
+) -> None:
+    cmd_base = hooks_core.hook_command_base(script_path, "codex")
+    if remote_permissions:
+        perm_hook = hooks_core.command_hook(
+            f"{cmd_base} permission --permission-timeout {permission_timeout}",
+            timeout=hook_wait_ceiling + 15,
+            status_message="Waiting for codelight approval")
+    else:
+        perm_hook = hooks_core.command_hook(f"{cmd_base} waiting")
+
+    desired: list[hooks_core.HookSpec] = [
+        ("SessionStart",     "startup|resume|clear|compact",
+         hooks_core.command_hook(f"{cmd_base} working")),
+        ("UserPromptSubmit", "", hooks_core.command_hook(f"{cmd_base} working")),
+        ("PreToolUse",      "", hooks_core.command_hook(f"{cmd_base} working")),
+        ("PostToolUse",     "", hooks_core.command_hook(f"{cmd_base} working")),
+        ("PermissionRequest", "", perm_hook),
+        ("Stop",            "", hooks_core.command_hook(f"{cmd_base} ended")),
+        ("SubagentStart",    "", hooks_core.command_hook(f"{cmd_base} working")),
+        ("SubagentStop",     "", hooks_core.command_hook(f"{cmd_base} working")),
+    ]
+    if remote_questions:
+        desired.append(("PreToolUse", "^request_user_input$", hooks_core.command_hook(
+            f"{cmd_base} question-codex --permission-timeout {permission_timeout}",
+            timeout=hook_wait_ceiling + 15,
+            status_message="Waiting for codelight answer")))
+
+    hooks_core.install_matcher_group_hooks(
+        hooks_file, desired, "codex-hooks", vprint=vprint)
+    print("[codex-hooks] review new or changed hooks with /hooks in Codex CLI",
+          flush=True)

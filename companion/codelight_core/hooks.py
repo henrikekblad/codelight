@@ -165,38 +165,29 @@ def install_claude_hooks(
     permission_timeout: int = 60,
     vprint: Callable[[str], None] | None = None,
 ) -> None:
-    cmd_base = hook_command_base(script_path, "claude")
-    if remote_permissions:
-        perm_hook = command_hook(
-            f"{cmd_base} permission --permission-timeout {permission_timeout}",
-            timeout=hook_wait_ceiling + 15)
-    else:
-        perm_hook = command_hook(f"{cmd_base} waiting")
+    from codelight_core.agents import claude
 
-    desired: list[HookSpec] = [
-        ("PreToolUse",        "", command_hook(f"{cmd_base} working")),
-        ("PostToolUse",       "", command_hook(f"{cmd_base} working")),
-        ("UserPromptSubmit",  "", command_hook(f"{cmd_base} working")),
-        ("PermissionRequest", "", perm_hook),
-        ("PermissionDenied",  "", command_hook(f"{cmd_base} working")),
-        ("Stop",              "", command_hook(f"{cmd_base} ended")),
-        ("SessionEnd",        "", command_hook(f"{cmd_base} ended")),
-    ]
-    if remote_questions:
-        desired.append(("PreToolUse", "AskUserQuestion", {
-            "type": "command",
-            "command": f"{cmd_base} question --permission-timeout {permission_timeout}",
-            "timeout": hook_wait_ceiling + 15}))
-
-    install_matcher_group_hooks(settings_path, desired, "hooks", vprint=vprint)
+    claude.install_hooks(
+        settings_path,
+        script_path,
+        hook_wait_ceiling=hook_wait_ceiling,
+        remote_permissions=remote_permissions,
+        remote_questions=remote_questions,
+        permission_timeout=permission_timeout,
+        vprint=vprint,
+    )
 
 
 def copilot_hooks_path(copilot_home: str) -> str:
-    return os.path.join(copilot_home, "hooks", "codelight.json")
+    from codelight_core.agents import copilot
+
+    return copilot.hooks_path(copilot_home)
 
 
 def codex_hooks_path(codex_home: str) -> str:
-    return os.path.join(codex_home, "hooks.json")
+    from codelight_core.agents import codex
+
+    return codex.hooks_path(codex_home)
 
 
 def install_codex_hooks(
@@ -209,35 +200,17 @@ def install_codex_hooks(
     permission_timeout: int = 60,
     vprint: Callable[[str], None] | None = None,
 ) -> None:
-    cmd_base = hook_command_base(script_path, "codex")
-    if remote_permissions:
-        perm_hook = command_hook(
-            f"{cmd_base} permission --permission-timeout {permission_timeout}",
-            timeout=hook_wait_ceiling + 15,
-            status_message="Waiting for codelight approval")
-    else:
-        perm_hook = command_hook(f"{cmd_base} waiting")
+    from codelight_core.agents import codex
 
-    desired: list[HookSpec] = [
-        ("SessionStart",     "startup|resume|clear|compact",
-         command_hook(f"{cmd_base} working")),
-        ("UserPromptSubmit", "", command_hook(f"{cmd_base} working")),
-        ("PreToolUse",      "", command_hook(f"{cmd_base} working")),
-        ("PostToolUse",     "", command_hook(f"{cmd_base} working")),
-        ("PermissionRequest", "", perm_hook),
-        ("Stop",            "", command_hook(f"{cmd_base} ended")),
-        ("SubagentStart",    "", command_hook(f"{cmd_base} working")),
-        ("SubagentStop",     "", command_hook(f"{cmd_base} working")),
-    ]
-    if remote_questions:
-        desired.append(("PreToolUse", "^request_user_input$", command_hook(
-            f"{cmd_base} question-codex --permission-timeout {permission_timeout}",
-            timeout=hook_wait_ceiling + 15,
-            status_message="Waiting for codelight answer")))
-
-    install_matcher_group_hooks(hooks_path, desired, "codex-hooks", vprint=vprint)
-    print("[codex-hooks] review new or changed hooks with /hooks in Codex CLI",
-          flush=True)
+    codex.install_hooks(
+        hooks_path,
+        script_path,
+        hook_wait_ceiling=hook_wait_ceiling,
+        remote_permissions=remote_permissions,
+        remote_questions=remote_questions,
+        permission_timeout=permission_timeout,
+        vprint=vprint,
+    )
 
 
 def install_copilot_hooks(
@@ -248,72 +221,12 @@ def install_copilot_hooks(
     remote_permissions: bool = False,
     permission_timeout: int = 60,
 ) -> None:
-    cmd_base = hook_command_base(script_path, "copilot")
+    from codelight_core.agents import copilot
 
-    permission_hook = {
-        "type": "command",
-        "command": f"{cmd_base} permission-copilot --permission-timeout {permission_timeout}",
-        "timeoutSec": hook_wait_ceiling + 15,
-    } if remote_permissions else {
-        "type": "command",
-        "command": f"{cmd_base} waiting",
-    }
-
-    doc = {
-        "version": 1,
-        "hooks": {
-            "SessionStart": [
-                {"type": "command", "command": f"{cmd_base} working"},
-            ],
-            "UserPromptSubmit": [
-                {"type": "command", "command": f"{cmd_base} working"},
-            ],
-            "PreToolUse": (
-                [
-                    {"type": "command", "command": f"{cmd_base} working"},
-                    {
-                        "type": "command",
-                        "command": f"{cmd_base} permission-vscode --permission-timeout {permission_timeout}",
-                        "timeoutSec": hook_wait_ceiling + 15,
-                    },
-                    {
-                        "type": "command",
-                        "command": f"{cmd_base} question-vscode --permission-timeout {permission_timeout}",
-                        "timeoutSec": hook_wait_ceiling + 15,
-                    },
-                ] if remote_permissions else [
-                    {"type": "command", "command": f"{cmd_base} working"},
-                ]
-            ),
-            "PostToolUse": [
-                {"type": "command", "command": f"{cmd_base} working"},
-            ],
-            "PermissionRequest": [
-                permission_hook,
-            ],
-            "Notification": [
-                {
-                    "type": "command",
-                    "matcher": "permission_prompt|elicitation_dialog|agent_idle",
-                    "command": f"{cmd_base} waiting",
-                },
-            ],
-            "Stop": [
-                {"type": "command", "command": f"{cmd_base} ended"},
-            ],
-            "SessionEnd": [
-                {"type": "command", "command": f"{cmd_base} ended"},
-            ],
-        },
-    }
-
-    try:
-        with open(hooks_path) as _f:
-            existing = json.load(_f)
-    except Exception:
-        existing = {}
-    if existing == doc:
-        print(f"[copilot-hooks] already up to date in {hooks_path}", flush=True)
-        return
-    write_json_object(hooks_path, doc)
-    print(f"[copilot-hooks] installed in {hooks_path}", flush=True)
+    copilot.install_hooks(
+        hooks_path,
+        script_path,
+        hook_wait_ceiling=hook_wait_ceiling,
+        remote_permissions=remote_permissions,
+        permission_timeout=permission_timeout,
+    )

@@ -6,6 +6,7 @@ import urllib.error
 import urllib.request
 from typing import Callable
 
+from codelight_core import hooks as hooks_core
 from codelight_core.timefmt import epoch, format_iso_countdown
 
 
@@ -84,3 +85,40 @@ def get_usage(
         "session_reset_at": epoch(session.get("resets_at", "")),
         "weekly_reset_at": epoch(weekly.get("resets_at", "")),
     }
+
+
+def install_hooks(
+    settings_path: str,
+    script_path: str,
+    *,
+    hook_wait_ceiling: int,
+    remote_permissions: bool = False,
+    remote_questions: bool = False,
+    permission_timeout: int = 60,
+    vprint: Callable[[str], None] | None = None,
+) -> None:
+    cmd_base = hooks_core.hook_command_base(script_path, "claude")
+    if remote_permissions:
+        perm_hook = hooks_core.command_hook(
+            f"{cmd_base} permission --permission-timeout {permission_timeout}",
+            timeout=hook_wait_ceiling + 15)
+    else:
+        perm_hook = hooks_core.command_hook(f"{cmd_base} waiting")
+
+    desired: list[hooks_core.HookSpec] = [
+        ("PreToolUse",        "", hooks_core.command_hook(f"{cmd_base} working")),
+        ("PostToolUse",       "", hooks_core.command_hook(f"{cmd_base} working")),
+        ("UserPromptSubmit",  "", hooks_core.command_hook(f"{cmd_base} working")),
+        ("PermissionRequest", "", perm_hook),
+        ("PermissionDenied",  "", hooks_core.command_hook(f"{cmd_base} working")),
+        ("Stop",              "", hooks_core.command_hook(f"{cmd_base} ended")),
+        ("SessionEnd",        "", hooks_core.command_hook(f"{cmd_base} ended")),
+    ]
+    if remote_questions:
+        desired.append(("PreToolUse", "AskUserQuestion", {
+            "type": "command",
+            "command": f"{cmd_base} question --permission-timeout {permission_timeout}",
+            "timeout": hook_wait_ceiling + 15}))
+
+    hooks_core.install_matcher_group_hooks(
+        settings_path, desired, "hooks", vprint=vprint)

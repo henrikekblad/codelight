@@ -123,3 +123,39 @@ def uninstall_service(*, run=subprocess.run) -> None:
     os.unlink(service_path)
     run(["systemctl", "--user", "daemon-reload"], capture_output=True)
     print(f"[uninstall] removed {service_path}")
+
+
+def remove_file(path: str, *, label: str = "uninstall") -> bool:
+    try:
+        os.unlink(path)
+        print(f"[{label}] removed {path}")
+        return True
+    except FileNotFoundError:
+        return False
+    except Exception as e:
+        print(f"[{label}] could not remove {path}: {e}", file=sys.stderr)
+        return False
+
+
+def remove_empty_dir(path: str, *, label: str = "uninstall") -> bool:
+    try:
+        os.rmdir(path)
+        print(f"[{label}] removed empty {path}")
+        return True
+    except OSError:
+        return False
+
+
+def remove_path(path: str, *, label: str = "uninstall") -> bool:
+    try:
+        if os.path.isdir(path):
+            shutil.rmtree(path)
+        else:
+            os.unlink(path)
+        print(f"[{label}] removed {path}")
+        return True
+    except FileNotFoundError:
+        return False
+    except Exception as e:
+        print(f"[{label}] could not remove {path}: {e}", file=sys.stderr)
+        return False
