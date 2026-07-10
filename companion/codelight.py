@@ -11,7 +11,6 @@ Usage:
 import argparse
 import asyncio
 import collections
-import json
 import os
 import shutil
 import signal
@@ -19,7 +18,6 @@ import subprocess
 import sys
 import threading
 import time
-import uuid
 from datetime import datetime, timezone
 from codelight_core.agents import claude as claude_agent
 from codelight_core.agents import codex as codex_agent
@@ -99,6 +97,7 @@ _gnome_features: set = set()
 _last_qclient_gone: float = 0.0
 _log_lines:       collections.deque = collections.deque(maxlen=10)
 _conversation_refresher: ConversationRefresher | None = None
+_remote_manager: remote_control.RemoteRequestManager | None = None
 
 AGENT_REGISTRY: dict[str, dict[str, str]] = {
     "claude": {"display": "Claude"},
@@ -341,31 +340,7 @@ def _perm_request_payload(entry: dict) -> dict:
 
 def _resolve_permission(request_id: str, decision: str, by: str) -> bool:
     """Record a decision for a pending request. First response wins."""
-    if decision not in ("allow", "deny", "skip", "allow_folder", "allow_command"):
-        return False
-
-    if decision in ("allow_folder", "allow_command"):
-        pending = _pending_requests.permission_persistence_request(request_id)
-        if pending is None:
-            return False
-        cwd, policy_command = pending
-
-        if decision == "allow_folder":
-            persisted, value = _allow_folder(cwd)
-            kind = "folder"
-        else:
-            persisted, value = _allow_command(policy_command, cwd)
-            kind = "command"
-
-        return _pending_requests.finish_permission_persistence(
-            request_id,
-            by=by,
-            kind=kind,
-            persisted=persisted,
-            value=value,
-        )
-
-    return _pending_requests.resolve_permission(request_id, decision, by)
+    return _remote_request_manager().resolve_permission(request_id, decision, by)
 
 
 def _wait_with_extend(entry: dict) -> None:
@@ -404,13 +379,13 @@ def _wait_question(entry: dict) -> None:
 def _extend_request(request_id: str) -> bool:
     """Client keepalive: reset a pending request's idle deadline (called while
     a remote client has the prompt open, so it never times out mid-interaction)."""
-    return _pending_requests.extend(request_id, _permission_timeout)
+    return _remote_request_manager().extend(request_id)
 
 
 def _cancel_permissions_for(session_id: str) -> None:
     """Session activity/end — wake up its pending permission AND question
     requests without a decision (answered locally)."""
-    _pending_requests.cancel_for_session(session_id)
+    _remote_request_manager().cancel_for_session(session_id)
 
 
 def _should_cancel_pending_for_hook(state: str, hook_event: str) -> bool:
@@ -429,72 +404,13 @@ def _cancel_pending_for_hook(session_id: str, state: str,
 def _permission_waiter(entry: dict) -> None:
     """Per-request thread: wait for a decision (or timeout), reply to the
     blocked hook on its held connection, and notify clients."""
-    _wait_with_extend(entry)
-    _pending_requests.pop_permission(entry["id"])
-    decision = entry["decision"]
-    by       = entry["by"]
-    persistence = entry.get("persistence") \
-        if isinstance(entry.get("persistence"), dict) else None
-
-    try:
-        entry["conn"].sendall((json.dumps({"decision": decision}) + "\n").encode())
-    except Exception:
-        pass
-    try:
-        entry["conn"].close()
-    except Exception:
-        pass
-
-    outcome = decision or ("cancelled" if by == "cancelled" else "skip" if by else "timeout")
-    if decision == "allow" and persistence and persistence.get("requested"):
-        outcome = f"allow_{persistence.get('kind', 'once')}"
-    _log(f"[perm] {entry['summary'][:60]} → {outcome}"
-         + (f" (by {by})" if decision else ""))
-    _broadcast_rc(remote_payloads.permission_resolved_payload(
-        {**entry, "agent_id": _normalize_agent_id(entry.get("agent_id"))},
-        decision=outcome,
-        by=by or "",
-        persistence=persistence,
-        agent_display_name=_agent_display_name,
-    ), "PermissionResolved")
-    _push()
+    _remote_request_manager()._permission_waiter(entry)
 
 
 def _register_permission(conn, msg: dict) -> None:
     """Take ownership of the hook's socket connection and start the approval
     round-trip. Called from the socket thread; must not block it."""
-    if not _remote_permissions:
-        # Feature off (e.g. stale hook entry) — release the hook immediately
-        try:
-            conn.sendall(b'{"decision": null}\n')
-        except Exception:
-            pass
-        conn.close()
-        return
-
-    rid = str(msg.get("prompt_id") or "") or uuid.uuid4().hex
-    sid = msg.get("session_id", "unknown")
-    entry = {
-        "conn":       conn,
-        "id":         rid,
-        "session_id": sid,
-        "agent_id":   _normalize_agent_id(msg.get("agent_id")),
-        "tool_name":  msg.get("tool_name", "?"),
-        "summary":    msg.get("summary", "") or msg.get("tool_name", "?"),
-        "tool_input": msg.get("tool_input", {}),
-        "policy_command": msg.get("policy_command", ""),
-        "cwd":        msg.get("cwd", ""),
-        "event":      threading.Event(),
-        "decision":   None,
-        "by":         None,
-        "expires":    time.time() + _permission_timeout,
-    }
-    _pending_requests.add_permission(rid, entry)
-    _update_session(sid, "waiting", agent_id=entry["agent_id"])
-    _log(f"[perm] request: {entry['summary'][:60]}")
-    _push()
-    _broadcast_rc(_perm_request_payload(entry), "PermissionRequest")
-    threading.Thread(target=_permission_waiter, args=(entry,), daemon=True).start()
+    _remote_request_manager().register_permission(conn, msg)
 
 
 # ── Remote question answering via PreToolUse ──────────────────────────────────
@@ -506,46 +422,69 @@ def _question_request_payload(entry: dict) -> dict:
     )
 
 
-def _pending_remote_payloads() -> list[dict]:
-    return _pending_requests.pending_payloads(
-        _perm_request_payload,
-        _question_request_payload,
+def _permission_resolved_payload(entry: dict, decision: str, by: str,
+                                 persistence: dict | None) -> dict:
+    return remote_payloads.permission_resolved_payload(
+        {**entry, "agent_id": _normalize_agent_id(entry.get("agent_id"))},
+        decision=decision,
+        by=by,
+        persistence=persistence,
+        agent_display_name=_agent_display_name,
     )
+
+
+def _question_resolved_payload(entry: dict, by: str) -> dict:
+    return remote_payloads.question_resolved_payload(
+        {**entry, "agent_id": _normalize_agent_id(entry.get("agent_id"))},
+        by=by,
+        agent_display_name=_agent_display_name,
+    )
+
+
+def _remote_request_manager() -> remote_control.RemoteRequestManager:
+    global _remote_manager
+    if _remote_manager is None:
+        _remote_manager = remote_control.RemoteRequestManager(
+            pending=_pending_requests,
+            permission_timeout=lambda: _permission_timeout,
+            remote_permissions=lambda: _remote_permissions,
+            remote_questions=lambda: _remote_questions,
+            normalize_agent_id=_normalize_agent_id,
+            permission_payload=_perm_request_payload,
+            question_payload=_question_request_payload,
+            permission_resolved_payload=_permission_resolved_payload,
+            question_resolved_payload=_question_resolved_payload,
+            broadcast_remote=_broadcast_rc,
+            update_session=lambda session_id, state, agent_id: _update_session(
+                session_id, state, agent_id=agent_id),
+            push_status=_push,
+            log=_log,
+            allow_folder=_allow_folder,
+            allow_command=_allow_command,
+            can_answer_questions=_can_answer_questions,
+            last_question_client_gone=lambda: _last_qclient_gone,
+            no_client_grace=NO_CLIENT_GRACE,
+            reconnect_window=RECONNECT_WINDOW,
+        )
+    return _remote_manager
+
+
+def _pending_remote_payloads() -> list[dict]:
+    return _remote_request_manager().pending_payloads()
 
 
 def _resolve_question(request_id: str, answers, by: str) -> bool:
     """Resolve a pending question. First response wins. A non-empty dict of
     {question: answer_string} answers it; an empty/None answers is an explicit
     skip (reply null → hook falls through to Claude's dialog immediately)."""
-    return _pending_requests.resolve_question(request_id, answers, by)
+    return _remote_request_manager().resolve_question(request_id, answers, by)
 
 
 def _question_waiter(entry: dict) -> None:
     """Per-request thread: wait for answers (or timeout), reply to the blocked
     hook, and notify clients. Reply {"answers": {...}} → hook emits updatedInput;
     {"answers": null} → hook prints nothing → Claude's local dialog."""
-    _wait_question(entry)
-    _pending_requests.pop_question(entry["id"])
-    answers = entry["answers"]
-    by      = entry["by"]
-
-    try:
-        entry["conn"].sendall((json.dumps({"answers": answers}) + "\n").encode())
-    except Exception:
-        pass
-    try:
-        entry["conn"].close()
-    except Exception:
-        pass
-
-    outcome = "answered" if answers else ("cancelled" if by == "cancelled" else "timeout")
-    _log(f"[question] {entry['id'][:8]}… → {outcome}" + (f" (by {by})" if answers else ""))
-    _broadcast_rc(remote_payloads.question_resolved_payload(
-        {**entry, "agent_id": _normalize_agent_id(entry.get("agent_id"))},
-        by=by or "",
-        agent_display_name=_agent_display_name,
-    ), "QuestionResolved")
-    _push()
+    _remote_request_manager()._question_waiter(entry)
 
 
 def _gnome_present(feature: str) -> bool:
@@ -578,34 +517,7 @@ def _note_qclient_gone() -> None:
 def _register_question(conn, msg: dict) -> None:
     """Take ownership of the hook's socket connection and start the answer
     round-trip for an AskUserQuestion PreToolUse hook."""
-    if not _remote_questions:
-        try:
-            conn.sendall(b'{"answers": null}\n')
-        except Exception:
-            pass
-        conn.close()
-        return
-
-    rid = str(msg.get("prompt_id") or "") or uuid.uuid4().hex
-    sid = msg.get("session_id", "unknown")
-    entry = {
-        "conn":       conn,
-        "id":         rid,
-        "session_id": sid,
-        "agent_id":   _normalize_agent_id(msg.get("agent_id")),
-        "questions":  msg.get("questions", []),
-        "cwd":        msg.get("cwd", ""),
-        "event":      threading.Event(),
-        "answers":    None,
-        "by":         None,
-        "expires":    time.time() + _permission_timeout,
-    }
-    _pending_requests.add_question(rid, entry)
-    _update_session(sid, "waiting", agent_id=entry["agent_id"])
-    _log(f"[question] request: {len(entry['questions'])} question(s)")
-    _push()
-    _broadcast_rc(_question_request_payload(entry), "QuestionRequest")
-    threading.Thread(target=_question_waiter, args=(entry,), daemon=True).start()
+    _remote_request_manager().register_question(conn, msg)
 
 
 def _remove_matcher_group_hooks(path: str) -> None:

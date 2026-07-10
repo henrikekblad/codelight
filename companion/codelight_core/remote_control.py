@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import json
 import threading
 import time
+import uuid
 from collections.abc import Callable
 
 
@@ -210,3 +212,206 @@ class PendingRequests:
         for entry in permissions + questions:
             entry["event"].set()
         return permissions + questions
+
+
+class RemoteRequestManager:
+    """Coordinates remote permission/question request lifecycle."""
+
+    def __init__(
+        self,
+        *,
+        pending: PendingRequests,
+        permission_timeout: Callable[[], int],
+        remote_permissions: Callable[[], bool],
+        remote_questions: Callable[[], bool],
+        normalize_agent_id: Callable[[str | None], str],
+        permission_payload: Callable[[dict], dict],
+        question_payload: Callable[[dict], dict],
+        permission_resolved_payload: Callable[[dict, str, str, dict | None], dict],
+        question_resolved_payload: Callable[[dict, str], dict],
+        broadcast_remote: Callable[[dict, str], None],
+        update_session: Callable[[str, str, str], None],
+        push_status: Callable[[], None],
+        log: Callable[[str], None],
+        allow_folder: Callable[[str], tuple[bool, str]],
+        allow_command: Callable[[str, str], tuple[bool, str]],
+        can_answer_questions: Callable[[], bool],
+        last_question_client_gone: Callable[[], float],
+        no_client_grace: float,
+        reconnect_window: float,
+    ) -> None:
+        self.pending = pending
+        self.permission_timeout = permission_timeout
+        self.remote_permissions = remote_permissions
+        self.remote_questions = remote_questions
+        self.normalize_agent_id = normalize_agent_id
+        self.permission_payload = permission_payload
+        self.question_payload = question_payload
+        self.permission_resolved_payload = permission_resolved_payload
+        self.question_resolved_payload = question_resolved_payload
+        self.broadcast_remote = broadcast_remote
+        self.update_session = update_session
+        self.push_status = push_status
+        self.log = log
+        self.allow_folder = allow_folder
+        self.allow_command = allow_command
+        self.can_answer_questions = can_answer_questions
+        self.last_question_client_gone = last_question_client_gone
+        self.no_client_grace = no_client_grace
+        self.reconnect_window = reconnect_window
+
+    def pending_payloads(self) -> list[dict]:
+        return self.pending.pending_payloads(
+            self.permission_payload,
+            self.question_payload,
+        )
+
+    def resolve_permission(self, request_id: str, decision: str, by: str) -> bool:
+        if decision not in ("allow", "deny", "skip", "allow_folder", "allow_command"):
+            return False
+
+        if decision in ("allow_folder", "allow_command"):
+            pending = self.pending.permission_persistence_request(request_id)
+            if pending is None:
+                return False
+            cwd, policy_command = pending
+
+            if decision == "allow_folder":
+                persisted, value = self.allow_folder(cwd)
+                kind = "folder"
+            else:
+                persisted, value = self.allow_command(policy_command, cwd)
+                kind = "command"
+
+            return self.pending.finish_permission_persistence(
+                request_id,
+                by=by,
+                kind=kind,
+                persisted=persisted,
+                value=value,
+            )
+
+        return self.pending.resolve_permission(request_id, decision, by)
+
+    def resolve_question(self, request_id: str, answers, by: str) -> bool:
+        return self.pending.resolve_question(request_id, answers, by)
+
+    def extend(self, request_id: str) -> bool:
+        return self.pending.extend(request_id, self.permission_timeout())
+
+    def cancel_for_session(self, session_id: str) -> None:
+        self.pending.cancel_for_session(session_id)
+
+    def register_permission(self, conn, msg: dict) -> None:
+        if not self.remote_permissions():
+            self._reply_and_close(conn, {"decision": None})
+            return
+
+        request_id = str(msg.get("prompt_id") or "") or uuid.uuid4().hex
+        session_id = msg.get("session_id", "unknown")
+        entry = {
+            "conn":       conn,
+            "id":         request_id,
+            "session_id": session_id,
+            "agent_id":   self.normalize_agent_id(msg.get("agent_id")),
+            "tool_name":  msg.get("tool_name", "?"),
+            "summary":    msg.get("summary", "") or msg.get("tool_name", "?"),
+            "tool_input": msg.get("tool_input", {}),
+            "policy_command": msg.get("policy_command", ""),
+            "cwd":        msg.get("cwd", ""),
+            "event":      threading.Event(),
+            "decision":   None,
+            "by":         None,
+            "expires":    time.time() + self.permission_timeout(),
+        }
+        self.pending.add_permission(request_id, entry)
+        self.update_session(session_id, "waiting", entry["agent_id"])
+        self.log(f"[perm] request: {entry['summary'][:60]}")
+        self.push_status()
+        self.broadcast_remote(self.permission_payload(entry), "PermissionRequest")
+        threading.Thread(
+            target=self._permission_waiter, args=(entry,), daemon=True).start()
+
+    def register_question(self, conn, msg: dict) -> None:
+        if not self.remote_questions():
+            self._reply_and_close(conn, {"answers": None})
+            return
+
+        request_id = str(msg.get("prompt_id") or "") or uuid.uuid4().hex
+        session_id = msg.get("session_id", "unknown")
+        entry = {
+            "conn":       conn,
+            "id":         request_id,
+            "session_id": session_id,
+            "agent_id":   self.normalize_agent_id(msg.get("agent_id")),
+            "questions":  msg.get("questions", []),
+            "cwd":        msg.get("cwd", ""),
+            "event":      threading.Event(),
+            "answers":    None,
+            "by":         None,
+            "expires":    time.time() + self.permission_timeout(),
+        }
+        self.pending.add_question(request_id, entry)
+        self.update_session(session_id, "waiting", entry["agent_id"])
+        self.log(f"[question] request: {len(entry['questions'])} question(s)")
+        self.push_status()
+        self.broadcast_remote(self.question_payload(entry), "QuestionRequest")
+        threading.Thread(
+            target=self._question_waiter, args=(entry,), daemon=True).start()
+
+    def _permission_waiter(self, entry: dict) -> None:
+        wait_with_extend(entry)
+        self.pending.pop_permission(entry["id"])
+        decision = entry["decision"]
+        by = entry["by"]
+        persistence = entry.get("persistence") \
+            if isinstance(entry.get("persistence"), dict) else None
+
+        self._reply_and_close(entry["conn"], {"decision": decision})
+
+        outcome = decision or (
+            "cancelled" if by == "cancelled" else "skip" if by else "timeout")
+        if decision == "allow" and persistence and persistence.get("requested"):
+            outcome = f"allow_{persistence.get('kind', 'once')}"
+        self.log(f"[perm] {entry['summary'][:60]} → {outcome}"
+                 + (f" (by {by})" if decision else ""))
+        self.broadcast_remote(
+            self.permission_resolved_payload(entry, outcome, by or "", persistence),
+            "PermissionResolved",
+        )
+        self.push_status()
+
+    def _question_waiter(self, entry: dict) -> None:
+        wait_question(
+            entry,
+            can_answer_questions=self.can_answer_questions,
+            last_client_gone=self.last_question_client_gone,
+            no_client_grace=self.no_client_grace,
+            reconnect_window=self.reconnect_window,
+        )
+        self.pending.pop_question(entry["id"])
+        answers = entry["answers"]
+        by = entry["by"]
+
+        self._reply_and_close(entry["conn"], {"answers": answers})
+
+        outcome = "answered" if answers else (
+            "cancelled" if by == "cancelled" else "timeout")
+        self.log(f"[question] {entry['id'][:8]}… → {outcome}"
+                 + (f" (by {by})" if answers else ""))
+        self.broadcast_remote(
+            self.question_resolved_payload(entry, by or ""),
+            "QuestionResolved",
+        )
+        self.push_status()
+
+    @staticmethod
+    def _reply_and_close(conn, payload: dict) -> None:
+        try:
+            conn.sendall((json.dumps(payload) + "\n").encode())
+        except Exception:
+            pass
+        try:
+            conn.close()
+        except Exception:
+            pass
