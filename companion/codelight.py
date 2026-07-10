@@ -468,14 +468,11 @@ def _register_question(conn, msg: dict) -> None:
     _remote_request_manager().register_question(conn, msg)
 
 
-def _remove_matcher_group_hooks(path: str) -> None:
-    hooks_core.remove_matcher_group_hooks(path)
-
-
 # ── Hook installation ─────────────────────────────────────────────────────────
 
-def install_hooks(script_path: str, remote_permissions: bool = False,
-                  remote_questions: bool = False, permission_timeout: int = 60) -> None:
+def install_claude_hooks(script_path: str, remote_permissions: bool = False,
+                         remote_questions: bool = False,
+                         permission_timeout: int = 60) -> None:
     """
     Ensure ~/.claude/settings.json has the monitor hooks pointing to this script.
     Idempotent: safe to call on every startup. Preserves all non-monitor hooks.
@@ -494,14 +491,6 @@ def install_hooks(script_path: str, remote_permissions: bool = False,
     )
 
 
-def _copilot_hooks_path() -> str:
-    return copilot_agent.hooks_path(COPILOT_HOME)
-
-
-def _codex_hooks_path() -> str:
-    return codex_agent.hooks_path(CODEX_HOME)
-
-
 def install_codex_hooks(script_path: str, remote_permissions: bool = False,
                         remote_questions: bool = False,
                         permission_timeout: int = 60) -> None:
@@ -511,7 +500,7 @@ def install_codex_hooks(script_path: str, remote_permissions: bool = False,
     hooks would need trust per repo, so codelight uses the user layer.
     """
     codex_agent.install_hooks(
-        _codex_hooks_path(),
+        codex_agent.hooks_path(CODEX_HOME),
         script_path,
         hook_wait_ceiling=HOOK_WAIT_CEILING,
         remote_permissions=remote_permissions,
@@ -525,7 +514,7 @@ def install_copilot_hooks(script_path: str, remote_permissions: bool = False,
                           permission_timeout: int = 60) -> None:
     """Install user-level GitHub Copilot CLI hooks in ~/.copilot/hooks/codelight.json."""
     copilot_agent.install_hooks(
-        _copilot_hooks_path(),
+        copilot_agent.hooks_path(COPILOT_HOME),
         script_path,
         hook_wait_ceiling=HOOK_WAIT_CEILING,
         remote_permissions=remote_permissions,
@@ -794,10 +783,10 @@ def uninstall() -> None:
     """Remove all codelight hooks, socket file, and state directory."""
 
     settings_path = os.path.expanduser("~/.claude/settings.json")
-    _remove_matcher_group_hooks(settings_path)
-    _remove_matcher_group_hooks(_codex_hooks_path())
+    hooks_core.remove_matcher_group_hooks(settings_path)
+    hooks_core.remove_matcher_group_hooks(codex_agent.hooks_path(CODEX_HOME))
 
-    copilot_hooks = _copilot_hooks_path()
+    copilot_hooks = copilot_agent.hooks_path(COPILOT_HOME)
     service_core.remove_file(copilot_hooks)
     service_core.remove_empty_dir(os.path.dirname(copilot_hooks))
 
@@ -977,8 +966,8 @@ def main():
           flush=True)
 
     if "claude" in enabled_agents:
-        install_hooks(os.path.abspath(__file__), _remote_permissions,
-                      _remote_questions, _permission_timeout)
+        install_claude_hooks(os.path.abspath(__file__), _remote_permissions,
+                             _remote_questions, _permission_timeout)
     if "copilot" in enabled_agents:
         install_copilot_hooks(os.path.abspath(__file__), _remote_permissions,
                               _permission_timeout)
