@@ -26,6 +26,10 @@ const IFACE_XML = `<node>
     <method name="GetStatus">
       <arg direction="out" type="s"/>
     </method>
+    <method name="GetConfig">
+      <arg direction="in" type="s" name="client"/>
+      <arg direction="out" type="s"/>
+    </method>
     <method name="RespondPermission">
       <arg direction="in" type="s" name="request_id"/>
       <arg direction="in" type="s" name="decision"/>
@@ -86,15 +90,33 @@ function toHex([r, g, b]) {
     return '#' + [r, g, b].map(v => Math.round(v * 255).toString(16).padStart(2, '0')).join('');
 }
 
+// Agent branding from the daemon's GetConfig:
+// { agent_id: { display, color, logo_svg } }. Empty until the daemon appears.
+let AGENTS_META = {};
+let DEFAULT_AGENT_ID = '';
+
+// Shown before any config arrives or for agents without a logo.
+const GENERIC_LOGO_SVG =
+    '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16">' +
+    '<circle cx="8" cy="8" r="6" fill="none" stroke="currentColor" stroke-width="2"/>' +
+    '</svg>';
+
+function agentDisplay(id) {
+    const display = AGENTS_META[id]?.display;
+    if (display) return String(display);
+    if (!id) return 'Agent';
+    return id.charAt(0).toUpperCase() + id.slice(1);
+}
+
 function agentName(data) {
-    const raw = String(data?.agent_display ?? data?.agent_id ?? 'Claude').trim();
-    if (!raw) return 'Claude';
-    return raw.charAt(0).toUpperCase() + raw.slice(1);
+    const raw = String(data?.agent_display ?? '').trim();
+    if (raw) return raw.charAt(0).toUpperCase() + raw.slice(1);
+    return agentDisplay(String(data?.agent_id ?? DEFAULT_AGENT_ID).trim().toLowerCase());
 }
 
 function agentIconKey(data) {
     const raw = String(data?.agent_id ?? '').trim().toLowerCase();
-    return raw || 'claude';
+    return raw || DEFAULT_AGENT_ID;
 }
 
 function normalizedStatus(status) {
@@ -323,30 +345,16 @@ export default class CodelightExtension extends Extension {
         hdrBox.add_child(this._hdrStatus);
         hdrBox.add_child(this._hdrSessions);
         hdrItem.add_child(hdrBox);
+        this._hdrItem = hdrItem;
         this._indicator.menu.addMenuItem(hdrItem);
 
-        // Meter rows. Keep both desktop agents visible; compact clients can
-        // continue using the active-agent compatibility fields.
-        this._usageItems = {};
-        for (const [index, [agent, display]] of
-            [['claude', 'Claude'], ['copilot', 'Copilot'], ['codex', 'Codex']].entries()) {
-            const header = makeAgentHeader(display, index > 0);
-            const weekly = makeMeterItem('Weekly');
-            const session = makeMeterItem('Session');
-            const meters = [weekly, session];
-            this._usageItems[agent] = {header, weekly, session, meters};
-            this._indicator.menu.addMenuItem(header);
-            this._indicator.menu.addMenuItem(weekly);
-            this._indicator.menu.addMenuItem(session);
-        }
-
-        // Status/limits rows — hidden while a request is being answered so the
-        // popup shows only the question/permission.
-        this._statusItems = [
-            hdrItem,
-            ...Object.values(this._usageItems)
-                .flatMap(items => [items.header, items.weekly, items.session]),
-        ];
+        // Meter rows, one block per agent the daemon reports. Built from
+        // AGENTS_META (refreshed via GetConfig) and extended on the fly when a
+        // status payload mentions an agent we have no row for yet.
+        this._usageSection = new PopupMenu.PopupMenuSection();
+        this._indicator.menu.addMenuItem(this._usageSection);
+        this._giconCache = new Map();
+        this._buildUsageRows();
 
         // Question section (populated when Claude asks; empty otherwise)
         this._qSection = new PopupMenu.PopupMenuSection();
@@ -374,6 +382,71 @@ export default class CodelightExtension extends Extension {
         );
     }
 
+    _buildUsageRows() {
+        this._usageSection.removeAll();
+        this._usageItems = {};
+        for (const agent of Object.keys(AGENTS_META)) this._addUsageRow(agent);
+        this._refreshStatusItems();
+    }
+
+    _addUsageRow(agent) {
+        const separated = Object.keys(this._usageItems).length > 0;
+        const header = makeAgentHeader(agentDisplay(agent), separated);
+        const weekly = makeMeterItem('Weekly');
+        const session = makeMeterItem('Session');
+        this._usageItems[agent] = {header, weekly, session, meters: [weekly, session]};
+        this._usageSection.addMenuItem(header);
+        this._usageSection.addMenuItem(weekly);
+        this._usageSection.addMenuItem(session);
+    }
+
+    _refreshStatusItems() {
+        // Status/limits rows — hidden while a request is being answered so the
+        // popup shows only the question/permission.
+        this._statusItems = [
+            this._hdrItem,
+            ...Object.values(this._usageItems)
+                .flatMap(items => [items.header, items.weekly, items.session]),
+        ];
+    }
+
+    _agentGicon(agentId, status) {
+        // Server-supplied logo, tinted with the status color.
+        const iconStatus = C[status] ? status : 'offline';
+        const meta = AGENTS_META[agentId];
+        const svg = typeof meta?.logo_svg === 'string' && meta.logo_svg.startsWith('<svg')
+            ? meta.logo_svg : GENERIC_LOGO_SVG;
+        const hex = toHex(C[iconStatus]);
+        const key = `${agentId}:${hex}:${svg.length}`;
+        let gicon = this._giconCache.get(key);
+        if (!gicon) {
+            const tinted = svg.replaceAll('currentColor', hex);
+            gicon = Gio.BytesIcon.new(
+                new GLib.Bytes(new TextEncoder().encode(tinted)));
+            this._giconCache.set(key, gicon);
+        }
+        return gicon;
+    }
+
+    _fetchConfig() {
+        // One-time client config: agent branding and the default agent.
+        try {
+            const result = this._proxy.call_sync(
+                'GetConfig', new GLib.Variant('(s)', ['gnome']),
+                Gio.DBusCallFlags.NONE, -1, null);
+            const [json] = result.deepUnpack();
+            const config = JSON.parse(json);
+            if (config?.agents && typeof config.agents === 'object') {
+                AGENTS_META = config.agents;
+                DEFAULT_AGENT_ID = String(config.default_agent_id ?? '');
+                this._giconCache.clear();
+                this._buildUsageRows();
+            }
+        } catch (e) {
+            logError(e, 'codelight GetConfig failed');
+        }
+    }
+
     _onDaemonAppeared() {
         try {
             const nodeInfo = Gio.DBusNodeInfo.new_for_xml(IFACE_XML);
@@ -384,6 +457,7 @@ export default class CodelightExtension extends Extension {
                 DBUS_NAME, DBUS_PATH, DBUS_IFACE,
                 null
             );
+            this._fetchConfig();
             this._signalId = this._proxy.connectSignal('StatusChanged', (_proxy, _sender, [json]) => {
                 try {
                     const data = JSON.parse(json);
@@ -724,13 +798,8 @@ export default class CodelightExtension extends Extension {
         const sessions = data?.sessions ?? 0;
         const activeName = agentName(data);
 
-        // statuses without an icon of their own fall back to the offline icon
-        const agent = agentIconKey(data).replace(/[^a-z0-9_-]/g, '');
-        const iconStatus = C[status] ? status : 'offline';
-        const preferred = `${this.path}/icons/${agent}-${iconStatus}.svg`;
-        const fallback = `${this.path}/icons/claude-${iconStatus}.svg`;
-        const iconPath = GLib.file_test(preferred, GLib.FileTest.EXISTS) ? preferred : fallback;
-        this._panelIcon.gicon = Gio.icon_new_for_string(iconPath);
+        const agent = agentIconKey(data);
+        this._panelIcon.gicon = this._agentGicon(agent, status);
 
         this._hdrDot.set_style(`color: ${hex};`);
         this._hdrDot.set_text('●');
@@ -738,37 +807,33 @@ export default class CodelightExtension extends Extension {
         this._hdrSessions.set_text(sessions === 1 ? '1 session' : `${sessions} sessions`);
 
         if (!hasActiveRequest) {
-            const perAgent = data?.per_agent_usage;
+            const perAgent = data?.per_agent_usage ?? {};
             const perAgentStatus = data?.per_agent_status;
-            if (perAgent && typeof perAgent === 'object') {
-                for (const [agentId, items] of Object.entries(this._usageItems)) {
-                    const usage = perAgent[agentId];
-                    const hasStatus = perAgentStatus && Object.prototype.hasOwnProperty.call(perAgentStatus, agentId);
-                    const display = usage?.agent_display ??
-                        agentId.charAt(0).toUpperCase() + agentId.slice(1);
-                    items.header.visible = !!usage || !!hasStatus;
-                    items.header._nameLabel.set_text(display);
-                    items.header._statusLabel.set_text(
-                        normalizedStatus(perAgentStatus?.[agentId]).toUpperCase());
-                    const limits = usageLimits(usage);
-                    items.meters.forEach((meter, index) => {
-                        const limit = limits[index];
-                        meter.visible = !!limit;
-                        if (limit)
-                            this._setMeter(meter, limit.pct, limit.reset, limit.label);
-                    });
+            // An agent we have no meter row for yet (e.g. added to the daemon
+            // after connect) gets one on the fly.
+            let added = false;
+            for (const agentId of Object.keys(perAgent)) {
+                if (!this._usageItems[agentId]) {
+                    this._addUsageRow(agentId);
+                    added = true;
                 }
-            } else {
-                const items = this._usageItems[agent] ?? this._usageItems.claude;
-                for (const [agentId, candidate] of Object.entries(this._usageItems)) {
-                    candidate.header.visible = agentId === agent;
-                    candidate.weekly.visible = agentId === agent;
-                    candidate.session.visible = agentId === agent;
-                }
-                items.header._nameLabel.set_text(activeName);
-                items.header._statusLabel.set_text(status.toUpperCase());
-                this._setMeter(items.weekly, data?.weekly_pct, data?.weekly_reset, 'Weekly');
-                this._setMeter(items.session, data?.session_pct, data?.session_reset, 'Session');
+            }
+            if (added) this._refreshStatusItems();
+            for (const [agentId, items] of Object.entries(this._usageItems)) {
+                const usage = perAgent[agentId];
+                const hasStatus = perAgentStatus && Object.prototype.hasOwnProperty.call(perAgentStatus, agentId);
+                const display = usage?.agent_display ?? agentDisplay(agentId);
+                items.header.visible = !!usage || !!hasStatus;
+                items.header._nameLabel.set_text(display);
+                items.header._statusLabel.set_text(
+                    normalizedStatus(perAgentStatus?.[agentId]).toUpperCase());
+                const limits = usageLimits(usage);
+                items.meters.forEach((meter, index) => {
+                    const limit = limits[index];
+                    meter.visible = !!limit;
+                    if (limit)
+                        this._setMeter(meter, limit.pct, limit.reset, limit.label);
+                });
             }
         }
     }
@@ -783,13 +848,13 @@ export default class CodelightExtension extends Extension {
 
     _setOffline() {
         const hex = toHex(C.offline);
-        this._panelIcon.gicon = Gio.icon_new_for_string(`${this.path}/icons/claude-offline.svg`);
+        this._panelIcon.gicon = this._agentGicon(DEFAULT_AGENT_ID, 'offline');
         this._hdrDot.set_style(`color: ${hex};`);
         this._hdrDot.set_text('●');
         this._hdrStatus.set_text('OFFLINE');
         this._hdrSessions.set_text('daemon offline');
         for (const [agent, items] of Object.entries(this._usageItems)) {
-            items.header.visible = agent === 'claude';
+            items.header.visible = agent === DEFAULT_AGENT_ID;
             items.weekly.visible = false;
             items.session.visible = false;
             items.header._statusLabel.set_text('OFFLINE');

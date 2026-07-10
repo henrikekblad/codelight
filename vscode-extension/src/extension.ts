@@ -16,10 +16,31 @@ let panel: vscode.WebviewPanel | undefined;   // the open question WebView
 let keepalive: NodeJS.Timeout | undefined;
 let lastStatus: any | undefined;              // last status payload, to restore the bar
 
+// Agent branding from the daemon's one-time "config" message:
+// { agent_id: { display, color, logo_svg } }. Empty until connected.
+let agentsMeta: Record<string, any> = {};
+let defaultAgentId = '';
+
+function applyConfig(config: any): void {
+    if (config?.agents && typeof config.agents === 'object') {
+        agentsMeta = config.agents;
+    }
+    if (typeof config?.default_agent_id === 'string') {
+        defaultAgentId = config.default_agent_id;
+    }
+}
+
+function agentDisplay(id: string): string {
+    const display = agentsMeta[id]?.display;
+    if (typeof display === 'string' && display) { return display; }
+    if (!id) { return 'Agent'; }
+    return id.charAt(0).toUpperCase() + id.slice(1);
+}
+
 function agentName(payload: any): string {
-    const raw = String(payload?.agent_display ?? payload?.agent_id ?? 'Claude').trim();
-    if (!raw) { return 'Claude'; }
-    return raw.charAt(0).toUpperCase() + raw.slice(1);
+    const raw = String(payload?.agent_display ?? '').trim();
+    if (raw) { return raw.charAt(0).toUpperCase() + raw.slice(1); }
+    return agentDisplay(String(payload?.agent_id ?? defaultAgentId).trim().toLowerCase());
 }
 
 function availableUsage(p: any): Array<[string, any]> {
@@ -27,12 +48,17 @@ function availableUsage(p: any): Array<[string, any]> {
     const perStatus = p?.per_agent_status;
     if ((perAgent && typeof perAgent === 'object') ||
         (perStatus && typeof perStatus === 'object')) {
-        return ['claude', 'copilot', 'codex']
+        // Known agents first, in the daemon's order, then anything else the
+        // payload mentions — so a new agent shows up without a client update.
+        const ids = [...Object.keys(agentsMeta),
+                     ...Object.keys(perAgent ?? {}), ...Object.keys(perStatus ?? {})]
+            .filter((id, index, all) => all.indexOf(id) === index);
+        return ids
             .filter(id => (perAgent?.[id] && typeof perAgent[id] === 'object') ||
                 Object.prototype.hasOwnProperty.call(perStatus ?? {}, id))
             .map(id => [id, perAgent?.[id]]);
     }
-    return [[String(p?.agent_id ?? 'claude'), p]];
+    return [[String(p?.agent_id ?? defaultAgentId), p]];
 }
 
 function usageLimits(
@@ -64,8 +90,7 @@ function applyStatus(p: any): void {
     const usage = availableUsage(p);
     const perAgentStatus = p?.per_agent_status;
     const details = usage.flatMap(([id, value], index) => {
-        const name = String(value?.agent_display ??
-            (id.charAt(0).toUpperCase() + id.slice(1)));
+        const name = String(value?.agent_display ?? agentDisplay(id));
         const agentStatus = normalizedStatus(perAgentStatus?.[id] ??
             (id === p?.agent_id ? status : 'idle')).toUpperCase();
         return [
@@ -196,6 +221,19 @@ function getNonce(): string {
     return Buffer.from(require('crypto').randomBytes(24)).toString('base64url');
 }
 
+/** Inline agent logo for webview headings; the SVG comes from the trusted
+ *  daemon's config message and fills with currentColor. */
+function logoHtml(req: any): string {
+    const meta = agentsMeta[String(req?.agent_id ?? '').trim().toLowerCase()];
+    const svg = typeof meta?.logo_svg === 'string' ? meta.logo_svg : '';
+    if (!svg.startsWith('<svg')) { return ''; }
+    const color = typeof meta?.color === 'string' && meta.color ? meta.color : 'currentColor';
+    return `<span class="agent-logo" style="color:${esc(color)}">${svg}</span> `;
+}
+
+const LOGO_CSS = `
+    .agent-logo svg { width: 17px; height: 17px; vertical-align: -3px; }`;
+
 function renderHtml(webview: vscode.Webview, req: any): string {
     if (req?.type === 'permission_request') {
         return renderPermissionHtml(webview, req);
@@ -264,10 +302,11 @@ function renderHtml(webview: vscode.Webview, req: any): string {
     .secondary:hover { background: var(--vscode-button-secondaryHoverBackground); }
     .err { color: var(--vscode-inputValidation-errorForeground, #f48771); font-size: 12px;
            min-height: 16px; margin-bottom: 8px; }
+${LOGO_CSS}
 </style>
 </head>
 <body>
-    <h1>${esc(agentName(req))} asks</h1>
+    <h1>${logoHtml(req)}${esc(agentName(req))} asks</h1>
     ${blocks || fallback}
     <div id="err" class="err"></div>
     <div class="actions">
@@ -408,10 +447,11 @@ function renderPermissionHtml(webview: vscode.Webview, req: any): string {
     .secondary { background: var(--vscode-button-secondaryBackground);
                  color: var(--vscode-button-secondaryForeground); }
     .secondary:hover { background: var(--vscode-button-secondaryHoverBackground); }
+${LOGO_CSS}
 </style>
 </head>
 <body>
-    <h1>${esc(name)} requests permission</h1>
+    <h1>${logoHtml(req)}${esc(name)} requests permission</h1>
     <div class="summary">${summary}</div>
     <div class="meta"><strong>tool</strong> ${toolName}</div>
     ${cwd}
@@ -469,6 +509,7 @@ function start(): void {
         cfg.get<boolean>('permissionPrompts', true),
         cfg.get<boolean>('questionPrompts', true),
         {
+            onConfig: (config) => { applyConfig(config); },
             onStatus: (p) => {
                 lastStatus = p;
                 if (!pending) { applyStatus(p); }

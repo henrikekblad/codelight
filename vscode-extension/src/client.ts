@@ -2,6 +2,7 @@ import WebSocket from 'ws';
 import { createHmac } from 'crypto';
 
 export interface CodelightHandlers {
+    onConfig(config: any): void;
     onStatus(payload: any): void;
     onConnectionChange(connected: boolean): void;
     onAuthFailed(): void;
@@ -93,6 +94,8 @@ export class CodelightClient {
                     .update(String(m.nonce)).digest('hex');
                 ws.send(JSON.stringify({ auth_hmac: proof }));
                 hello();
+            } else if (m.type === 'config') {
+                this.handlers.onConfig(m);
             } else if (m.type === 'permission_request') {
                 this.handlers.onPermissionRequest(m);
             } else if (m.type === 'question_request') {
