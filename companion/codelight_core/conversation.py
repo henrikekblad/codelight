@@ -9,7 +9,36 @@ from typing import Callable
 ActivePath = Callable[[], str]
 HasClients = Callable[[], bool]
 Broadcast = Callable[[], None]
+ParseTranscript = Callable[[str], list[dict]]
+ConversationAgent = Callable[[str], str]
+AgentDisplay = Callable[[str | None], str]
 FileSignature = tuple[int, int]
+
+
+def build_payload(
+    *,
+    active_transcript: Callable[[], tuple[str, str]],
+    parse_transcript: ParseTranscript,
+    conversation_agent: ConversationAgent,
+    agent_display_name: AgentDisplay,
+) -> dict | None:
+    """Build the conversation feed payload for the active transcript."""
+    session_id, path = active_transcript()
+    if not path:
+        return None
+    agent_id = conversation_agent(session_id)
+    lines = parse_transcript(path)
+    for line in lines:
+        if isinstance(line, dict):
+            line.setdefault("agent_id", agent_id)
+            line.setdefault("agent_display", agent_display_name(agent_id))
+    return {
+        "type": "conversation",
+        "session_id": session_id,
+        "agent_id": agent_id,
+        "agent_display": agent_display_name(agent_id),
+        "lines": lines,
+    }
 
 
 class ConversationRefresher:

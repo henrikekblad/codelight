@@ -13,10 +13,8 @@ import asyncio
 import collections
 import json
 import os
-import secrets
 import shutil
 import signal
-import socket
 import subprocess
 import sys
 import threading
@@ -27,42 +25,29 @@ from codelight_core.agents import claude as claude_agent
 from codelight_core.agents import codex as codex_agent
 from codelight_core.agents import copilot as copilot_agent
 from codelight_core import auth as auth_core
+from codelight_core import conversation as conversation_core
 from codelight_core.conversation import ConversationRefresher
 from codelight_core import dashboard_client
 from codelight_core import discovery as discovery_core
-from codelight_core import hook_io
+from codelight_core import hook_commands
 from codelight_core import hooks as hooks_core
-from codelight_core import hook_runtime
 from codelight_core import policy as policy_core
 from codelight_core import remote_control
 from codelight_core import remote_payloads
 from codelight_core import service as service_core
+from codelight_core import socket_server
 from codelight_core.state import CodelightState
 from codelight_core import transcript as transcript_core
 from codelight_core import timefmt
 from codelight_core.usage import UsageFetchers, UsagePoller
 from codelight_core import vscode as vscode_core
+from codelight_core.ws_server import CodelightWebsocketHub
 
 try:
     import websockets as _websockets
     _have_websockets = True
 except ImportError:
     _have_websockets = False
-
-try:
-    from zeroconf import Zeroconf, ServiceInfo
-    _have_zeroconf = True
-except ImportError:
-    _have_zeroconf = False
-
-try:
-    from dbus_fast.aio import MessageBus as _DbusMessageBus
-    from dbus_fast.service import ServiceInterface as _DbusServiceInterface
-    from dbus_fast.service import signal as _dbus_signal, method as _dbus_method
-    from dbus_fast import BusType as _DbusBusType
-    _have_dbus = True
-except ImportError:
-    _have_dbus = False
 
 # ── Config ────────────────────────────────────────────────────────────────────
 
@@ -87,31 +72,22 @@ HOOK_WAIT_CEILING = 590
 _verbose  = False
 _shutdown = threading.Event()
 
-_lock: threading.Lock = threading.Lock()
 _policy_lock: threading.Lock = threading.Lock()
 # session_id → {"state": "working"|"waiting", "time": float}
 _github_org: str = ""
 _github_token_file: str = ""
 
-_ws_loop:    asyncio.AbstractEventLoop | None = None
-_ws_clients: set = set()
-_last_ws_status: str = "idle"   # updated by _broadcast; watched by timeout-watchdog
-_dbus_iface: object | None = None   # CodelightDbusInterface instance when D-Bus is available
+_ws_hub: CodelightWebsocketHub | None = None
 
 # Remote control (armed via --remote-control, requires --secret):
 # approve tool permissions AND answer AskUserQuestion prompts remotely.
 _remote_permissions: bool = False
 _remote_questions:   bool = False
 _permission_timeout: int  = 60
-# request_id → {"conn", "id", "session_id", "tool_name", "summary", "tool_input",
-#               "cwd", "event", "decision", "by", "expires"}
-_pending_perms: dict[str, dict] = {}
-# request_id → {"conn", "id", "session_id", "tool_input", "questions",
-#               "event", "answers", "by", "expires"}
-_pending_questions: dict[str, dict] = {}
-_perm_clients: set = set()   # WS clients subscribed to remote-control events
-_conv_clients: set = set()   # WS clients subscribed to the conversation feed
-_question_clients: set = set()  # WS clients that will answer AskUserQuestion prompts
+_pending_requests = remote_control.PendingRequests()
+_lock = _pending_requests.lock
+_pending_perms = _pending_requests.permissions
+_pending_questions = _pending_requests.questions
 # GNOME answers over D-Bus (not a WS subscriber), so it announces its presence:
 # question fall-through must not fire while a GNOME extension is listening.
 GNOME_PRESENCE_TTL = 90
@@ -195,25 +171,8 @@ def _get_local_ip() -> str:
 
 def _broadcast(payload: dict) -> None:
     """Thread-safe push to all WebSocket clients and the D-Bus signal."""
-    global _last_ws_status
-    _last_ws_status = payload.get("status", _last_ws_status)
-    if _ws_loop is None:
-        return
-    msg = json.dumps(payload)
-
-    async def _send_all() -> None:
-        if _ws_clients:
-            await asyncio.gather(
-                *[c.send(msg) for c in list(_ws_clients)],
-                return_exceptions=True,
-            )
-        if _dbus_iface is not None:
-            try:
-                _dbus_iface.StatusChanged(msg)  # type: ignore[union-attr]
-            except Exception:
-                pass
-
-    asyncio.run_coroutine_threadsafe(_send_all(), _ws_loop)
+    if _ws_hub is not None:
+        _ws_hub.broadcast_status(payload)
 
 
 # ── Session state ─────────────────────────────────────────────────────────────
@@ -294,22 +253,12 @@ def _codex_tool_result_text(content) -> str:
 
 def _conversation_payload() -> dict | None:
     """Build the {"type":"conversation", ...} feed for the active session."""
-    sid, path = _active_transcript()
-    if not path:
-        return None
-    agent_id = _state.conversation_agent(sid)
-    lines = _parse_transcript(path)
-    for line in lines:
-        if isinstance(line, dict):
-            line.setdefault("agent_id", agent_id)
-            line.setdefault("agent_display", _agent_display_name(agent_id))
-    return {
-        "type": "conversation",
-        "session_id": sid,
-        "agent_id": agent_id,
-        "agent_display": _agent_display_name(agent_id),
-        "lines": lines,
-    }
+    return conversation_core.build_payload(
+        active_transcript=_active_transcript,
+        parse_transcript=_parse_transcript,
+        conversation_agent=_state.conversation_agent,
+        agent_display_name=_agent_display_name,
+    )
 
 
 def _active_conversation_path() -> str:
@@ -317,7 +266,7 @@ def _active_conversation_path() -> str:
 
 
 def _has_conversation_clients() -> bool:
-    return bool(_conv_clients)
+    return _ws_hub.has_conversation_clients() if _ws_hub is not None else False
 
 
 def _conversation_refresh_thread() -> None:
@@ -332,20 +281,8 @@ def _notify_conversation_changed() -> None:
 
 def _broadcast_conversation() -> None:
     """Push the conversation feed to subscribed clients (thread-safe)."""
-    if _ws_loop is None or not _conv_clients:
-        return
-    payload = _conversation_payload()
-    if payload is None:
-        return
-    msg = json.dumps(payload)
-
-    async def _send() -> None:
-        targets = [c for c in list(_conv_clients) if c in _ws_clients]
-        if targets:
-            await asyncio.gather(*[c.send(msg) for c in targets],
-                                 return_exceptions=True)
-
-    asyncio.run_coroutine_threadsafe(_send(), _ws_loop)
+    if _ws_hub is not None:
+        _ws_hub.broadcast_conversation()
 
 
 def _status_rank(status: str) -> int:
@@ -355,23 +292,17 @@ def _status_rank(status: str) -> int:
 def _overall_status() -> tuple[int, str, dict[str, str], str]:
     """Return (active_count, overall_status) from in-memory session state.
     Cleans up sessions that have been silent longer than IDLE_WINDOW."""
-    with _lock:
-        # Sessions with a pending remote permission/question request stay alive —
-        # the 30 s waiting window would otherwise drop them mid-request
-        pending_sids = ({p["session_id"] for p in _pending_perms.values()}
-                        | {q["session_id"] for q in _pending_questions.values()})
-    return _state.overall_status(pending_sids)
+    # Sessions with a pending remote permission/question request stay alive —
+    # the 30 s waiting window would otherwise drop them mid-request.
+    return _state.overall_status(_pending_requests.pending_session_ids())
 
 
 def _status_snapshot() -> dict:
-    with _lock:
-        pending_sids = ({p["session_id"] for p in _pending_perms.values()}
-                        | {q["session_id"] for q in _pending_questions.values()})
-    payload = _state.status_snapshot(pending_sids)
+    payload = _state.status_snapshot(_pending_requests.pending_session_ids())
     payload["activity"] = list(_log_lines)
     payload["clients"] = {
-        "websocket": len(_ws_clients),
-        "dbus": _dbus_iface is not None,
+        "websocket": _ws_hub.client_count() if _ws_hub is not None else 0,
+        "dbus": _ws_hub.dbus_exported() if _ws_hub is not None else False,
     }
     return payload
 
@@ -379,70 +310,6 @@ def _status_snapshot() -> dict:
 def _usage_limit(label: str, usage: dict, prefix: str) -> dict:
     """Return the generic limit shape understood by multi-agent clients."""
     return CodelightState._usage_limit(label, usage, prefix)
-
-# ── D-Bus interface ───────────────────────────────────────────────────────────
-
-if _have_dbus:
-    class CodelightDbusInterface(_DbusServiceInterface):  # type: ignore[misc]
-        def __init__(self):
-            super().__init__('se.sensnology.codelight')
-
-        @_dbus_signal()
-        def StatusChanged(self, status_json: str) -> 's':  # type: ignore[return]
-            return status_json
-
-        @_dbus_method()
-        def GetStatus(self) -> 's':  # type: ignore[return]
-            return json.dumps(_status_snapshot())
-
-        @_dbus_signal()
-        def PermissionRequest(self, request_json: str) -> 's':  # type: ignore[return]
-            return request_json
-
-        @_dbus_signal()
-        def PermissionResolved(self, resolved_json: str) -> 's':  # type: ignore[return]
-            return resolved_json
-
-        @_dbus_method()
-        def RespondPermission(self, request_id: 's', decision: 's') -> 'b':  # type: ignore[return]
-            # Session bus = same local user → inside the trust boundary
-            return _resolve_permission(request_id, decision, 'gnome')
-
-        @_dbus_signal()
-        def QuestionRequest(self, request_json: str) -> 's':  # type: ignore[return]
-            return request_json
-
-        @_dbus_signal()
-        def QuestionResolved(self, resolved_json: str) -> 's':  # type: ignore[return]
-            return resolved_json
-
-        @_dbus_method()
-        def RespondQuestion(self, request_id: 's', answers_json: 's') -> 'b':  # type: ignore[return]
-            try:
-                answers = json.loads(answers_json)
-            except Exception:
-                return False
-            return _resolve_question(request_id, answers, 'gnome')
-
-        @_dbus_method()
-        def ExtendRequest(self, request_id: 's') -> 'b':  # type: ignore[return]
-            # Keepalive while the GNOME prompt is open, so it doesn't time out
-            return _extend_request(request_id)
-
-        @_dbus_method()
-        def Announce(self, features_json: 's') -> 'b':  # type: ignore[return]
-            # The GNOME extension announces (on enable + a periodic heartbeat)
-            # which features it can answer, so question fall-through doesn't fire
-            # while it's listening. Not a WS subscriber, so it can't be counted
-            # any other way.
-            global _gnome_last_seen, _gnome_features
-            try:
-                feats = json.loads(features_json)
-            except Exception:
-                feats = []
-            _gnome_last_seen = time.time()
-            _gnome_features = set(feats) if isinstance(feats, list) else set()
-            return True
 
 # ── Remote permission approval ────────────────────────────────────────────────
 #
@@ -456,23 +323,8 @@ if _have_dbus:
 def _broadcast_rc(payload: dict, dbus_signal: str) -> None:
     """Send a remote-control event (permission/question) to subscribed WS
     clients and emit the named D-Bus signal."""
-    if _ws_loop is None:
-        return
-    msg = json.dumps(payload)
-
-    async def _send() -> None:
-        if _perm_clients:
-            await asyncio.gather(
-                *[c.send(msg) for c in list(_perm_clients)],
-                return_exceptions=True,
-            )
-        if _dbus_iface is not None:
-            try:
-                getattr(_dbus_iface, dbus_signal)(msg)   # type: ignore[union-attr]
-            except Exception:
-                pass
-
-    asyncio.run_coroutine_threadsafe(_send(), _ws_loop)
+    if _ws_hub is not None:
+        _ws_hub.broadcast_remote(payload, dbus_signal)
 
 
 def _perm_request_payload(entry: dict) -> dict:
@@ -493,12 +345,10 @@ def _resolve_permission(request_id: str, decision: str, by: str) -> bool:
         return False
 
     if decision in ("allow_folder", "allow_command"):
-        with _lock:
-            entry = _pending_perms.get(request_id)
-            if entry is None or entry["decision"] is not None or entry["by"] is not None:
-                return False
-            cwd = str(entry.get("cwd") or "")
-            policy_command = str(entry.get("policy_command") or "")
+        pending = _pending_requests.permission_persistence_request(request_id)
+        if pending is None:
+            return False
+        cwd, policy_command = pending
 
         if decision == "allow_folder":
             persisted, value = _allow_folder(cwd)
@@ -507,29 +357,15 @@ def _resolve_permission(request_id: str, decision: str, by: str) -> bool:
             persisted, value = _allow_command(policy_command, cwd)
             kind = "command"
 
-        with _lock:
-            entry = _pending_perms.get(request_id)
-            if entry is None or entry["decision"] is not None or entry["by"] is not None:
-                return False
-            entry["decision"] = "allow"
-            entry["by"] = by
-            entry["persistence"] = {
-                "kind": kind,
-                "requested": True,
-                "persisted": persisted,
-                "value": value,
-            }
-        entry["event"].set()
-        return True
+        return _pending_requests.finish_permission_persistence(
+            request_id,
+            by=by,
+            kind=kind,
+            persisted=persisted,
+            value=value,
+        )
 
-    with _lock:
-        entry = _pending_perms.get(request_id)
-        if entry is None or entry["decision"] is not None or entry["by"] is not None:
-            return False
-        entry["decision"] = None if decision == "skip" else decision
-        entry["by"] = by
-    entry["event"].set()
-    return True
+    return _pending_requests.resolve_permission(request_id, decision, by)
 
 
 def _wait_with_extend(entry: dict) -> None:
@@ -568,28 +404,13 @@ def _wait_question(entry: dict) -> None:
 def _extend_request(request_id: str) -> bool:
     """Client keepalive: reset a pending request's idle deadline (called while
     a remote client has the prompt open, so it never times out mid-interaction)."""
-    with _lock:
-        e = _pending_perms.get(request_id) or _pending_questions.get(request_id)
-        if e is None:
-            return False
-        e["expires"] = time.time() + _permission_timeout
-    return True
+    return _pending_requests.extend(request_id, _permission_timeout)
 
 
 def _cancel_permissions_for(session_id: str) -> None:
     """Session activity/end — wake up its pending permission AND question
     requests without a decision (answered locally)."""
-    with _lock:
-        perms = [e for e in _pending_perms.values()
-                 if e["session_id"] == session_id and e["decision"] is None]
-        for e in perms:
-            e["by"] = "cancelled"
-        ques = [e for e in _pending_questions.values()
-                if e["session_id"] == session_id and e["by"] is None]
-        for e in ques:
-            e["by"] = "cancelled"
-    for e in perms + ques:
-        e["event"].set()
+    _pending_requests.cancel_for_session(session_id)
 
 
 def _should_cancel_pending_for_hook(state: str, hook_event: str) -> bool:
@@ -609,12 +430,11 @@ def _permission_waiter(entry: dict) -> None:
     """Per-request thread: wait for a decision (or timeout), reply to the
     blocked hook on its held connection, and notify clients."""
     _wait_with_extend(entry)
-    with _lock:
-        _pending_perms.pop(entry["id"], None)
-        decision = entry["decision"]
-        by       = entry["by"]
-        persistence = entry.get("persistence") \
-            if isinstance(entry.get("persistence"), dict) else None
+    _pending_requests.pop_permission(entry["id"])
+    decision = entry["decision"]
+    by       = entry["by"]
+    persistence = entry.get("persistence") \
+        if isinstance(entry.get("persistence"), dict) else None
 
     try:
         entry["conn"].sendall((json.dumps({"decision": decision}) + "\n").encode())
@@ -669,8 +489,7 @@ def _register_permission(conn, msg: dict) -> None:
         "by":         None,
         "expires":    time.time() + _permission_timeout,
     }
-    with _lock:
-        _pending_perms[rid] = entry
+    _pending_requests.add_permission(rid, entry)
     _update_session(sid, "waiting", agent_id=entry["agent_id"])
     _log(f"[perm] request: {entry['summary'][:60]}")
     _push()
@@ -687,19 +506,18 @@ def _question_request_payload(entry: dict) -> dict:
     )
 
 
+def _pending_remote_payloads() -> list[dict]:
+    return _pending_requests.pending_payloads(
+        _perm_request_payload,
+        _question_request_payload,
+    )
+
+
 def _resolve_question(request_id: str, answers, by: str) -> bool:
     """Resolve a pending question. First response wins. A non-empty dict of
     {question: answer_string} answers it; an empty/None answers is an explicit
     skip (reply null → hook falls through to Claude's dialog immediately)."""
-    with _lock:
-        entry = _pending_questions.get(request_id)
-        if entry is None or entry["by"] is not None:   # already resolved
-            return False
-        entry["by"] = by
-        if isinstance(answers, dict) and answers:
-            entry["answers"] = answers   # else leave None → skip/fall-through
-    entry["event"].set()
-    return True
+    return _pending_requests.resolve_question(request_id, answers, by)
 
 
 def _question_waiter(entry: dict) -> None:
@@ -707,10 +525,9 @@ def _question_waiter(entry: dict) -> None:
     hook, and notify clients. Reply {"answers": {...}} → hook emits updatedInput;
     {"answers": null} → hook prints nothing → Claude's local dialog."""
     _wait_question(entry)
-    with _lock:
-        _pending_questions.pop(entry["id"], None)
-        answers = entry["answers"]
-        by      = entry["by"]
+    _pending_requests.pop_question(entry["id"])
+    answers = entry["answers"]
+    by      = entry["by"]
 
     try:
         entry["conn"].sendall((json.dumps({"answers": answers}) + "\n").encode())
@@ -737,9 +554,18 @@ def _gnome_present(feature: str) -> bool:
             and feature in _gnome_features)
 
 
+def _announce_gnome(features: list[str]) -> bool:
+    """Record a GNOME extension feature heartbeat received over D-Bus."""
+    global _gnome_last_seen, _gnome_features
+    _gnome_last_seen = time.time()
+    _gnome_features = set(features)
+    return True
+
+
 def _can_answer_questions() -> bool:
     """True if any client (WS or GNOME) is currently able to answer questions."""
-    return bool(_question_clients) or _gnome_present("questions")
+    ws_can_answer = _ws_hub.has_question_clients() if _ws_hub is not None else False
+    return ws_can_answer or _gnome_present("questions")
 
 
 def _note_qclient_gone() -> None:
@@ -774,8 +600,7 @@ def _register_question(conn, msg: dict) -> None:
         "by":         None,
         "expires":    time.time() + _permission_timeout,
     }
-    with _lock:
-        _pending_questions[rid] = entry
+    _pending_requests.add_question(rid, entry)
     _update_session(sid, "waiting", agent_id=entry["agent_id"])
     _log(f"[question] request: {len(entry['questions'])} question(s)")
     _push()
@@ -783,47 +608,11 @@ def _register_question(conn, msg: dict) -> None:
     threading.Thread(target=_question_waiter, args=(entry,), daemon=True).start()
 
 
-# ── Hook installation ─────────────────────────────────────────────────────────
-
-HookSpec = hooks_core.HookSpec
-
-
-def _hook_command_base(script_path: str, agent_id: str) -> str:
-    return hooks_core.hook_command_base(script_path, agent_id)
-
-
-def _command_hook(command: str, timeout_key: str = "timeout",
-                  timeout: int | None = None,
-                  status_message: str | None = None) -> dict:
-    return hooks_core.command_hook(
-        command, timeout_key=timeout_key, timeout=timeout,
-        status_message=status_message)
-
-
-def _is_codelight_hook_cmd(cmd: str) -> bool:
-    return hooks_core.is_codelight_hook_cmd(cmd)
-
-
-def _read_json_object(path: str, label: str) -> dict | None:
-    return hooks_core.read_json_object(path, label)
-
-
-def _write_json_object(path: str, data: dict) -> None:
-    hooks_core.write_json_object(path, data)
-
-
-def _merge_matcher_group_hooks(hooks: dict, desired: list[HookSpec]) -> bool:
-    return hooks_core.merge_matcher_group_hooks(hooks, desired)
-
-
-def _install_matcher_group_hooks(path: str, desired: list[HookSpec],
-                                 label: str) -> None:
-    hooks_core.install_matcher_group_hooks(path, desired, label, vprint=vprint)
-
-
 def _remove_matcher_group_hooks(path: str) -> None:
     hooks_core.remove_matcher_group_hooks(path)
 
+
+# ── Hook installation ─────────────────────────────────────────────────────────
 
 def install_hooks(script_path: str, remote_permissions: bool = False,
                   remote_questions: bool = False, permission_timeout: int = 60) -> None:
@@ -834,7 +623,7 @@ def install_hooks(script_path: str, remote_permissions: bool = False,
     decision; with remote_questions a PreToolUse hook (matcher AskUserQuestion)
     blocks for a remote answer.
     """
-    hooks_core.install_claude_hooks(
+    claude_agent.install_hooks(
         os.path.expanduser("~/.claude/settings.json"),
         script_path,
         hook_wait_ceiling=HOOK_WAIT_CEILING,
@@ -846,11 +635,11 @@ def install_hooks(script_path: str, remote_permissions: bool = False,
 
 
 def _copilot_hooks_path() -> str:
-    return hooks_core.copilot_hooks_path(COPILOT_HOME)
+    return copilot_agent.hooks_path(COPILOT_HOME)
 
 
 def _codex_hooks_path() -> str:
-    return hooks_core.codex_hooks_path(CODEX_HOME)
+    return codex_agent.hooks_path(CODEX_HOME)
 
 
 def install_codex_hooks(script_path: str, remote_permissions: bool = False,
@@ -861,7 +650,7 @@ def install_codex_hooks(script_path: str, remote_permissions: bool = False,
     Codex local surfaces (CLI and IDE extension) share CODEX_HOME. Project-local
     hooks would need trust per repo, so codelight uses the user layer.
     """
-    hooks_core.install_codex_hooks(
+    codex_agent.install_hooks(
         _codex_hooks_path(),
         script_path,
         hook_wait_ceiling=HOOK_WAIT_CEILING,
@@ -875,7 +664,7 @@ def install_codex_hooks(script_path: str, remote_permissions: bool = False,
 def install_copilot_hooks(script_path: str, remote_permissions: bool = False,
                           permission_timeout: int = 60) -> None:
     """Install user-level GitHub Copilot CLI hooks in ~/.copilot/hooks/codelight.json."""
-    hooks_core.install_copilot_hooks(
+    copilot_agent.install_hooks(
         _copilot_hooks_path(),
         script_path,
         hook_wait_ceiling=HOOK_WAIT_CEILING,
@@ -883,48 +672,8 @@ def install_copilot_hooks(script_path: str, remote_permissions: bool = False,
         permission_timeout=permission_timeout,
     )
 
-# ── Hook mode ─────────────────────────────────────────────────────────────────
 
-def run_hook(state: str, agent_id: str = DEFAULT_AGENT_ID) -> None:
-    """
-    Hook mode: invoked by coding-agent hooks via --hook STATE.
-    Fast path: sends event to the running daemon over the Unix socket (~1 ms).
-    Fallback: writes a state file if the daemon is not running.
-    Must exit immediately so it never blocks the host agent.
-    """
-    data = hook_runtime.parse_json_object(sys.stdin.read())
-    session_id = hook_runtime.session_id(data)
-    transcript_path = _extract_transcript_path(data)
-    hook_event = hook_runtime.hook_event_name(data)
-
-    if hook_io.send_json(
-        SOCKET_PATH,
-        {
-            "state": state,
-            "session_id": session_id,
-            "agent_id": _normalize_agent_id(agent_id),
-            # Let the daemon tail this session's conversation for the app feed.
-            "transcript_path": transcript_path,
-            "cwd": data.get("cwd", ""),
-            "hook_event": hook_event,
-        },
-        timeout=0.5,
-    ):
-        return
-
-    hook_io.write_monitor_state(
-        MONITOR_STATE_DIR,
-        session_id=session_id,
-        state=state,
-        agent_id=_normalize_agent_id(agent_id),
-        hook_event=hook_event,
-    )
-
-
-def _truncate_tool_input(tool_input, max_str: int = 500, max_total: int = 3000):
-    return policy_core.truncate_tool_input(
-        tool_input, max_str=max_str, max_total=max_total)
-
+# ── Permission policy compatibility helpers ──────────────────────────────────
 
 def _norm_path(path: str) -> str:
     return policy_core.norm_path(path)
@@ -935,12 +684,10 @@ def _load_policy() -> dict:
 
 
 def _write_policy(policy: dict) -> bool:
-    """Atomically persist the user-owned cross-agent permission policy."""
     return policy_core.write_policy(POLICY_PATH, policy)
 
 
 def _trusted_folders() -> list[str]:
-    """Return normalized trusted roots from codelight's policy."""
     return policy_core.trusted_folders(POLICY_PATH)
 
 
@@ -960,10 +707,6 @@ def _allow_folder(cwd: str) -> tuple[bool, str]:
     return policy_core.allow_folder(POLICY_PATH, _policy_lock, cwd)
 
 
-def _command_from_tool(tool_name: str, tool_input) -> str:
-    return policy_core.command_from_tool(tool_name, tool_input)
-
-
 def _is_allowed_command(tool_name: str, tool_input, cwd: str) -> bool:
     return policy_core.is_allowed_command(POLICY_PATH, tool_name, tool_input, cwd)
 
@@ -974,14 +717,6 @@ def _allow_command(command: str, cwd: str) -> tuple[bool, str]:
 
 def _tool_summary(tool_name: str, tool_input: dict) -> str:
     return policy_core.tool_summary(tool_name, tool_input)
-
-
-def _is_trusted_auto_allow_tool(tool_name: str) -> bool:
-    return policy_core.is_trusted_auto_allow_tool(tool_name)
-
-
-def _is_safe_memory_read(tool_name: str, tool_input) -> bool:
-    return policy_core.is_safe_memory_read(tool_name, tool_input)
 
 
 def _extract_patch_targets(patch_text: str) -> tuple[list[str], bool]:
@@ -997,183 +732,47 @@ def _is_safe_trusted_apply_patch(tool_name: str, tool_input, cwd: str) -> bool:
         POLICY_PATH, tool_name, tool_input, cwd)
 
 
-def _emit_permission_decision(decision: str, copilot_mode: bool,
-                              vscode_prettool_mode: bool,
-                              reason: str = "") -> None:
-    """Emit the host-specific decision envelope from one shared policy path."""
-    print(json.dumps(hook_runtime.permission_decision_output(
-        decision,
-        copilot_mode=copilot_mode,
-        vscode_prettool_mode=vscode_prettool_mode,
-        reason=reason,
-    )))
+# ── Hook mode ─────────────────────────────────────────────────────────────────
+
+def run_hook(state: str, agent_id: str = DEFAULT_AGENT_ID) -> None:
+    hook_commands.run_status_hook(
+        state,
+        agent_id=agent_id,
+        socket_path=SOCKET_PATH,
+        monitor_state_dir=MONITOR_STATE_DIR,
+        normalize_agent_id=_normalize_agent_id,
+    )
 
 
 def run_permission_hook(wait_secs: int, copilot_mode: bool = False,
                         vscode_prettool_mode: bool = False,
                         agent_id: str | None = None) -> None:
-    """
-    PermissionRequest hook mode (--hook permission): forward the prompt to the
-    daemon and block until someone approves/denies remotely or the daemon
-    times out. Prints the Claude Code decision JSON on allow/deny; prints
-    nothing otherwise, which makes Claude Code show its normal built-in prompt.
-    """
-    data = hook_runtime.parse_json_object(sys.stdin.read())
-    session_id = hook_runtime.session_id(data)
-    normalized_agent = _normalize_agent_id(
-        agent_id or ("copilot" if (copilot_mode or vscode_prettool_mode) else "claude")
+    hook_commands.run_permission_hook(
+        copilot_mode=copilot_mode,
+        vscode_prettool_mode=vscode_prettool_mode,
+        agent_id=agent_id,
+        socket_path=SOCKET_PATH,
+        monitor_state_dir=MONITOR_STATE_DIR,
+        policy_path=POLICY_PATH,
+        policy_lock=_policy_lock,
+        hook_wait_ceiling=HOOK_WAIT_CEILING,
+        normalize_agent_id=_normalize_agent_id,
+        agent_display_name=_agent_display_name,
     )
-    tool_name = hook_runtime.tool_name(data)
-    tool_input = hook_runtime.tool_input(data)
-    cwd = str(data.get("cwd") or "")
-
-    # The shared ~/.copilot/hooks file is loaded by both Copilot CLI and VS Code.
-    # Only VS Code's PreToolUse payload carries tool_use_id, so use it to keep
-    # the extra PreToolUse hook a no-op under CLI sessions.
-    if vscode_prettool_mode and not data.get("tool_use_id"):
-        return
-
-    # Question tools are answered through run_question_hook (updatedInput), not
-    # this allow/deny path. Skip so PreToolUse question hooks can handle them.
-    if hook_runtime.is_question_tool(tool_name, tool_input):
-        return
-
-    # Memory policy: allow only read-only view access for repo/session scopes.
-    # Keep all mutating memory operations and user-global memory behind prompts.
-    if _is_safe_memory_read(tool_name, tool_input):
-        _emit_permission_decision(
-            "allow", copilot_mode, vscode_prettool_mode,
-            "Read-only memory view in repo/session scope")
-        return
-
-    # Exact commands explicitly approved for this repository are shared across
-    # Claude, Copilot, and Codex. No prefix, regex, or shell parsing is used.
-    if _is_allowed_command(tool_name, tool_input, cwd):
-        _emit_permission_decision(
-            "allow", copilot_mode, vscode_prettool_mode,
-            "Exact command allowed by codelight policy")
-        return
-
-    # Trusted apply_patch edits: allow when all target files are in trusted
-    # folders and the patch does not request file deletion.
-    if _is_safe_trusted_apply_patch(tool_name, tool_input, cwd):
-        _emit_permission_decision(
-            "allow", copilot_mode, vscode_prettool_mode,
-            "apply_patch target is within trusted codelight folder")
-        return
-
-    # Trusted-folder short-circuit: only allow explicit trust/read-only probes
-    # under codelight policy roots. Mutating tools must still ask for approval.
-    if _is_trusted_repo_cwd(cwd) and _is_trusted_auto_allow_tool(tool_name):
-        _emit_permission_decision(
-            "allow", copilot_mode, vscode_prettool_mode,
-            "Read-only tool in trusted codelight folder")
-        return
-
-    # ExitPlanMode carries the full plan (markdown) in tool_input — keep it
-    # readable on the client instead of clipping it to the default 500 chars.
-    trunc = (_truncate_tool_input(tool_input, max_str=8000, max_total=12000)
-             if tool_name == "ExitPlanMode"
-             else _truncate_tool_input(tool_input))
-    request = {
-        "type":       "permission_request",
-        "session_id": session_id,
-        "agent_id":   normalized_agent,
-        "agent_display": _agent_display_name(normalized_agent),
-        "prompt_id":  data.get("prompt_id") or uuid.uuid4().hex,
-        "tool_name":  tool_name,
-        "summary":    _tool_summary(tool_name, tool_input),
-        "tool_input": trunc,
-        "policy_command": _command_from_tool(tool_name, tool_input),
-        "cwd":        cwd,
-    }
-
-    try:
-        response = hook_io.request_json(
-            SOCKET_PATH,
-            request,
-            connect_timeout=2.0,
-            response_timeout=HOOK_WAIT_CEILING,
-            max_bytes=4096,
-        )
-        decision = response.get("decision") if response else None
-        if decision in ("allow", "deny"):
-            _emit_permission_decision(
-                decision, copilot_mode, vscode_prettool_mode,
-                "Denied by remote codelight approval" if decision == "deny" else "")
-        return
-    except Exception:
-        pass
-
-    # Daemon unreachable: behave like the plain status hook so the session
-    # still shows as waiting, and let Claude Code prompt normally.
-    try:
-        hook_io.write_monitor_state(
-            MONITOR_STATE_DIR,
-            session_id=session_id,
-            state="waiting",
-            agent_id=normalized_agent,
-        )
-    except Exception:
-        pass
 
 
 def run_question_hook(wait_secs: int, vscode_prettool_mode: bool = False,
                       codex_context_mode: bool = False,
                       agent_id: str | None = None) -> None:
-    """
-    PreToolUse hook mode: forward question(s) to the daemon and block for a
-        remote answer.
-        - Default (Claude-style): emits PreToolUse updatedInput with answers.
-        - VS Code/Codex context mode: emits PreToolUse deny + additionalContext
-            so the native ask dialog/tool is skipped and the model still
-            receives the answer.
-        Prints nothing on timeout/disabled/unreachable → local dialog fallback.
-    """
-    normalized_agent = _normalize_agent_id(
-        agent_id or ("copilot" if vscode_prettool_mode else "claude")
+    hook_commands.run_question_hook(
+        vscode_prettool_mode=vscode_prettool_mode,
+        codex_context_mode=codex_context_mode,
+        agent_id=agent_id,
+        socket_path=SOCKET_PATH,
+        hook_wait_ceiling=HOOK_WAIT_CEILING,
+        normalize_agent_id=_normalize_agent_id,
+        agent_display_name=_agent_display_name,
     )
-
-    data = hook_runtime.parse_json_object(sys.stdin.read())
-    tool_input = hook_runtime.tool_input(data)
-    questions = hook_runtime.questions_from_input(data, tool_input)
-    if not questions:
-        return   # nothing to answer → fall through
-
-    request = {
-        "type":       "question_request",
-        "session_id": hook_runtime.session_id(data),
-        "agent_id":   normalized_agent,
-        "agent_display": _agent_display_name(normalized_agent),
-        "prompt_id":  data.get("prompt_id") or uuid.uuid4().hex,
-        "questions":  questions,
-        "cwd":        data.get("cwd", ""),
-    }
-
-    try:
-        response = hook_io.request_json(
-            SOCKET_PATH,
-            request,
-            connect_timeout=2.0,
-            response_timeout=HOOK_WAIT_CEILING,
-            max_bytes=65536,
-        )
-        answers = response.get("answers") if response else None
-        if isinstance(answers, dict) and answers:
-            if vscode_prettool_mode or codex_context_mode:
-                print(json.dumps(hook_runtime.question_context_output(answers)))
-            else:
-                # VS Code/Copilot and Claude variants may look for different
-                # override fields/shapes. Provide a rich replacement object so a
-                # remote answer can short-circuit the native ask dialog.
-                # updatedInput REPLACES tool_input for Claude-style hooks.
-                # modifiedArgs is the equivalent shape used by Copilot CLI docs.
-                print(json.dumps(
-                    hook_runtime.question_updated_input_output(tool_input, answers)
-                ))
-    except Exception:
-        pass
-    # Any failure → print nothing → Claude Code shows its own dialog.
 
 # ── Usage API ─────────────────────────────────────────────────────────────────
 # Credentials are read fresh each poll so token rotations are picked up automatically.
@@ -1266,247 +865,91 @@ def run_dashboard(host: str, ws_port: int, secret: str) -> None:
 
 def _ws_thread(port: int, secret: str) -> None:
     """Run a WebSocket server; screen and Android clients connect here for live updates."""
-    global _ws_loop, _ws_clients
+    global _ws_hub
 
     if not _have_websockets:
         print("[ws] websockets not installed — clients unavailable", file=sys.stderr)
         print("[ws] Install: pip install websockets", file=sys.stderr)
         return
 
-    async def handler(ws, *_) -> None:
-        if secret:
-            # Challenge-response: the client proves it knows the secret by
-            # returning HMAC-SHA256(secret, nonce), so the secret itself never
-            # crosses the (plaintext ws://) wire.
-            try:
-                nonce = secrets.token_hex(16)
-                await ws.send(json.dumps({"type": "challenge", "nonce": nonce}))
-                msg = await asyncio.wait_for(ws.recv(), timeout=5.0)
-                data = json.loads(msg)
-                ok = _valid_auth_response(data, secret, nonce)
-                if not ok:
-                    _log(f"[ws] auth failed from {ws.remote_address}")
-                    try:
-                        await ws.send(json.dumps({"error": "unauthorized", "message": "Wrong password"}))
-                    except Exception:
-                        pass
-                    await ws.close(1008, "Unauthorized")
-                    return
-            except Exception:
-                _log(f"[ws] auth error from {ws.remote_address}")
-                try:
-                    await ws.send(json.dumps({"error": "unauthorized", "message": "Wrong password"}))
-                except Exception:
-                    pass
-                await ws.close(1008, "Unauthorized")
-                return
-
-        _ws_clients.add(ws)
-        _log(f"[ws] client connected ({len(_ws_clients)} total)")
-        try:
-            # Push timezone offset so the screen can configure NTP correctly,
-            # and tell clients whether remote-control (permissions/questions/
-            # conversation) is armed so the app can show its control tabs.
-            utc_offset = int(datetime.now().astimezone().utcoffset().total_seconds())
-            await ws.send(json.dumps({"type": "config", "utc_offset": utc_offset,
-                                      "remote_control": _remote_permissions}))
-
-            # Send current state immediately so the client isn't blank on connect
-            await ws.send(json.dumps(_status_snapshot()))
-
-            client_name = "ws"
-            try:
-                async for raw in ws:
-                    try:
-                        m = json.loads(raw)
-                    except Exception:
-                        continue
-                    mtype = m.get("type")
-
-                    if mtype == "subscribe":
-                        client_name = str(m.get("client") or "ws")
-                        feats = m.get("features") or []
-                        # A client that wants permissions and/or questions joins
-                        # the remote-control subscriber set and gets both replays.
-                        wants = (("permissions" in feats and _remote_permissions)
-                                 or ("questions" in feats and _remote_questions))
-                        if wants:
-                            _perm_clients.add(ws)
-                            # Track question-answering clients separately so the
-                            # fall-through gate knows if anyone can answer.
-                            if "questions" in feats and _remote_questions:
-                                _question_clients.add(ws)
-                            _log(f"[ws] remote-control subscriber: {client_name}")
-                            with _lock:
-                                pending = ([_perm_request_payload(e) for e in _pending_perms.values()]
-                                           + [_question_request_payload(e) for e in _pending_questions.values()])
-                            for p in pending:
-                                await ws.send(json.dumps(p))
-                        # Conversation feed: gated on remote-control being armed.
-                        if "conversation" in feats and _remote_permissions:
-                            _conv_clients.add(ws)
-                            _log(f"[ws] conversation subscriber: {client_name}")
-                            snapshot = _conversation_payload()
-                            if snapshot is not None:
-                                await ws.send(json.dumps(snapshot))
-                            _notify_conversation_changed()
-
-                    elif mtype == "permission_response":
-                        rid      = str(m.get("id", ""))
-                        decision = str(m.get("decision", ""))
-                        if _resolve_permission(rid, decision, client_name):
-                            _log(f"[perm] {decision} by {client_name}")
-
-                    elif mtype == "question_response":
-                        rid     = str(m.get("id", ""))
-                        answers = m.get("answers")
-                        if _resolve_question(rid, answers, client_name):
-                            _log(f"[question] answered by {client_name}")
-
-                    elif mtype == "extend":
-                        _extend_request(str(m.get("id", "")))
-            except Exception:
-                pass  # connection reset without close frame — normal on app restart
-        finally:
-            _ws_clients.discard(ws)
-            _perm_clients.discard(ws)
-            _conv_clients.discard(ws)
-            if ws in _question_clients:
-                _note_qclient_gone()
-            _question_clients.discard(ws)
-            _log(f"[ws] client disconnected ({len(_ws_clients)} remaining)")
-
-    async def serve() -> None:
-        global _last_ws_status, _dbus_iface
-
-        if _have_dbus:
-            try:
-                dbus_bus = await _DbusMessageBus(bus_type=_DbusBusType.SESSION).connect()
-                iface = CodelightDbusInterface()  # type: ignore[name-defined]
-                dbus_bus.export('/se/sensnology/codelight', iface)
-                await dbus_bus.request_name('se.sensnology.codelight')
-                _dbus_iface = iface
-                _log("[dbus] service exported")
-            except Exception as e:
-                print(f"[dbus] setup failed: {e}", file=sys.stderr, flush=True)
-
-        async with _websockets.serve(handler, "0.0.0.0", port):
-            vprint(f"[ws] listening on :{port}")
-            while not _shutdown.is_set():
-                await asyncio.sleep(2)
-                if not _ws_clients and _dbus_iface is None:
-                    continue
-                # Detect status changes caused by session timeouts (no hook fires for those).
-                _, current_status, _, _ = _overall_status()
-                if current_status != _last_ws_status:
-                    _last_ws_status = current_status
-                    payload = _status_snapshot()
-                    msg = json.dumps(payload)
-                    _log(f"[ws] timeout → {current_status}")
-                    if _ws_clients:
-                        await asyncio.gather(
-                            *[c.send(msg) for c in list(_ws_clients)],
-                            return_exceptions=True,
-                        )
-                    if _dbus_iface is not None:
-                        try:
-                            _dbus_iface.StatusChanged(msg)  # type: ignore[union-attr]
-                        except Exception:
-                            pass
-
-    _ws_loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(_ws_loop)
+    _ws_hub = CodelightWebsocketHub(
+        websockets_module=_websockets,
+        shutdown=_shutdown,
+        remote_permissions=lambda: _remote_permissions,
+        remote_questions=lambda: _remote_questions,
+        status_snapshot=_status_snapshot,
+        overall_status=_overall_status,
+        pending_payloads=_pending_remote_payloads,
+        conversation_payload=_conversation_payload,
+        notify_conversation_changed=_notify_conversation_changed,
+        note_question_client_gone=_note_qclient_gone,
+        respond_permission=_resolve_permission,
+        respond_question=_resolve_question,
+        extend_request=_extend_request,
+        announce_gnome=_announce_gnome,
+        log=_log,
+        verbose_log=vprint,
+    )
     try:
-        _ws_loop.run_until_complete(serve())
-    except Exception as e:
-        print(f"[ws] server error: {e}", file=sys.stderr)
+        _ws_hub.run(port=port, secret=secret)
     finally:
-        _ws_loop.close()
-        _ws_loop = None
-
+        _ws_hub = None
 
 def _mdns_thread(port: int, name: str) -> None:
-    if not _have_zeroconf:
-        discovery_core.unavailable_message()
-        return
     discovery_core.advertise_mdns(
         port=port,
         name=name,
         shutdown=_shutdown,
-        zeroconf_cls=Zeroconf,
-        service_info_cls=ServiceInfo,
         log=_log,
         verbose_log=vprint,
     )
 
 
+def _handle_socket_message(conn, msg: dict) -> bool:
+    """Handle one parsed Unix-socket hook message.
+
+    Returns True when the handler takes ownership of the connection.
+    """
+    if msg.get("type") == "permission_request":
+        _register_permission(conn, msg)
+        return True
+    if msg.get("type") == "question_request":
+        _register_question(conn, msg)
+        return True
+
+    sid = msg.get("session_id", "unknown")
+    state = msg.get("state", "")
+
+    if state:
+        transcript_path = (
+            msg.get("transcript_path")
+            or msg.get("transcriptPath")
+            or msg.get("transcript")
+            or ""
+        )
+        _update_session(sid, state,
+                        transcript=transcript_path,
+                        cwd=msg.get("cwd", ""),
+                        agent_id=msg.get("agent_id", DEFAULT_AGENT_ID))
+        # PreToolUse status and question hooks may run concurrently.
+        # Only completion events prove a local prompt is finished.
+        _cancel_pending_for_hook(
+            sid, state, str(msg.get("hook_event") or ""))
+        vprint(f"[socket] {sid[:8]}… → {state}")
+        _push()
+        # The transcript just grew — refresh the conversation feed.
+        _notify_conversation_changed()
+    return False
+
+
 def _socket_thread() -> None:
     """Accept hook events on the Unix socket and broadcast to clients immediately."""
-    try:
-        os.unlink(SOCKET_PATH)
-    except FileNotFoundError:
-        pass
-
-    srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-    srv.bind(SOCKET_PATH)
-    srv.listen(32)
-    srv.settimeout(1.0)
-    vprint(f"[socket] listening on {SOCKET_PATH}")
-
-    try:
-        while not _shutdown.is_set():
-            try:
-                conn, _ = srv.accept()
-            except socket.timeout:
-                continue
-            try:
-                conn.settimeout(2.0)
-                msg = hook_io.read_json_message(conn, max_bytes=8192)
-                if msg is None:
-                    continue
-
-                if msg.get("type") == "permission_request":
-                    _register_permission(conn, msg)   # takes ownership of conn
-                    conn = None
-                    continue
-                if msg.get("type") == "question_request":
-                    _register_question(conn, msg)     # takes ownership of conn
-                    conn = None
-                    continue
-
-                sid   = msg.get("session_id", "unknown")
-                state = msg.get("state", "")
-
-                if state:
-                    transcript_path = (
-                        msg.get("transcript_path")
-                        or msg.get("transcriptPath")
-                        or msg.get("transcript")
-                        or ""
-                    )
-                    _update_session(sid, state,
-                                    transcript=transcript_path,
-                                    cwd=msg.get("cwd", ""),
-                                    agent_id=msg.get("agent_id", DEFAULT_AGENT_ID))
-                    # PreToolUse status and question hooks may run concurrently.
-                    # Only completion events prove a local prompt is finished.
-                    _cancel_pending_for_hook(
-                        sid, state, str(msg.get("hook_event") or ""))
-                    vprint(f"[socket] {sid[:8]}… → {state}")
-                    _push()
-                    # The transcript just grew — refresh the conversation feed.
-                    _notify_conversation_changed()
-            except Exception as e:
-                vprint(f"[socket] error: {e}")
-            finally:
-                if conn is not None:
-                    conn.close()
-    finally:
-        srv.close()
-        try:
-            os.unlink(SOCKET_PATH)
-        except FileNotFoundError:
-            pass
+    socket_server.serve_hook_socket(
+        socket_path=SOCKET_PATH,
+        shutdown=_shutdown,
+        handle_message=_handle_socket_message,
+        log=vprint,
+    )
 
 
 def _usage_thread() -> None:
@@ -1532,43 +975,14 @@ def uninstall() -> None:
     _remove_matcher_group_hooks(_codex_hooks_path())
 
     copilot_hooks = _copilot_hooks_path()
-    try:
-        os.unlink(copilot_hooks)
-        print(f"[uninstall] removed {copilot_hooks}")
-    except FileNotFoundError:
-        pass
-    except Exception as e:
-        print(f"[uninstall] could not remove {copilot_hooks}: {e}", file=sys.stderr)
+    service_core.remove_file(copilot_hooks)
+    service_core.remove_empty_dir(os.path.dirname(copilot_hooks))
 
-    copilot_hooks_dir = os.path.dirname(copilot_hooks)
-    try:
-        os.rmdir(copilot_hooks_dir)
-        print(f"[uninstall] removed empty {copilot_hooks_dir}")
-    except OSError:
-        pass
-
-    try:
-        os.unlink(POLICY_PATH)
-        print(f"[uninstall] removed {POLICY_PATH}")
-    except FileNotFoundError:
-        pass
-    except Exception as e:
-        print(f"[uninstall] could not remove {POLICY_PATH}: {e}",
-              file=sys.stderr)
-    try:
-        os.rmdir(CODELIGHT_CONFIG_HOME)
-    except OSError:
-        pass
+    service_core.remove_file(POLICY_PATH)
+    service_core.remove_empty_dir(CODELIGHT_CONFIG_HOME)
 
     for path in [SOCKET_PATH, MONITOR_STATE_DIR]:
-        try:
-            if os.path.isdir(path):
-                shutil.rmtree(path)
-            else:
-                os.unlink(path)
-            print(f"[uninstall] removed {path}")
-        except FileNotFoundError:
-            pass
+        service_core.remove_path(path)
 
     service_core.uninstall_service(run=subprocess.run)
 
