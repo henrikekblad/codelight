@@ -30,6 +30,22 @@ HOOK_MODES = (
 )
 
 
+def transcript_extractor(record: dict, tool_summary) -> tuple[str, object] | None:
+    """Match Claude Code's transcript JSONL: {"type": "user"|"assistant", "message": ...}."""
+    t = str(record.get("type") or "").strip().lower()
+    if t not in ("user", "assistant"):
+        return None
+    msg = record.get("message")
+    if isinstance(msg, dict):
+        role = str(msg.get("role") or t)
+        content = msg.get("content")
+        if content is not None:
+            return role, content
+    if isinstance(msg, str):
+        return t, msg
+    return None
+
+
 def build_integration(agent: ClaudeAgent, *, settings_path: str) -> base.AgentIntegration:
     def _install_hooks(*, script_path, hook_wait_ceiling, remote_permissions,
                        remote_questions, permission_timeout, log=None):
@@ -49,6 +65,7 @@ def build_integration(agent: ClaudeAgent, *, settings_path: str) -> base.AgentIn
         usage_fetcher=agent.get_usage,
         install_hooks=_install_hooks,
         removable_hook_paths=(settings_path,),
+        transcript_extractor=transcript_extractor,
     )
 
 

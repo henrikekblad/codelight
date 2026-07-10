@@ -43,6 +43,9 @@ class AgentSpec:
     display: str
     executables: tuple[str, ...] = ()
     vscode_extensions: frozenset[str] = frozenset()
+    # Read-only tools of this agent that are safe to auto-allow when the
+    # session cwd is inside a user-trusted folder.
+    trusted_auto_allow_tools: frozenset[str] = frozenset()
 
 
 @dataclass(frozen=True)
@@ -66,3 +69,5 @@ class AgentIntegration:
     removable_empty_dirs: tuple[str, ...] = ()
     transcript_path_for_session: Callable[[str], str] | None = None
     latest_transcript_fallback: Callable[[], str] | None = None
+    # Sniffs one transcript JSONL record; see transcript.TranscriptExtractor.
+    transcript_extractor: Callable[..., "tuple[str, object] | None"] | None = None

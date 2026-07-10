@@ -240,36 +240,6 @@ def tool_summary(tool_name: str, tool_input: dict) -> str:
     return f"{tool_name}: {detail}" if detail else tool_name
 
 
-def is_trusted_auto_allow_tool(tool_name: str) -> bool:
-    """Tools that are safe to auto-allow inside a trusted workspace."""
-    t = str(tool_name or "").strip()
-    if not t:
-        return False
-    if t in {"check_workspace_trust", "read_workspace_status"}:
-        return True
-    return t in {
-        "list_dir",
-        "read_file",
-        "file_search",
-        "grep_search",
-        "semantic_search",
-        "get_errors",
-        "get_changed_files",
-        "copilot_getNotebookSummary",
-        "read_notebook_cell_output",
-        "read_page",
-        "screenshot_page",
-        "view_image",
-        "fetch_webpage",
-        "vscode_listCodeUsages",
-        "terminal_last_command",
-        "terminal_selection",
-        "testFailure",
-        "get_task_output",
-        "manage_todo_list",
-    }
-
-
 def is_safe_memory_read(tool_name: str, tool_input) -> bool:
     """Allow memory reads for repo/session scopes only."""
     if str(tool_name or "").strip() != "memory":

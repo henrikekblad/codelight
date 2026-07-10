@@ -5,6 +5,7 @@ import os
 from typing import Callable
 
 from codelight_core import hooks as hooks_core
+from codelight_core import transcript as transcript_core
 from codelight_core.agents import base
 from codelight_core.timefmt import format_epoch_countdown
 
@@ -24,6 +25,57 @@ HOOK_MODES = (
 
 def default_home() -> str:
     return os.path.expanduser(os.environ.get("CODEX_HOME", "~/.codex"))
+
+
+def tool_result_text(content) -> str:
+    """Remove Codex's execution envelope from a tool result."""
+    if not isinstance(content, str):
+        return transcript_core.tool_result_text(content)
+    lines = content.strip().splitlines()
+    while lines and (
+        lines[0].startswith("Chunk ID:")
+        or lines[0].startswith("Wall time:")
+        or lines[0].startswith("Process exited with code ")
+        or lines[0].startswith("Process running with session ID ")
+        or lines[0].startswith("Exit code:")
+        or lines[0].startswith("Original token count:")
+        or lines[0].startswith("Final output:")
+        or lines[0].startswith("Original output:")
+        or lines[0].startswith("Output:")
+    ):
+        lines.pop(0)
+    return " ".join("\n".join(lines).split())
+
+
+def transcript_extractor(record: dict, tool_summary) -> tuple[str, object] | None:
+    """Match Codex's rollout JSONL: {"type": "response_item", "payload": ...}."""
+    if str(record.get("type") or "").strip().lower() != "response_item":
+        return None
+    payload = record.get("payload")
+    if not isinstance(payload, dict):
+        return None
+    pt = str(payload.get("type") or "").strip().lower()
+    if pt == "message":
+        role = str(payload.get("role") or "").strip().lower()
+        if role in ("user", "assistant"):
+            return role, payload.get("content")
+        return None
+    if pt in ("function_call", "custom_tool_call", "tool_call"):
+        name = str(payload.get("name") or "tool")
+        args = payload.get("arguments", payload.get("input", {}))
+        if isinstance(args, str):
+            try:
+                args = json.loads(args)
+            except Exception:
+                args = {"input": args}
+        if not isinstance(args, dict):
+            args = {"input": args}
+        return "tool", tool_summary(name, args)
+    if pt in ("function_call_output", "custom_tool_call_output",
+              "tool_call_output"):
+        output = tool_result_text(payload.get("output"))
+        return "output", ("↳ " + output[:400]) if output else None
+    return None
 
 
 def build_integration(agent: CodexAgent, *, home: str) -> base.AgentIntegration:
@@ -48,6 +100,7 @@ def build_integration(agent: CodexAgent, *, home: str) -> base.AgentIntegration:
         install_hooks=_install_hooks,
         removable_hook_paths=(hooks_file,),
         transcript_path_for_session=agent.rollout_path_for_session,
+        transcript_extractor=transcript_extractor,
     )
 
 

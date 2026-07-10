@@ -1,10 +1,14 @@
 from __future__ import annotations
 
 import json
-from typing import Callable
+from typing import Callable, Sequence
 
 
 ToolSummary = Callable[[str, dict], str]
+# Sniffs one parsed transcript record: returns (role, content) when the record
+# matches the agent's transcript format, or None to let the next extractor or
+# the generic heuristics try.
+TranscriptExtractor = Callable[[dict, ToolSummary], "tuple[str, object] | None"]
 
 
 def is_noise(s: str) -> bool:
@@ -30,26 +34,6 @@ def tool_result_text(content) -> str:
     return " ".join(s.split())
 
 
-def codex_tool_result_text(content) -> str:
-    """Remove Codex's execution envelope from a tool result."""
-    if not isinstance(content, str):
-        return tool_result_text(content)
-    lines = content.strip().splitlines()
-    while lines and (
-        lines[0].startswith("Chunk ID:")
-        or lines[0].startswith("Wall time:")
-        or lines[0].startswith("Process exited with code ")
-        or lines[0].startswith("Process running with session ID ")
-        or lines[0].startswith("Exit code:")
-        or lines[0].startswith("Original token count:")
-        or lines[0].startswith("Final output:")
-        or lines[0].startswith("Original output:")
-        or lines[0].startswith("Output:")
-    ):
-        lines.pop(0)
-    return " ".join("\n".join(lines).split())
-
-
 def extract_transcript_path(data: dict) -> str:
     """Read transcript path across hook payload variants."""
     if not isinstance(data, dict):
@@ -70,9 +54,12 @@ def extract_transcript_path(data: dict) -> str:
 
 
 def parse_transcript(path: str, *, tool_summary: ToolSummary,
+                     extractors: Sequence[TranscriptExtractor] = (),
                      max_msgs: int = 60) -> list[dict]:
     """Best-effort parse of supported-agent transcript JSONL.
 
+    ``extractors`` carry the agent-specific format knowledge (each agent's
+    integration contributes one); generic heuristics below catch the rest.
     Transcript formats are internal to each agent and can change without
     notice, so this parser deliberately never raises.
     """
@@ -83,47 +70,12 @@ def parse_transcript(path: str, *, tool_summary: ToolSummary,
         return []
 
     def extract_role_and_content(o: dict):
+        for extractor in extractors:
+            found = extractor(o, tool_summary)
+            if found is not None:
+                return found
+
         t = str(o.get("type") or "").strip().lower()
-
-        if t == "response_item" and isinstance(o.get("payload"), dict):
-            payload = o["payload"]
-            pt = str(payload.get("type") or "").strip().lower()
-            if pt == "message":
-                role = str(payload.get("role") or "").strip().lower()
-                if role in ("user", "assistant"):
-                    return role, payload.get("content")
-            if pt in ("function_call", "custom_tool_call", "tool_call"):
-                name = str(payload.get("name") or "tool")
-                args = payload.get("arguments", payload.get("input", {}))
-                if isinstance(args, str):
-                    try:
-                        args = json.loads(args)
-                    except Exception:
-                        args = {"input": args}
-                if not isinstance(args, dict):
-                    args = {"input": args}
-                return "tool", tool_summary(name, args)
-            if pt in ("function_call_output", "custom_tool_call_output",
-                      "tool_call_output"):
-                output = codex_tool_result_text(payload.get("output"))
-                return "output", ("↳ " + output[:400]) if output else None
-
-        if t in ("user.message", "assistant.message"):
-            data = o.get("data")
-            if isinstance(data, dict):
-                content = data.get("content")
-                if content is not None:
-                    return ("user" if t.startswith("user") else "assistant"), content
-
-        if t in ("user", "assistant"):
-            msg = o.get("message")
-            if isinstance(msg, dict):
-                role = str(msg.get("role") or t)
-                content = msg.get("content")
-                if content is not None:
-                    return role, content
-            if isinstance(msg, str):
-                return t, msg
 
         role = str(o.get("role") or "").strip().lower()
         content = o.get("content")

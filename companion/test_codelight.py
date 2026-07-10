@@ -241,6 +241,12 @@ class CopilotUsageTests(unittest.TestCase):
 
 
 class PermissionPolicyTests(unittest.TestCase):
+    def test_trusted_auto_allow_tools_are_agent_scoped(self):
+        registry = codelight._new_agent_registry()
+        self.assertIn("read_file", registry.trusted_auto_allow_tools("copilot"))
+        self.assertEqual(registry.trusted_auto_allow_tools("claude"), frozenset())
+        self.assertEqual(registry.trusted_auto_allow_tools("unknown"), frozenset())
+
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         self.policy = os.path.join(self.tmp.name, "policy.json")

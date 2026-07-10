@@ -20,6 +20,29 @@ SPEC = base.AgentSpec(
     "Copilot",
     executables=("copilot",),
     vscode_extensions=frozenset({"github.copilot", "github.copilot-chat"}),
+    trusted_auto_allow_tools=frozenset({
+        "check_workspace_trust",
+        "read_workspace_status",
+        "list_dir",
+        "read_file",
+        "file_search",
+        "grep_search",
+        "semantic_search",
+        "get_errors",
+        "get_changed_files",
+        "copilot_getNotebookSummary",
+        "read_notebook_cell_output",
+        "read_page",
+        "screenshot_page",
+        "view_image",
+        "fetch_webpage",
+        "vscode_listCodeUsages",
+        "terminal_last_command",
+        "terminal_selection",
+        "testFailure",
+        "get_task_output",
+        "manage_todo_list",
+    }),
 )
 
 HOOK_MODES = (
@@ -35,6 +58,19 @@ HOOK_MODES = (
 
 def default_home() -> str:
     return os.path.expanduser(os.environ.get("COPILOT_HOME", "~/.copilot"))
+
+
+def transcript_extractor(record: dict, tool_summary) -> tuple[str, object] | None:
+    """Match Copilot's events JSONL: {"type": "user.message"|"assistant.message", "data": ...}."""
+    t = str(record.get("type") or "").strip().lower()
+    if t not in ("user.message", "assistant.message"):
+        return None
+    data = record.get("data")
+    if isinstance(data, dict):
+        content = data.get("content")
+        if content is not None:
+            return ("user" if t.startswith("user") else "assistant"), content
+    return None
 
 
 def build_integration(agent: CopilotAgent, *, home: str) -> base.AgentIntegration:
@@ -63,6 +99,7 @@ def build_integration(agent: CopilotAgent, *, home: str) -> base.AgentIntegratio
         # Copilot hooks do not always pass a transcript path, so keep the old
         # behavior of falling back to its newest local events file.
         latest_transcript_fallback=agent.latest_events_path,
+        transcript_extractor=transcript_extractor,
     )
 
 

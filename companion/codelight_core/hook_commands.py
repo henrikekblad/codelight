@@ -82,6 +82,7 @@ def run_permission_hook(
     hook_wait_ceiling: int,
     normalize_agent_id: AgentNameCallback,
     agent_display_name: AgentDisplayCallback,
+    auto_allow_tools: Callable[[str], frozenset[str]] = lambda agent_id: frozenset(),
     input_text: str | None = None,
 ) -> None:
     """Forward a permission prompt to the daemon or fall back to local prompt."""
@@ -123,7 +124,7 @@ def run_permission_hook(
 
     if (
         policy_core.is_trusted_repo_cwd(policy_path, cwd)
-        and policy_core.is_trusted_auto_allow_tool(tool_name)
+        and tool_name in auto_allow_tools(normalized_agent)
     ):
         emit_permission_decision(
             "allow",
