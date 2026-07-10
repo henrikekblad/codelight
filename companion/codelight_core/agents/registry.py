@@ -84,6 +84,15 @@ class AgentRegistry:
             for agent_id, integration in self._integrations.items()
         }
 
+    @property
+    def default_agent_id(self) -> str:
+        """Fallback agent for events that don't carry an agent id.
+
+        The first registered integration; also the agent whose usage meters
+        are shown when nothing is active.
+        """
+        return next(iter(self._integrations))
+
     def display_registry(self) -> dict[str, dict[str, str]]:
         return {
             agent_id: {"display": spec.display}
@@ -106,6 +115,10 @@ class AgentRegistry:
             for agent_id, spec in self.specs.items()
             if spec.vscode_extensions
         }
+
+    def trusted_auto_allow_tools(self, agent_id: str) -> frozenset[str]:
+        spec = self.specs.get(agent_id)
+        return spec.trusted_auto_allow_tools if spec else frozenset()
 
     def hook_modes(self) -> dict[str, HookMode]:
         modes: dict[str, HookMode] = {}
@@ -175,6 +188,13 @@ class AgentRegistry:
         if integration is None or integration.transcript_path_for_session is None:
             return ""
         return integration.transcript_path_for_session(session_id)
+
+    def transcript_extractors(self) -> tuple[Callable, ...]:
+        return tuple(
+            integration.transcript_extractor
+            for integration in self._integrations.values()
+            if integration.transcript_extractor is not None
+        )
 
     def latest_transcript_fallbacks(self) -> list[tuple[str, str]]:
         return [

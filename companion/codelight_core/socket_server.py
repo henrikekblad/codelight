@@ -24,6 +24,7 @@ def serve_hook_socket(
     `handle_message` returns True when it takes ownership of the connection
     (permission/question hooks block on that connection until resolved).
     """
+    os.makedirs(os.path.dirname(socket_path), exist_ok=True)
     try:
         os.unlink(socket_path)
     except FileNotFoundError:

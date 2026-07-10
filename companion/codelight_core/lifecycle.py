@@ -88,6 +88,7 @@ def uninstall(
     config_home: str,
     socket_path: str,
     monitor_state_dir: str,
+    legacy_paths: tuple[str, ...] = (),
 ) -> None:
     """Remove codelight hooks, local state, service, and optional clients."""
     for path in agent_registry.removable_hook_paths():
@@ -101,7 +102,7 @@ def uninstall(
     service_core.remove_file(policy_path)
     service_core.remove_empty_dir(config_home)
 
-    for path in [socket_path, monitor_state_dir]:
+    for path in [socket_path, monitor_state_dir, *legacy_paths]:
         service_core.remove_path(path)
 
     service_core.uninstall_service(run=subprocess.run)

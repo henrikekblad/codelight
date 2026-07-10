@@ -42,11 +42,16 @@ except ImportError:
 
 # ── Config ────────────────────────────────────────────────────────────────────
 
-MONITOR_STATE_DIR = os.path.expanduser("~/.claude/monitor_state")
-SOCKET_PATH       = os.path.expanduser("~/.claude/codelight.sock")
 CODELIGHT_CONFIG_HOME = os.path.expanduser(
     os.environ.get("CODELIGHT_CONFIG_HOME", "~/.config/codelight"))
+MONITOR_STATE_DIR = os.path.join(CODELIGHT_CONFIG_HOME, "monitor_state")
+SOCKET_PATH       = os.path.join(CODELIGHT_CONFIG_HOME, "codelight.sock")
 POLICY_PATH       = os.path.join(CODELIGHT_CONFIG_HOME, "policy.json")
+# Pre-1.x locations, cleaned up on uninstall.
+LEGACY_STATE_PATHS = (
+    os.path.expanduser("~/.claude/monitor_state"),
+    os.path.expanduser("~/.claude/codelight.sock"),
+)
 USAGE_INTERVAL      = 60   # seconds between usage API polls
 IDLE_WINDOW         = 600  # seconds before a silent "working" session is dropped
 IDLE_WINDOW_WAITING = 30   # seconds before a "waiting" session is dropped (subagents resolve quickly)
@@ -90,9 +95,6 @@ _log_lines:       collections.deque = collections.deque(maxlen=10)
 _conversation_refresher: ConversationRefresher | None = None
 _remote_manager: remote_control.RemoteRequestManager | None = None
 
-DEFAULT_AGENT_ID = "claude"
-
-
 def _new_agent_registry(log=None) -> AgentRegistry:
     return AgentRegistry(
         github_org=_github_org,
@@ -103,6 +105,7 @@ def _new_agent_registry(log=None) -> AgentRegistry:
 
 _agents = _new_agent_registry()
 AGENT_REGISTRY = _agents.display_registry()
+DEFAULT_AGENT_ID = _agents.default_agent_id
 _state = CodelightState(
     default_agent_id=DEFAULT_AGENT_ID,
     agent_registry=AGENT_REGISTRY,
@@ -183,7 +186,8 @@ def _active_transcript() -> tuple[str, str]:
 
 def _parse_transcript(path: str, max_msgs: int = 60) -> list[dict]:
     return transcript_core.parse_transcript(
-        path, tool_summary=_tool_summary, max_msgs=max_msgs)
+        path, tool_summary=_tool_summary,
+        extractors=_agents.transcript_extractors(), max_msgs=max_msgs)
 
 
 def _conversation_payload() -> dict | None:
@@ -491,6 +495,7 @@ def run_permission_hook(wait_secs: int, mode, agent_id: str | None = None) -> No
     hook_commands.run_permission_hook(
         mode=mode,
         agent_id=agent_id,
+        auto_allow_tools=_agents.trusted_auto_allow_tools,
         socket_path=SOCKET_PATH,
         monitor_state_dir=MONITOR_STATE_DIR,
         policy_path=POLICY_PATH,
@@ -655,6 +660,7 @@ def uninstall() -> None:
         config_home=CODELIGHT_CONFIG_HOME,
         socket_path=SOCKET_PATH,
         monitor_state_dir=MONITOR_STATE_DIR,
+        legacy_paths=LEGACY_STATE_PATHS,
     )
 
 
