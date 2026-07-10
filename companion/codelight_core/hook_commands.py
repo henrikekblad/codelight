@@ -10,6 +10,7 @@ from codelight_core import hook_io
 from codelight_core import hook_runtime
 from codelight_core import policy as policy_core
 from codelight_core import transcript as transcript_core
+from codelight_core.agents import base as agents_base
 
 
 AgentNameCallback = Callable[[str | None], str]
@@ -59,23 +60,20 @@ def run_status_hook(
 def emit_permission_decision(
     decision: str,
     *,
-    copilot_mode: bool,
-    vscode_prettool_mode: bool,
+    envelope: str,
     reason: str = "",
 ) -> None:
     """Emit the host-specific decision envelope from one shared policy path."""
     print(json.dumps(hook_runtime.permission_decision_output(
         decision,
-        copilot_mode=copilot_mode,
-        vscode_prettool_mode=vscode_prettool_mode,
+        envelope=envelope,
         reason=reason,
     )))
 
 
 def run_permission_hook(
     *,
-    copilot_mode: bool = False,
-    vscode_prettool_mode: bool = False,
+    mode: agents_base.HookMode,
     agent_id: str | None = None,
     socket_path: str,
     monitor_state_dir: str,
@@ -90,14 +88,12 @@ def run_permission_hook(
     data = hook_runtime.parse_json_object(
         sys.stdin.read() if input_text is None else input_text)
     session_id = hook_runtime.session_id(data)
-    normalized_agent = normalize_agent_id(
-        agent_id or ("copilot" if (copilot_mode or vscode_prettool_mode) else "claude")
-    )
+    normalized_agent = normalize_agent_id(agent_id or mode.default_agent_id)
     tool_name = hook_runtime.tool_name(data)
     tool_input = hook_runtime.tool_input(data)
     cwd = str(data.get("cwd") or "")
 
-    if vscode_prettool_mode and not data.get("tool_use_id"):
+    if mode.requires_tool_use_id and not data.get("tool_use_id"):
         return
 
     if hook_runtime.is_question_tool(tool_name, tool_input):
@@ -106,16 +102,14 @@ def run_permission_hook(
     if policy_core.is_safe_memory_read(tool_name, tool_input):
         emit_permission_decision(
             "allow",
-            copilot_mode=copilot_mode,
-            vscode_prettool_mode=vscode_prettool_mode,
+            envelope=mode.envelope,
             reason="Read-only memory view in repo/session scope")
         return
 
     if policy_core.is_allowed_command(policy_path, tool_name, tool_input, cwd):
         emit_permission_decision(
             "allow",
-            copilot_mode=copilot_mode,
-            vscode_prettool_mode=vscode_prettool_mode,
+            envelope=mode.envelope,
             reason="Exact command allowed by codelight policy")
         return
 
@@ -123,8 +117,7 @@ def run_permission_hook(
         policy_path, tool_name, tool_input, cwd):
         emit_permission_decision(
             "allow",
-            copilot_mode=copilot_mode,
-            vscode_prettool_mode=vscode_prettool_mode,
+            envelope=mode.envelope,
             reason="apply_patch target is within trusted codelight folder")
         return
 
@@ -134,8 +127,7 @@ def run_permission_hook(
     ):
         emit_permission_decision(
             "allow",
-            copilot_mode=copilot_mode,
-            vscode_prettool_mode=vscode_prettool_mode,
+            envelope=mode.envelope,
             reason="Read-only tool in trusted codelight folder")
         return
 
@@ -170,8 +162,7 @@ def run_permission_hook(
         if decision in ("allow", "deny"):
             emit_permission_decision(
                 decision,
-                copilot_mode=copilot_mode,
-                vscode_prettool_mode=vscode_prettool_mode,
+                envelope=mode.envelope,
                 reason="Denied by remote codelight approval" if decision == "deny" else "")
         return
     except Exception:
@@ -190,8 +181,7 @@ def run_permission_hook(
 
 def run_question_hook(
     *,
-    vscode_prettool_mode: bool = False,
-    codex_context_mode: bool = False,
+    mode: agents_base.HookMode,
     agent_id: str | None = None,
     socket_path: str,
     hook_wait_ceiling: int,
@@ -200,9 +190,7 @@ def run_question_hook(
     input_text: str | None = None,
 ) -> None:
     """Forward AskUserQuestion prompts to the daemon and emit hook output."""
-    normalized_agent = normalize_agent_id(
-        agent_id or ("copilot" if vscode_prettool_mode else "claude")
-    )
+    normalized_agent = normalize_agent_id(agent_id or mode.default_agent_id)
 
     data = hook_runtime.parse_json_object(
         sys.stdin.read() if input_text is None else input_text)
@@ -231,7 +219,7 @@ def run_question_hook(
         )
         answers = response.get("answers") if response else None
         if isinstance(answers, dict) and answers:
-            if vscode_prettool_mode or codex_context_mode:
+            if mode.envelope == agents_base.CONTEXT:
                 print(json.dumps(hook_runtime.question_context_output(answers)))
             else:
                 print(json.dumps(

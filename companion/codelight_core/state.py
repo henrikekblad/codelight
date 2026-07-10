@@ -167,31 +167,13 @@ class CodelightState:
         *,
         usages: dict[str, dict[str, Any] | None] | None = None,
         clear_missing: bool = False,
-        claude: dict[str, Any] | None = None,
-        codex: dict[str, Any] | None = None,
-        copilot: dict[str, Any] | None = None,
-        clear_codex: bool = False,
-        clear_copilot: bool = False,
     ) -> None:
         """Update per-agent usage caches.
 
-        ``usages`` is the preferred generic API. The named parameters remain as
-        compatibility sugar for older tests/helpers while the daemon is being
-        split into agent-owned components.
+        A ``None`` usage clears that agent's cache (the default agent resets
+        to ``DEFAULT_USAGE`` instead of disappearing).
         """
-        incoming: dict[str, dict[str, Any] | None] = {}
-        if usages:
-            incoming.update(usages)
-        if claude is not None:
-            incoming["claude"] = claude
-        if codex is not None:
-            incoming["codex"] = codex
-        elif clear_codex:
-            incoming["codex"] = None
-        if copilot is not None:
-            incoming["copilot"] = copilot
-        elif clear_copilot:
-            incoming["copilot"] = None
+        incoming: dict[str, dict[str, Any] | None] = dict(usages or {})
 
         with self._lock:
             if clear_missing:

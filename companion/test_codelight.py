@@ -1,3 +1,5 @@
+import contextlib
+import io
 import json
 import os
 import sys
@@ -10,6 +12,7 @@ from unittest import mock
 
 sys.path.insert(0, os.path.dirname(__file__))
 import codelight
+from codelight_core.agents import base as agents_base
 from codelight_core.agents import codex as codex_agent
 from codelight_core.agents import copilot as copilot_agent
 from codelight_core.state import CodelightState
@@ -18,6 +21,7 @@ from codelight_core import dashboard_client
 from codelight_core import hooks as hooks_core
 from codelight_core.conversation import ConversationRefresher
 from codelight_core import discovery as discovery_core
+from codelight_core import hook_commands
 from codelight_core import hook_io
 from codelight_core import hook_runtime
 from codelight_core import lifecycle
@@ -335,6 +339,126 @@ class AgentDetectionTests(unittest.TestCase):
         )
 
 
+class FakeAgentIntegrationTests(unittest.TestCase):
+    """Prove the registry path is additive: a new agent registers one
+    AgentIntegration and flows through every client surface unchanged."""
+
+    def make_fake_integration(self):
+        return agents_base.AgentIntegration(
+            spec=agents_base.AgentSpec(
+                "fake",
+                "Fake Agent",
+                executables=("fake-cli",),
+                vscode_extensions=frozenset({"acme.fake-agent"}),
+            ),
+            hook_modes=(
+                agents_base.HookMode(
+                    "question-fake", kind="question",
+                    envelope=agents_base.CONTEXT, default_agent_id="fake"),
+            ),
+            usage_fetcher=lambda: {"session_pct": 0.25, "weekly_pct": 0.5},
+        )
+
+    def make_registry(self):
+        return AgentRegistry(extra_agents=(self.make_fake_integration(),))
+
+    def test_fake_agent_flows_through_registry_surfaces(self):
+        registry = self.make_registry()
+
+        self.assertIn("fake", registry.supported_agent_ids())
+        self.assertEqual(registry.display_registry()["fake"],
+                         {"display": "Fake Agent"})
+        self.assertEqual(registry.executables_by_agent()["fake"], ("fake-cli",))
+        self.assertEqual(
+            lifecycle.parse_agent_set("fake, unknown",
+                                      registry.supported_agent_ids()),
+            {"fake"},
+        )
+        self.assertEqual(registry.hook_modes()["question-fake"].kind, "question")
+
+    def test_fake_agent_is_detected_and_polled(self):
+        registry = self.make_registry()
+
+        def which(name):
+            return "/bin/fake-cli" if name == "fake-cli" else None
+
+        with mock.patch.object(lifecycle.shutil, "which", side_effect=which), \
+             mock.patch("subprocess.run",
+                        return_value=mock.Mock(stdout="", returncode=1)):
+            self.assertEqual(lifecycle.detect_installed_agents(registry), {"fake"})
+
+        state = CodelightState(
+            default_agent_id="claude",
+            agent_registry=registry.display_registry(),
+            idle_window=600,
+            idle_window_waiting=30,
+        )
+        poller = UsagePoller(
+            state=state,
+            fetchers={"fake": registry.usage_fetchers()["fake"]},
+            interval=60,
+            shutdown=threading.Event(),
+            log=lambda line: None,
+            push=lambda: None,
+        )
+        poller.poll_once()
+
+        snapshot = state.status_snapshot()
+        self.assertEqual(snapshot["per_agent_usage"]["fake"]["session_pct"], 0.25)
+        self.assertEqual(snapshot["per_agent_usage"]["fake"]["agent_display"],
+                         "Fake Agent")
+
+    def test_fake_question_mode_emits_context_envelope(self):
+        registry = self.make_registry()
+        mode = registry.hook_modes()["question-fake"]
+        seen = {}
+
+        def request_json(path, request, **kwargs):
+            seen.update(request)
+            return {"answers": {"Deploy?": "Yes"}}
+
+        stdout = io.StringIO()
+        with mock.patch.object(hook_commands.hook_io, "request_json",
+                               side_effect=request_json), \
+             contextlib.redirect_stdout(stdout):
+            hook_commands.run_question_hook(
+                mode=mode,
+                agent_id="",
+                socket_path="/nonexistent.sock",
+                hook_wait_ceiling=1,
+                normalize_agent_id=lambda a: a or "claude",
+                agent_display_name=lambda a: "Fake Agent",
+                input_text=json.dumps({
+                    "session_id": "s1",
+                    "tool_input": {"questions": [{"question": "Deploy?"}]},
+                }),
+            )
+
+        self.assertEqual(seen["agent_id"], "fake")
+        payload = json.loads(stdout.getvalue())
+        self.assertEqual(payload["hookSpecificOutput"]["permissionDecision"],
+                         "deny")
+        self.assertIn("Deploy?: Yes",
+                      payload["hookSpecificOutput"]["additionalContext"])
+
+    def test_registry_rejects_duplicate_agent_ids_and_hook_modes(self):
+        claude_clone = agents_base.AgentIntegration(
+            spec=agents_base.AgentSpec("claude", "Claude Clone"))
+        with self.assertRaises(ValueError):
+            AgentRegistry(extra_agents=(claude_clone,))
+
+        mode_clone = agents_base.AgentIntegration(
+            spec=agents_base.AgentSpec("fake", "Fake Agent"),
+            hook_modes=(
+                agents_base.HookMode(
+                    "permission", kind="permission",
+                    envelope=agents_base.BEHAVIOR, default_agent_id="fake"),
+            ),
+        )
+        with self.assertRaises(ValueError):
+            AgentRegistry(extra_agents=(mode_clone,)).hook_modes()
+
+
 class StateSnapshotTests(unittest.TestCase):
     def make_state(self):
         return CodelightState(
@@ -346,11 +470,11 @@ class StateSnapshotTests(unittest.TestCase):
 
     def test_status_snapshot_uses_last_active_agent_usage(self):
         state = self.make_state()
-        state.update_usage(
-            claude={"session_pct": 0.1, "weekly_pct": 0.2},
-            codex={"session_pct": 0.3, "weekly_pct": 0.4},
-            copilot={"monthly_pct": 0.5, "monthly_reset": "20d"},
-        )
+        state.update_usage(usages={
+            "claude": {"session_pct": 0.1, "weekly_pct": 0.2},
+            "codex": {"session_pct": 0.3, "weekly_pct": 0.4},
+            "copilot": {"monthly_pct": 0.5, "monthly_reset": "20d"},
+        })
 
         state.update_session("codex-session", "working", agent_id="codex")
         codex_payload = state.status_snapshot()
@@ -402,10 +526,10 @@ class UsagePollerTests(unittest.TestCase):
         state = self.make_state()
         logs: list[str] = []
         pushes: list[bool] = []
-        state.update_usage(
-            codex={"session_pct": 0.9, "weekly_pct": 0.8},
-            copilot={"monthly_pct": 0.7, "monthly_reset": "1d"},
-        )
+        state.update_usage(usages={
+            "codex": {"session_pct": 0.9, "weekly_pct": 0.8},
+            "copilot": {"monthly_pct": 0.7, "monthly_reset": "1d"},
+        })
 
         poller = UsagePoller(
             state=state,
@@ -451,7 +575,7 @@ class UsagePollerTests(unittest.TestCase):
                 }
 
             registry = AgentRegistry(
-                claude_settings_path="",
+                claude_settings_path=os.path.join(tmp, "settings.json"),
                 claude_credentials_path=os.path.join(tmp, "missing.json"),
                 claude_usage_api="https://example.invalid",
                 codex_home=tmp,
@@ -661,13 +785,13 @@ class HookRuntimeTests(unittest.TestCase):
             },
         )
         self.assertEqual(
-            hook_runtime.permission_decision_output("deny", copilot_mode=True,
-                                                   reason="nope"),
+            hook_runtime.permission_decision_output(
+                "deny", envelope=agents_base.BEHAVIOR, reason="nope"),
             {"behavior": "deny", "message": "nope"},
         )
         self.assertEqual(
             hook_runtime.permission_decision_output(
-                "deny", vscode_prettool_mode=True, reason="nope"
+                "deny", envelope=agents_base.PRETOOL_DECISION, reason="nope"
             ),
             {
                 "hookSpecificOutput": {
@@ -675,6 +799,16 @@ class HookRuntimeTests(unittest.TestCase):
                     "permissionDecision": "deny",
                     "permissionDecisionReason": "nope",
                 },
+            },
+        )
+
+    def test_hook_mode_strings_are_stable(self):
+        # These tokens are persisted in users' installed hook files.
+        self.assertEqual(
+            set(codelight._new_agent_registry().hook_modes()),
+            {
+                "permission", "permission-copilot", "permission-vscode",
+                "question", "question-vscode", "question-codex",
             },
         )
 

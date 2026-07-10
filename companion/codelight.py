@@ -44,8 +44,6 @@ except ImportError:
 
 MONITOR_STATE_DIR = os.path.expanduser("~/.claude/monitor_state")
 SOCKET_PATH       = os.path.expanduser("~/.claude/codelight.sock")
-COPILOT_HOME      = os.path.expanduser(os.environ.get("COPILOT_HOME", "~/.copilot"))
-CODEX_HOME        = os.path.expanduser(os.environ.get("CODEX_HOME", "~/.codex"))
 CODELIGHT_CONFIG_HOME = os.path.expanduser(
     os.environ.get("CODELIGHT_CONFIG_HOME", "~/.config/codelight"))
 POLICY_PATH       = os.path.join(CODELIGHT_CONFIG_HOME, "policy.json")
@@ -97,10 +95,6 @@ DEFAULT_AGENT_ID = "claude"
 
 def _new_agent_registry(log=None) -> AgentRegistry:
     return AgentRegistry(
-        claude_settings_path=os.path.expanduser("~/.claude/settings.json"),
-        claude_credentials_path=os.path.expanduser("~/.claude/.credentials.json"),
-        codex_home=CODEX_HOME,
-        copilot_home=COPILOT_HOME,
         github_org=_github_org,
         github_token_file=_github_token_file,
         log=log,
@@ -493,12 +487,9 @@ def run_hook(state: str, agent_id: str = DEFAULT_AGENT_ID) -> None:
     )
 
 
-def run_permission_hook(wait_secs: int, copilot_mode: bool = False,
-                        vscode_prettool_mode: bool = False,
-                        agent_id: str | None = None) -> None:
+def run_permission_hook(wait_secs: int, mode, agent_id: str | None = None) -> None:
     hook_commands.run_permission_hook(
-        copilot_mode=copilot_mode,
-        vscode_prettool_mode=vscode_prettool_mode,
+        mode=mode,
         agent_id=agent_id,
         socket_path=SOCKET_PATH,
         monitor_state_dir=MONITOR_STATE_DIR,
@@ -510,12 +501,9 @@ def run_permission_hook(wait_secs: int, copilot_mode: bool = False,
     )
 
 
-def run_question_hook(wait_secs: int, vscode_prettool_mode: bool = False,
-                      codex_context_mode: bool = False,
-                      agent_id: str | None = None) -> None:
+def run_question_hook(wait_secs: int, mode, agent_id: str | None = None) -> None:
     hook_commands.run_question_hook(
-        vscode_prettool_mode=vscode_prettool_mode,
-        codex_context_mode=codex_context_mode,
+        mode=mode,
         agent_id=agent_id,
         socket_path=SOCKET_PATH,
         hook_wait_ceiling=HOOK_WAIT_CEILING,
@@ -690,7 +678,8 @@ def main():
                         help="Hook mode: send STATE event to daemon and exit. "
                              "Used internally by agent hooks (working/waiting/ended).")
     parser.add_argument("--agent", default=DEFAULT_AGENT_ID,
-                        help="Internal hook/runtime agent id (claude/copilot/codex).")
+                        help="Internal hook/runtime agent id ("
+                             + "/".join(AGENT_REGISTRY) + ").")
     parser.add_argument("--verbose", "-v", action="store_true",
                         help="Show low-level debug events (socket, API) in activity log")
     parser.add_argument("--ws-port", type=int, default=8765,
@@ -755,30 +744,16 @@ def main():
                 os.path.abspath(__file__), args.secret, args.ws_port)
         return
 
-    if args.hook == "permission":
-        run_permission_hook(args.permission_timeout, agent_id=args.agent)
-        return
-    if args.hook == "permission-copilot":
-        run_permission_hook(args.permission_timeout, copilot_mode=True,
-                            agent_id=args.agent)
-        return
-    if args.hook == "permission-vscode":
-        run_permission_hook(args.permission_timeout, vscode_prettool_mode=True,
-                            agent_id=args.agent)
-        return
-    if args.hook == "question-vscode":
-        run_question_hook(args.permission_timeout, vscode_prettool_mode=True,
-                          agent_id=args.agent)
-        return
-    if args.hook == "question-codex":
-        run_question_hook(args.permission_timeout, codex_context_mode=True,
-                          agent_id=args.agent)
-        return
-    if args.hook == "question":
-        run_question_hook(args.permission_timeout, agent_id=args.agent)
-        return
     if args.hook:
-        run_hook(args.hook, agent_id=args.agent)
+        hook_mode = _agents.hook_modes().get(args.hook)
+        if hook_mode is None:
+            run_hook(args.hook, agent_id=args.agent)
+        elif hook_mode.kind == "permission":
+            run_permission_hook(args.permission_timeout, hook_mode,
+                                agent_id=args.agent)
+        else:
+            run_question_hook(args.permission_timeout, hook_mode,
+                              agent_id=args.agent)
         return
 
     if args.name is None:

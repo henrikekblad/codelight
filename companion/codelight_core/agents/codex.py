@@ -5,7 +5,50 @@ import os
 from typing import Callable
 
 from codelight_core import hooks as hooks_core
+from codelight_core.agents import base
 from codelight_core.timefmt import format_epoch_countdown
+
+
+SPEC = base.AgentSpec(
+    "codex",
+    "Codex",
+    executables=("codex",),
+    vscode_extensions=frozenset({"openai.chatgpt"}),
+)
+
+HOOK_MODES = (
+    base.HookMode("question-codex", kind="question",
+                  envelope=base.CONTEXT, default_agent_id="codex"),
+)
+
+
+def default_home() -> str:
+    return os.path.expanduser(os.environ.get("CODEX_HOME", "~/.codex"))
+
+
+def build_integration(agent: CodexAgent, *, home: str) -> base.AgentIntegration:
+    hooks_file = hooks_path(home)
+
+    def _install_hooks(*, script_path, hook_wait_ceiling, remote_permissions,
+                       remote_questions, permission_timeout, log=None):
+        install_hooks(
+            hooks_file,
+            script_path,
+            hook_wait_ceiling=hook_wait_ceiling,
+            remote_permissions=remote_permissions,
+            remote_questions=remote_questions,
+            permission_timeout=permission_timeout,
+            vprint=log,
+        )
+
+    return base.AgentIntegration(
+        spec=SPEC,
+        hook_modes=HOOK_MODES,
+        usage_fetcher=agent.get_usage,
+        install_hooks=_install_hooks,
+        removable_hook_paths=(hooks_file,),
+        transcript_path_for_session=agent.rollout_path_for_session,
+    )
 
 
 class CodexAgent:

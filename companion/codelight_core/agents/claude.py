@@ -1,16 +1,63 @@
 from __future__ import annotations
 
 import json
+import os
 import sys
 import urllib.error
 import urllib.request
 from typing import Callable
 
 from codelight_core import hooks as hooks_core
+from codelight_core.agents import base
 from codelight_core.timefmt import epoch, format_iso_countdown
 
 
 USAGE_API = "https://claude.ai/api/oauth/usage"
+
+SPEC = base.AgentSpec(
+    "claude",
+    "Claude",
+    executables=("claude",),
+    vscode_extensions=frozenset({"anthropic.claude-code"}),
+)
+
+# Codex reuses the Claude hook protocol for permissions/questions via --agent codex.
+HOOK_MODES = (
+    base.HookMode("permission", kind="permission",
+                  envelope=base.PERMISSION_REQUEST, default_agent_id="claude"),
+    base.HookMode("question", kind="question",
+                  envelope=base.UPDATED_INPUT, default_agent_id="claude"),
+)
+
+
+def build_integration(agent: ClaudeAgent, *, settings_path: str) -> base.AgentIntegration:
+    def _install_hooks(*, script_path, hook_wait_ceiling, remote_permissions,
+                       remote_questions, permission_timeout, log=None):
+        install_hooks(
+            settings_path,
+            script_path,
+            hook_wait_ceiling=hook_wait_ceiling,
+            remote_permissions=remote_permissions,
+            remote_questions=remote_questions,
+            permission_timeout=permission_timeout,
+            vprint=log,
+        )
+
+    return base.AgentIntegration(
+        spec=SPEC,
+        hook_modes=HOOK_MODES,
+        usage_fetcher=agent.get_usage,
+        install_hooks=_install_hooks,
+        removable_hook_paths=(settings_path,),
+    )
+
+
+def default_settings_path() -> str:
+    return os.path.expanduser("~/.claude/settings.json")
+
+
+def default_credentials_path() -> str:
+    return os.path.expanduser("~/.claude/.credentials.json")
 
 
 class ClaudeAgent:

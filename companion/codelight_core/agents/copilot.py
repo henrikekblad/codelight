@@ -11,7 +11,59 @@ from datetime import datetime, timezone
 from typing import Callable
 
 from codelight_core import hooks as hooks_core
+from codelight_core.agents import base
 from codelight_core.timefmt import format_epoch_countdown
+
+
+SPEC = base.AgentSpec(
+    "copilot",
+    "Copilot",
+    executables=("copilot",),
+    vscode_extensions=frozenset({"github.copilot", "github.copilot-chat"}),
+)
+
+HOOK_MODES = (
+    base.HookMode("permission-copilot", kind="permission",
+                  envelope=base.BEHAVIOR, default_agent_id="copilot"),
+    base.HookMode("permission-vscode", kind="permission",
+                  envelope=base.PRETOOL_DECISION, default_agent_id="copilot",
+                  requires_tool_use_id=True),
+    base.HookMode("question-vscode", kind="question",
+                  envelope=base.CONTEXT, default_agent_id="copilot"),
+)
+
+
+def default_home() -> str:
+    return os.path.expanduser(os.environ.get("COPILOT_HOME", "~/.copilot"))
+
+
+def build_integration(agent: CopilotAgent, *, home: str) -> base.AgentIntegration:
+    hooks_file = hooks_path(home)
+
+    def _install_hooks(*, script_path, hook_wait_ceiling, remote_permissions,
+                       remote_questions, permission_timeout, log=None):
+        # Copilot has no question hook of its own; remote_questions rides along
+        # on the PreToolUse question-vscode hook installed with permissions.
+        install_hooks(
+            hooks_file,
+            script_path,
+            hook_wait_ceiling=hook_wait_ceiling,
+            remote_permissions=remote_permissions,
+            permission_timeout=permission_timeout,
+        )
+
+    return base.AgentIntegration(
+        spec=SPEC,
+        hook_modes=HOOK_MODES,
+        usage_fetcher=agent.get_usage,
+        install_hooks=_install_hooks,
+        removable_files=(hooks_file,),
+        removable_empty_dirs=(os.path.dirname(hooks_file),),
+        transcript_path_for_session=agent.events_path_for_session,
+        # Copilot hooks do not always pass a transcript path, so keep the old
+        # behavior of falling back to its newest local events file.
+        latest_transcript_fallback=agent.latest_events_path,
+    )
 
 
 def events_path_for_session(copilot_home: str, session_id: str) -> str:

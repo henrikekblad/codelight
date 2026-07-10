@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import json
 
+from codelight_core.agents import base as agents_base
+
 
 QUESTION_TOOLS = {"AskUserQuestion", "ask_user", "askUser", "vscode_askQuestions"}
 
@@ -65,12 +67,11 @@ def questions_from_input(data: dict, value: dict) -> list:
 def permission_decision_output(
     decision: str,
     *,
-    copilot_mode: bool = False,
-    vscode_prettool_mode: bool = False,
+    envelope: str = agents_base.PERMISSION_REQUEST,
     reason: str = "",
 ) -> dict:
     """Return the host-specific permission decision envelope."""
-    if vscode_prettool_mode:
+    if envelope == agents_base.PRETOOL_DECISION:
         output = {
             "hookSpecificOutput": {
                 "hookEventName": "PreToolUse",
@@ -80,7 +81,7 @@ def permission_decision_output(
         if reason:
             output["hookSpecificOutput"]["permissionDecisionReason"] = reason
         return output
-    if copilot_mode:
+    if envelope == agents_base.BEHAVIOR:
         output = {"behavior": decision}
         if reason and decision == "deny":
             output["message"] = reason
