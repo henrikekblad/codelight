@@ -195,6 +195,20 @@ class AgentRegistry:
             if integration.usage_fetcher is not None
         }
 
+    def session_reset_supported(self, agent_id: str) -> bool:
+        integration = self._integrations.get(agent_id)
+        return bool(integration and integration.session_reset_consumer)
+
+    def consume_session_reset(self, agent_id: str) -> dict:
+        integration = self._integrations.get(agent_id)
+        if integration is None or integration.session_reset_consumer is None:
+            return {
+                "ok": False,
+                "outcome": "unsupported",
+                "message": "Agent does not support session limit resets.",
+            }
+        return integration.session_reset_consumer()
+
     def install_hooks(
         self,
         *,

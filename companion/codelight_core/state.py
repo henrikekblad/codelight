@@ -288,3 +288,17 @@ class CodelightState:
             "reset": usage.get(f"{prefix}_reset", "--"),
             "reset_at": usage.get(f"{prefix}_reset_at", 0),
         }
+
+    def set_agent_capability(
+        self,
+        agent_id: str,
+        key: str,
+        value: Any,
+    ) -> None:
+        aid = self.normalize_agent_id(agent_id)
+        with self._lock:
+            usage = self._usage_caches.setdefault(
+                aid,
+                dict(DEFAULT_USAGE) if aid == self._default_agent_id else {},
+            )
+            usage[key] = value

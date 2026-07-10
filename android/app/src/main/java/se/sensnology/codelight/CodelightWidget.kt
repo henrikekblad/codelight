@@ -21,6 +21,8 @@ import androidx.glance.action.clickable
 import androidx.glance.appwidget.GlanceAppWidget
 import androidx.glance.appwidget.LinearProgressIndicator
 import androidx.glance.appwidget.SizeMode
+import androidx.glance.appwidget.lazy.LazyColumn
+import androidx.glance.appwidget.lazy.itemsIndexed
 import androidx.glance.appwidget.provideContent
 import androidx.glance.background
 import androidx.glance.layout.*
@@ -35,25 +37,29 @@ class CodelightWidget : GlanceAppWidget() {
         val KEY_TICK = intPreferencesKey("tick")
 
         // Responsive size buckets. Glance picks the largest-area bucket that
-        // fits the current widget dimensions. Three buckets cover all cases:
+        // fits the current widget dimensions:
         //
         //  SMALL     (100× 80) – always fits — active agent only
         //  TALL      (100×200) – height ≥ 200 dp — all agents stacked, status below
-        //  WIDE_TALL (280×200) – width ≥ 280 dp AND height ≥ 200 dp — all agents
+        //  WIDE_TALL (240×200) – width ≥ 240 dp AND height ≥ 200 dp — agents
         //                         stacked, status column on the right
+        //  EXTRA_WIDE_TALL (300×200) – meters capped at a fixed width on the
+        //                         left, status window consumes the extra width
         //
-        // Area order: WIDE_TALL (56 000) > TALL (20 000) > SMALL (8 000)
-        // A narrow+tall widget (e.g. 218×235) can’t fit WIDE_TALL (280 > 218),
+        // Area order: EXTRA_WIDE_TALL > WIDE_TALL > TALL > SMALL.
+        // A narrow+tall widget can’t fit WIDE_TALL,
         // so TALL wins → status below.
-        // A wide+tall widget (e.g. 360×235) fits both; WIDE_TALL wins → status right.
+        // A wide+tall widget fits WIDE_TALL → status right.
+        // A wider widget fits EXTRA_WIDE_TALL → status grows while meters stay capped.
         // A short or landscape widget fits only SMALL → active agent only.
         val SIZE_SMALL     = DpSize(100.dp, 80.dp)
         val SIZE_TALL      = DpSize(100.dp, 200.dp)
-        val SIZE_WIDE_TALL = DpSize(280.dp, 200.dp)
+        val SIZE_WIDE_TALL = DpSize(240.dp, 200.dp)
+        val SIZE_EXTRA_WIDE_TALL = DpSize(300.dp, 200.dp)
     }
 
     override val sizeMode: SizeMode = SizeMode.Responsive(
-        setOf(SIZE_SMALL, SIZE_TALL, SIZE_WIDE_TALL)
+        setOf(SIZE_SMALL, SIZE_TALL, SIZE_WIDE_TALL, SIZE_EXTRA_WIDE_TALL)
     )
 
     override suspend fun provideGlance(context: Context, id: GlanceId) {
@@ -96,8 +102,13 @@ class CodelightWidget : GlanceAppWidget() {
         val textColor  = ColorProvider(Color.White)
         val mutedColor = ColorProvider(Color(0xFF888888))
 
-        if (size == SIZE_WIDE_TALL) {
-            // Wide+tall: agents stacked on the left, prominent status column on the right.
+        if (size == SIZE_WIDE_TALL || size == SIZE_EXTRA_WIDE_TALL) {
+            val extraWide = size == SIZE_EXTRA_WIDE_TALL
+            // Wide+tall: agents stacked on the left, prominent status column on
+            // the right. Exactly one side may be weighted: the meters column is
+            // capped at a fixed width when extra wide (status absorbs the rest),
+            // otherwise the status keeps a fixed width and the meters grow —
+            // a fixed width inside a weighted slot overflows and clips.
             Row(
                 modifier = GlanceModifier
                     .fillMaxSize()
@@ -105,19 +116,31 @@ class CodelightWidget : GlanceAppWidget() {
             ) {
                 Column(
                     modifier = GlanceModifier
-                        .defaultWeight()
+                        .then(if (extraWide) GlanceModifier.width(200.dp)
+                              else GlanceModifier.defaultWeight())
                         .fillMaxHeight()
                         .padding(10.dp)
                         .clickable(actionStartActivity<MainActivity>()),
                 ) {
-                    shownAgents.forEachIndexed { index, agent ->
-                        if (index > 0) Spacer(GlanceModifier.height(9.dp))
-                        AgentBlock(agent, textColor, mutedColor)
+                    LazyColumn(modifier = GlanceModifier.fillMaxWidth().fillMaxHeight()) {
+                        // Each lazy item must be a single composable (a trailing
+                        // Spacer is silently dropped), and the list consumes
+                        // taps — so spacing and the open-app click both live on
+                        // the item itself.
+                        itemsIndexed(shownAgents) { index, agent ->
+                            AgentBlock(
+                                agent, textColor, mutedColor,
+                                modifier = GlanceModifier
+                                    .then(if (index > 0) GlanceModifier.padding(top = 9.dp)
+                                          else GlanceModifier)
+                                    .clickable(actionStartActivity<MainActivity>()),
+                            )
+                        }
                     }
                 }
                 Box(
                     modifier = GlanceModifier
-                        .width(90.dp)
+                        .then(if (extraWide) GlanceModifier.defaultWeight() else GlanceModifier.width(90.dp))
                         .fillMaxHeight()
                         .background(ColorProvider(statusColor))
                         .clickable(actionStartActivity<MainActivity>()),
@@ -135,23 +158,60 @@ class CodelightWidget : GlanceAppWidget() {
                     )
                 }
             }
-        } else {
+        } else if (showAll) {
+            // ── TALL: scrollable agent list on top, status banner below. The
+            // list (a ListView) greedily fills any weighted slot, so the
+            // banner gets a fixed height instead of a weight.
             Column(
                 modifier = GlanceModifier
                     .fillMaxSize()
                     .background(ColorProvider(bgColor)),
             ) {
-                // ── Top: meters ───────────────────────────────────────────────────
+                Column(modifier = GlanceModifier.fillMaxWidth().defaultWeight().padding(10.dp)
+                    .clickable(actionStartActivity<MainActivity>())) {
+                    LazyColumn(modifier = GlanceModifier.fillMaxWidth().fillMaxHeight()) {
+                        itemsIndexed(shownAgents) { index, agent ->
+                            AgentBlock(
+                                agent, textColor, mutedColor,
+                                modifier = GlanceModifier
+                                    .then(if (index > 0) GlanceModifier.padding(top = 9.dp)
+                                          else GlanceModifier)
+                                    .clickable(actionStartActivity<MainActivity>()),
+                            )
+                        }
+                    }
+                }
+                Box(
+                    modifier = GlanceModifier
+                        .fillMaxWidth()
+                        .height(56.dp)
+                        .background(ColorProvider(statusColor))
+                        .clickable(actionStartActivity<MainActivity>()),
+                    contentAlignment = Alignment.Center,
+                ) {
+                    Text(
+                        statusLabel,
+                        style = TextStyle(
+                            color      = ColorProvider(statusTextColor),
+                            fontSize   = 18.sp,
+                            fontWeight = FontWeight.Bold,
+                        ),
+                    )
+                }
+            }
+        } else {
+            // ── SMALL: the active agent only — no list needed, so the status
+            // box can keep soaking up the remaining height as before.
+            Column(
+                modifier = GlanceModifier
+                    .fillMaxSize()
+                    .background(ColorProvider(bgColor)),
+            ) {
                 Column(modifier = GlanceModifier.fillMaxWidth().padding(10.dp)
                     .clickable(actionStartActivity<MainActivity>())) {
-                    shownAgents.forEachIndexed { index, agent ->
-                        if (index > 0) Spacer(GlanceModifier.height(9.dp))
-                        AgentBlock(agent, textColor, mutedColor)
-                    }
+                    AgentBlock(activeAgent, textColor, mutedColor)
                     Spacer(GlanceModifier.height(5.dp))
                 }
-
-                // ── Bottom: status fills remaining space ──────────────────────────
                 Box(
                     modifier = GlanceModifier
                         .fillMaxWidth()
@@ -160,16 +220,14 @@ class CodelightWidget : GlanceAppWidget() {
                         .clickable(actionStartActivity<MainActivity>()),
                     contentAlignment = Alignment.Center,
                 ) {
-                    Column(horizontalAlignment = Alignment.CenterHorizontally) {
-                        Text(
-                            statusLabel,
-                            style = TextStyle(
-                                color      = ColorProvider(statusTextColor),
-                                fontSize   = 18.sp,
-                                fontWeight = FontWeight.Bold,
-                            ),
-                        )
-                    }
+                    Text(
+                        statusLabel,
+                        style = TextStyle(
+                            color      = ColorProvider(statusTextColor),
+                            fontSize   = 18.sp,
+                            fontWeight = FontWeight.Bold,
+                        ),
+                    )
                 }
             }
         }

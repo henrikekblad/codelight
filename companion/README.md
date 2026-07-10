@@ -295,6 +295,10 @@ listed in [AGENTS.md](AGENTS.md).
 The daemon stores usage per agent and publishes a unified `per_agent_usage` model
 to all clients. Each client renders whatever limits an integration exposes with
 consistent labels and agent branding delivered in the connection handshake.
+Agents may also expose usage actions. Codex currently exposes earned session
+rate-limit resets through `rateLimitResetCredits` when `codex app-server`
+account APIs are available; clients request a reset through the companion, which
+consumes one reset credit and then refreshes `account/rateLimits/read`.
 
 Configuration for usage credentials and agent homes lives in
 `~/.config/codelight/config.json`; see `companion/AGENTS.md` for all supported keys.

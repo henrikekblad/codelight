@@ -2,6 +2,9 @@ from __future__ import annotations
 
 import json
 import os
+import subprocess
+import sys
+import uuid
 from typing import Callable
 
 from codelight_core import hooks as hooks_core
@@ -101,7 +104,8 @@ def build_integration(config: dict) -> base.AgentIntegration:
     """Config keys (~/.config/codelight/config.json, agents.codex): home."""
     home = (os.path.expanduser(str(config.get("home") or ""))
             or default_home())
-    agent = CodexAgent(home)
+    app_server_enabled = bool(config.get("app_server_usage", True))
+    agent = CodexAgent(home, app_server_enabled=app_server_enabled)
     hooks_file = hooks_path(home)
 
     def _install_hooks(*, script_path, hook_wait_ceiling, remote_permissions,
@@ -121,6 +125,7 @@ def build_integration(config: dict) -> base.AgentIntegration:
         agent=agent,
         hook_modes=HOOK_MODES,
         usage_fetcher=agent.get_usage,
+        session_reset_consumer=agent.consume_session_reset,
         install_hooks=_install_hooks,
         removable_hook_paths=(hooks_file,),
         transcript_path_for_session=agent.rollout_path_for_session,
@@ -129,8 +134,16 @@ def build_integration(config: dict) -> base.AgentIntegration:
 
 
 class CodexAgent:
-    def __init__(self, code_home: str) -> None:
+    def __init__(
+        self,
+        code_home: str,
+        *,
+        app_server_enabled: bool = True,
+        rpc: Callable[[list[dict]], list[dict]] | None = None,
+    ) -> None:
         self.code_home = code_home
+        self.app_server_enabled = app_server_enabled
+        self.rpc = rpc
 
     def rollout_path_for_session(self, session_id: str) -> str:
         return rollout_path_for_session(self.code_home, session_id)
@@ -142,7 +155,104 @@ class CodexAgent:
         return usage_from_rollout(path)
 
     def get_usage(self) -> dict | None:
+        if self.app_server_enabled:
+            usage = get_app_server_usage(self.code_home, rpc=self.rpc)
+            if usage is not None:
+                return usage
         return get_usage(self.code_home)
+
+    def consume_session_reset(self) -> dict:
+        return consume_session_reset(self.code_home, rpc=self.rpc)
+
+
+def app_server_rpc(
+    code_home: str,
+    requests: list[dict],
+    *,
+    timeout: float = 8.0,
+) -> list[dict]:
+    """Run Codex app-server for a small JSON-RPC exchange.
+
+    The app-server owns Codex auth/token refresh. We initialize a short-lived
+    stdio transport, send the requested account RPCs, and return matching
+    responses by id. Notifications are ignored.
+    """
+    env = os.environ.copy()
+    env["CODEX_HOME"] = code_home
+    proc = subprocess.Popen(
+        ["codex", "app-server"],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+        text=True,
+        env=env,
+    )
+    assert proc.stdin is not None
+    assert proc.stdout is not None
+
+    def send(message: dict) -> None:
+        proc.stdin.write(json.dumps(message) + "\n")
+        proc.stdin.flush()
+
+    def read_responses(wanted: list[object], deadline: float) -> dict[object, dict]:
+        wanted_set = set(wanted)
+        responses: dict[object, dict] = {}
+        while wanted_set - set(responses):
+            if time.monotonic() > deadline:
+                raise TimeoutError("codex app-server timed out")
+            line = proc.stdout.readline()
+            if not line:
+                break
+            try:
+                message = json.loads(line)
+            except Exception:
+                continue
+            mid = message.get("id")
+            if mid in wanted_set:
+                responses[mid] = message
+        return responses
+
+    try:
+        import time
+        deadline = time.monotonic() + timeout
+        send({
+            "method": "initialize",
+            "id": 1,
+            "params": {
+                "clientInfo": {
+                    "name": "codelight",
+                    "title": "codelight",
+                    "version": "1",
+                },
+                "capabilities": {"experimentalApi": True},
+            },
+        })
+        init_response = read_responses([1], deadline).get(1, {})
+        if init_response.get("error"):
+            raise RuntimeError(f"codex app-server initialize failed: {init_response['error']}")
+        send({"method": "initialized", "params": {}})
+        for request in requests:
+            send(request)
+
+        wanted = [request.get("id") for request in requests if request.get("id") is not None]
+        responses = read_responses(wanted, deadline)
+        return [responses[i] for i in wanted if i in responses]
+    finally:
+        try:
+            proc.stdin.close()
+        except Exception:
+            pass
+        try:
+            proc.terminate()
+        except Exception:
+            pass
+        try:
+            proc.wait(timeout=1)
+        except Exception:
+            try:
+                proc.kill()
+            except Exception:
+                pass
 
 
 def rollout_path_for_session(code_home: str, session_id: str) -> str:
@@ -238,6 +348,112 @@ def usage_from_rollout(path: str) -> dict | None:
         "weekly_reset": format_epoch_countdown(weekly_reset_at),
         "session_reset_at": session_reset_at,
         "weekly_reset_at": weekly_reset_at,
+    }
+
+
+def pct_from_window(window: dict) -> float:
+    try:
+        return max(0.0, min(1.0, float(window.get("usedPercent") or 0.0) / 100.0))
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def reset_at_from_window(window: dict) -> int:
+    try:
+        return int(window.get("resetsAt") or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def usage_from_app_server_rate_limits(result: dict) -> dict | None:
+    rate_limits = result.get("rateLimitsByLimitId")
+    if isinstance(rate_limits, dict):
+        codex_limits = rate_limits.get("codex")
+    else:
+        codex_limits = result.get("rateLimits")
+    if not isinstance(codex_limits, dict):
+        return None
+
+    primary = codex_limits.get("primary")
+    secondary = codex_limits.get("secondary")
+    primary = primary if isinstance(primary, dict) else {}
+    secondary = secondary if isinstance(secondary, dict) else {}
+
+    session_reset_at = reset_at_from_window(primary)
+    weekly_reset_at = reset_at_from_window(secondary)
+    usage = {
+        "session_pct": pct_from_window(primary),
+        "weekly_pct": pct_from_window(secondary),
+        "session_reset": format_epoch_countdown(session_reset_at),
+        "weekly_reset": format_epoch_countdown(weekly_reset_at),
+        "session_reset_at": session_reset_at,
+        "weekly_reset_at": weekly_reset_at,
+    }
+
+    reset_credits = result.get("rateLimitResetCredits")
+    if isinstance(reset_credits, dict):
+        usage["rateLimitResetCredits"] = reset_credits
+        usage["rate_limit_reset_available_count"] = int(
+            reset_credits.get("availableCount") or 0)
+    return usage
+
+
+def get_app_server_usage(
+    code_home: str,
+    *,
+    rpc: Callable[[list[dict]], list[dict]] | None = None,
+) -> dict | None:
+    call = rpc or (lambda requests: app_server_rpc(code_home, requests))
+    try:
+        responses = call([{"method": "account/rateLimits/read", "id": 2}])
+        response = responses[0] if responses else {}
+        result = response.get("result")
+        if isinstance(result, dict):
+            return usage_from_app_server_rate_limits(result)
+        if response.get("error"):
+            print(f"[usage] codex app-server error: {response['error']}",
+                  file=sys.stderr, flush=True)
+    except Exception as e:
+        print(f"[usage] codex app-server unavailable: {e}",
+              file=sys.stderr, flush=True)
+    return None
+
+
+def consume_session_reset(
+    code_home: str,
+    *,
+    rpc: Callable[[list[dict]], list[dict]] | None = None,
+) -> dict:
+    call = rpc or (lambda requests: app_server_rpc(code_home, requests))
+    idempotency_key = str(uuid.uuid4())
+    responses = call([
+        {
+            "method": "account/rateLimitResetCredit/consume",
+            "id": 2,
+            "params": {"idempotencyKey": idempotency_key},
+        },
+        {"method": "account/rateLimits/read", "id": 3},
+    ])
+    by_id = {response.get("id"): response for response in responses}
+    consume_response = by_id.get(2, {})
+    read_response = by_id.get(3, {})
+    if consume_response.get("error"):
+        return {
+            "ok": False,
+            "outcome": "error",
+            "message": str(consume_response["error"]),
+        }
+    outcome = "unknown"
+    result = consume_response.get("result")
+    if isinstance(result, dict):
+        outcome = str(result.get("outcome") or "unknown")
+    read_result = read_response.get("result")
+    usage = usage_from_app_server_rate_limits(read_result) \
+        if isinstance(read_result, dict) else None
+    return {
+        "ok": outcome in ("reset", "alreadyRedeemed"),
+        "outcome": outcome,
+        "usage": usage,
     }
 
 

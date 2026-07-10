@@ -15,6 +15,8 @@ internal data class AgentUsage(
     val display: String,
     val status: String,
     val limits: List<UsageLimit>,
+    val sessionResetSupported: Boolean = false,
+    val rateLimitResetCreditsAvailableCount: Int? = null,
 )
 
 internal fun loadAgentUsage(prefs: SharedPreferences, now: Long): List<AgentUsage> {
@@ -38,6 +40,7 @@ internal fun loadAgentUsage(prefs: SharedPreferences, now: Long): List<AgentUsag
 
     return ids.map { id ->
         val value = usage.optJSONObject(id)
+        val rateLimitResetCredits = value?.optJSONObject("rateLimitResetCredits")
         val limits = buildList {
             val generic = value?.optJSONArray("limits")
             if (generic != null) {
@@ -80,8 +83,24 @@ internal fun loadAgentUsage(prefs: SharedPreferences, now: Long): List<AgentUsag
                 id, if (id == activeId) prefs.getString(CodelightService.KEY_STATUS, "idle")
                     ?: "idle" else "idle"),
             limits = limits,
+            sessionResetSupported = value?.optBoolean("session_reset_supported", false) == true,
+            rateLimitResetCreditsAvailableCount = when {
+                rateLimitResetCredits != null -> rateLimitResetCredits.optInt("availableCount", 0)
+                value?.has("rate_limit_reset_available_count") == true ->
+                    value.optInt("rate_limit_reset_available_count", 0)
+                else -> null
+            },
         )
-    }
+    }.sortedWith(compareByDescending<AgentUsage> { it.id == activeId }
+        .thenByDescending { statusRank(it.status) }
+        .thenBy { it.display.lowercase() })
+}
+
+private fun statusRank(status: String): Int = when (status) {
+    "working" -> 3
+    "waiting" -> 2
+    "idle" -> 1
+    else -> 0
 }
 
 private fun topLevelPct(

@@ -74,6 +74,7 @@ class CodelightService : LifecycleService() {
         const val KEY_CONV_LINES         = "conv_lines"         // how many lines to show
         const val KEY_REMOTE_CONTROL     = "remote_control"     // companion arms tabs
         const val KEY_CONVERSATION       = "conversation"       // JSON [{role,text}]
+        const val KEY_SESSION_RESET_RESULT = "session_reset_result"
 
         private const val ALERT_NOTIF_ID    = 2
         private const val ALERT_CHANNEL_ID  = "codelight_alerts"
@@ -86,9 +87,11 @@ class CodelightService : LifecycleService() {
         const val ACTION_PERMISSION_RESPONSE = "se.sensnology.codelight.PERMISSION_RESPONSE"
         const val ACTION_QUESTION_RESPONSE   = "se.sensnology.codelight.QUESTION_RESPONSE"
         const val ACTION_EXTEND              = "se.sensnology.codelight.EXTEND"
+        const val ACTION_SESSION_RESET       = "se.sensnology.codelight.SESSION_RESET"
         const val EXTRA_REQUEST_ID = "request_id"
         const val EXTRA_DECISION   = "decision"
         const val EXTRA_ANSWERS    = "answers"   // JSON {question → answer}
+        const val EXTRA_AGENT_ID   = "agent_id"
         const val EXTRA_TAB        = "tab"       // MainActivity initial tab
     }
 
@@ -133,10 +136,22 @@ class CodelightService : LifecycleService() {
             .remove(KEY_CONNECTED_PORT)
             .apply()
         createNotificationChannels()
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-            startForeground(SVC_NOTIF_ID, buildServiceNotification("Connecting…"), ServiceInfo.FOREGROUND_SERVICE_TYPE_CONNECTED_DEVICE)
-        } else {
-            startForeground(SVC_NOTIF_ID, buildServiceNotification("Connecting…"))
+        try {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                startForeground(SVC_NOTIF_ID, buildServiceNotification("Connecting…"), ServiceInfo.FOREGROUND_SERVICE_TYPE_CONNECTED_DEVICE)
+            } else {
+                startForeground(SVC_NOTIF_ID, buildServiceNotification("Connecting…"))
+            }
+        } catch (e: IllegalStateException) {
+            // Android 12+ forbids foreground promotion when we were started
+            // from the background (ForegroundServiceStartNotAllowedException,
+            // e.g. the widget's onEnabled broadcast after a re-add). Bail out
+            // quietly instead of crash-looping: the widget renders from stored
+            // state, and MainActivity/BootReceiver start us from an allowed
+            // context the next time the app opens or the phone boots.
+            Log.w("Codelight", "startForeground not allowed from background, stopping: $e")
+            stopSelf()
+            return
         }
         pushWidgetUpdate()
         nsdManager = getSystemService(NSD_SERVICE) as NsdManager
@@ -168,6 +183,10 @@ class CodelightService : LifecycleService() {
             }
             ACTION_EXTEND -> {
                 if (id != null) webSocket?.send("""{"type":"extend","id":"$id"}""")
+            }
+            ACTION_SESSION_RESET -> {
+                val agentId = intent.getStringExtra(EXTRA_AGENT_ID)
+                if (!agentId.isNullOrBlank()) sendSessionResetRequest(agentId)
             }
         }
         return START_STICKY
@@ -370,6 +389,7 @@ class CodelightService : LifecycleService() {
                 "question_request"    -> { onRequest(obj, "question"); return }
                 "permission_resolved",
                 "question_resolved"   -> { resolveRequest(obj.optString("id")); return }
+                "session_reset_result" -> { storeSessionResetResult(obj); return }
                 "conversation"        -> { storeConversation(obj); return }
             }
             val edit = getSharedPreferences(STATE_PREFS, MODE_PRIVATE).edit()
@@ -537,6 +557,28 @@ class CodelightService : LifecycleService() {
         val answers = answersJson?.takeIf { it.isNotBlank() } ?: "{}"
         webSocket?.send("""{"type":"question_response","id":"$id","answers":$answers}""")
         resolveRequest(id)
+    }
+
+    private fun sendSessionResetRequest(agentId: String) {
+        val id = java.util.UUID.randomUUID().toString()
+        getSharedPreferences(STATE_PREFS, MODE_PRIVATE).edit()
+            .putString(KEY_SESSION_RESET_RESULT, JSONObject()
+                .put("id", id)
+                .put("agent_id", agentId)
+                .put("pending", true)
+                .toString())
+            .apply()
+        webSocket?.send(JSONObject()
+            .put("type", "session_reset_request")
+            .put("id", id)
+            .put("agent_id", agentId)
+            .toString())
+    }
+
+    private fun storeSessionResetResult(obj: JSONObject) {
+        getSharedPreferences(STATE_PREFS, MODE_PRIVATE).edit()
+            .putString(KEY_SESSION_RESET_RESULT, obj.toString())
+            .apply()
     }
 
     // Pending requests are mirrored to STATE_PREFS so RequestActivity can render them.

@@ -187,6 +187,76 @@ class CodexUsageTests(unittest.TestCase):
         self.assertEqual(usage["session_reset_at"], 2_000_000_000)
         self.assertEqual(usage["weekly_reset_at"], 2_000_604_800)
 
+    def test_app_server_usage_includes_rate_limit_reset_credits(self):
+        def rpc(requests):
+            self.assertEqual(requests[0]["method"], "account/rateLimits/read")
+            return [{
+                "id": 2,
+                "result": {
+                    "rateLimitsByLimitId": {
+                        "codex": {
+                            "primary": {
+                                "usedPercent": 25,
+                                "resetsAt": 2_000_000_000,
+                            },
+                            "secondary": {
+                                "usedPercent": 50,
+                                "resetsAt": 2_000_604_800,
+                            },
+                        },
+                    },
+                    "rateLimitResetCredits": {
+                        "availableCount": 2,
+                        "credits": [{
+                            "id": "RateLimitResetCredit_1",
+                            "resetType": "codexRateLimits",
+                            "status": "available",
+                        }],
+                    },
+                },
+            }]
+
+        usage = codex_agent.get_app_server_usage("/tmp/codex", rpc=rpc)
+
+        self.assertIsNotNone(usage)
+        self.assertEqual(usage["session_pct"], 0.25)
+        self.assertEqual(usage["weekly_pct"], 0.5)
+        self.assertEqual(
+            usage["rateLimitResetCredits"]["availableCount"], 2)
+        self.assertEqual(usage["rate_limit_reset_available_count"], 2)
+
+    def test_consume_session_reset_returns_outcome_and_refreshed_usage(self):
+        def rpc(requests):
+            self.assertEqual(
+                requests[0]["method"],
+                "account/rateLimitResetCredit/consume",
+            )
+            self.assertTrue(requests[0]["params"]["idempotencyKey"])
+            self.assertEqual(requests[1]["method"], "account/rateLimits/read")
+            return [
+                {"id": 2, "result": {"outcome": "reset"}},
+                {
+                    "id": 3,
+                    "result": {
+                        "rateLimits": {
+                            "primary": {
+                                "usedPercent": 0,
+                                "resetsAt": 2_000_000_000,
+                            },
+                        },
+                        "rateLimitResetCredits": {"availableCount": 1},
+                    },
+                },
+            ]
+
+        result = codex_agent.consume_session_reset("/tmp/codex", rpc=rpc)
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["outcome"], "reset")
+        self.assertEqual(result["usage"]["session_pct"], 0.0)
+        self.assertEqual(
+            result["usage"]["rateLimitResetCredits"]["availableCount"], 1)
+
 
 class CopilotUsageTests(unittest.TestCase):
     def test_builds_monthly_company_pool_from_direct_api(self):
@@ -344,6 +414,7 @@ class AuthenticationTests(unittest.TestCase):
             note_question_client_gone=lambda: None,
             respond_permission=lambda request_id, decision, by: False,
             respond_question=lambda request_id, answers, by: False,
+            consume_session_reset=lambda agent_id, request_id: {},
             extend_request=lambda request_id: False,
             announce_gnome=lambda features: False,
             log=lambda message: None,
@@ -684,6 +755,22 @@ class StateSnapshotTests(unittest.TestCase):
         self.assertEqual(active, 1)
         self.assertEqual(status, "waiting")
 
+    def test_status_snapshot_includes_session_reset_capability(self):
+        state = self.make_state()
+        state.set_agent_capability("codex", "session_reset_supported", True)
+        state.update_usage(usages={
+            "codex": {
+                "session_pct": 0.2,
+                "weekly_pct": 0.4,
+                "rateLimitResetCredits": {"availableCount": 2},
+            },
+        })
+
+        usage = state.status_snapshot()["per_agent_usage"]["codex"]
+
+        self.assertTrue(usage["session_reset_supported"])
+        self.assertEqual(usage["rateLimitResetCredits"]["availableCount"], 2)
+
 
 class UsagePollerTests(unittest.TestCase):
     def make_state(self):
@@ -784,6 +871,22 @@ class UsagePollerTests(unittest.TestCase):
             self.assertEqual(set(registry.usage_fetchers()), {"claude", "codex", "copilot"})
             self.assertIsNotNone(usage)
             self.assertEqual(usage["used_credits"], 100)
+
+    def test_registry_session_reset_consumer_is_agent_scoped(self):
+        integration = agents_base.AgentIntegration(
+            spec=agents_base.AgentSpec("resetter", "Resetter"),
+            session_reset_consumer=lambda: {"ok": True, "outcome": "reset"},
+        )
+        registry = AgentRegistry(modules=(), extra_agents=(integration,))
+
+        self.assertTrue(registry.session_reset_supported("resetter"))
+        self.assertEqual(
+            registry.consume_session_reset("resetter")["outcome"], "reset")
+        self.assertFalse(registry.session_reset_supported("missing"))
+        self.assertEqual(
+            registry.consume_session_reset("missing")["outcome"],
+            "unsupported",
+        )
 
 
 class ConversationRefresherTests(unittest.TestCase):

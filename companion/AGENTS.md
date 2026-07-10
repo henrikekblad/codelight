@@ -145,12 +145,22 @@ Keys:
 
 - `home` (string): Codex home directory.
   - Default: `~/.codex` (or `CODEX_HOME`)
+- `app_server_usage` (boolean): use `codex app-server` for
+  `account/rateLimits/read` usage and earned reset-credit metadata when
+  available.
+  - Default: `true`
 
 Behavior and quirks:
 
 - Hooks are merged into `~/.codex/hooks.json`.
 - Codex requires hook trust review in the Codex CLI (`/hooks`) when hooks change.
 - Usage is read from local rollout JSONL rate-limit events (5-hour and weekly windows).
+- When `codex app-server` is available, usage prefers
+  `account/rateLimits/read` so codelight can also show
+  `rateLimitResetCredits.availableCount`.
+- Session reset consumes one earned reset via
+  `account/rateLimitResetCredit/consume`, then refreshes with
+  `account/rateLimits/read`.
 - Local Codex CLI and Codex IDE extension sessions share the user-level hooks file.
 - The question tool is `request_user_input`. It is available in Plan Mode by
   default, or in Default Mode when enabled with:
@@ -178,7 +188,8 @@ Example:
 {
   "agents": {
     "codex": {
-      "home": "~/.codex"
+      "home": "~/.codex",
+      "app_server_usage": true
     }
   }
 }

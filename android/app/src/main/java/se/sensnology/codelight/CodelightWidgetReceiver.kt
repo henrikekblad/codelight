@@ -11,7 +11,12 @@ class CodelightWidgetReceiver : GlanceAppWidgetReceiver() {
 
     override fun onEnabled(context: Context) {
         super.onEnabled(context)
-        context.startService(Intent(context, CodelightService::class.java))
+        try {
+            context.startService(Intent(context, CodelightService::class.java))
+        } catch (_: IllegalStateException) {
+            // Background start not allowed (Android 12+). The widget renders
+            // from stored state; the service starts on next app open / boot.
+        }
     }
 
     override fun onUpdate(context: Context, appWidgetManager: AppWidgetManager, appWidgetIds: IntArray) {

@@ -123,6 +123,9 @@ _state = CodelightState(
     idle_window=IDLE_WINDOW,
     idle_window_waiting=IDLE_WINDOW_WAITING,
 )
+for _agent_id in _agents.supported_agent_ids():
+    if _agents.session_reset_supported(_agent_id):
+        _state.set_agent_capability(_agent_id, "session_reset_supported", True)
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -552,6 +555,34 @@ def _push() -> None:
     _broadcast(payload)
 
 
+def _consume_session_reset(agent_id: str, request_id: str = "") -> dict:
+    aid = _state.normalize_agent_id(agent_id)
+    result = _agents.consume_session_reset(aid)
+    usage = result.get("usage")
+    if isinstance(usage, dict):
+        usage["session_reset_supported"] = True
+        _state.update_usage(usages={aid: usage})
+    elif _agents.session_reset_supported(aid):
+        _state.set_agent_capability(aid, "session_reset_supported", True)
+    payload = {
+        "type": "session_reset_result",
+        "id": request_id,
+        "agent_id": aid,
+        "agent_display": _state.agent_display_name(aid),
+        "ok": bool(result.get("ok")),
+        "outcome": str(result.get("outcome") or ""),
+    }
+    if result.get("message"):
+        payload["message"] = str(result["message"])
+    current_usage = _state.status_snapshot().get("per_agent_usage", {}).get(aid, {})
+    reset_credits = current_usage.get("rateLimitResetCredits")
+    if isinstance(reset_credits, dict):
+        payload["rateLimitResetCredits"] = reset_credits
+    _log(f"[reset] {aid} → {payload['outcome'] or 'unknown'}")
+    _push()
+    return payload
+
+
 def run_dashboard(host: str, ws_port: int, secret: str) -> None:
     """Run the terminal dashboard as a normal WebSocket client."""
     if not _have_websockets:
@@ -596,6 +627,7 @@ def _ws_thread(port: int, secret: str) -> None:
         note_question_client_gone=_note_qclient_gone,
         respond_permission=_resolve_permission,
         respond_question=_resolve_question,
+        consume_session_reset=_consume_session_reset,
         extend_request=_extend_request,
         announce_gnome=_announce_gnome,
         log=_log,

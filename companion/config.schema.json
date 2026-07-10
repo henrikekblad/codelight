@@ -33,6 +33,10 @@
             "home": {
               "type": "string",
               "description": "Override Codex home directory."
+            },
+            "app_server_usage": {
+              "type": "boolean",
+              "description": "Use codex app-server account/rateLimits/read for reset-credit-aware usage when available."
             }
           }
         },

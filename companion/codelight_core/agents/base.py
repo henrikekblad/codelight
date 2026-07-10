@@ -10,6 +10,7 @@ from typing import Callable
 
 
 UsageFetcher = Callable[[], dict | None]
+SessionResetConsumer = Callable[[], dict]
 
 # Permission envelopes (JSON shape the host agent expects on stdout).
 PERMISSION_REQUEST = "permission_request"  # Claude/Codex PermissionRequest decision
@@ -77,6 +78,7 @@ class AgentIntegration:
     agent: object = None
     hook_modes: tuple[HookMode, ...] = ()
     usage_fetcher: UsageFetcher | None = None
+    session_reset_consumer: SessionResetConsumer | None = None
     install_hooks: Callable[..., None] | None = None
     removable_hook_paths: tuple[str, ...] = ()   # files to strip codelight hooks from
     removable_files: tuple[str, ...] = ()        # files codelight owns outright

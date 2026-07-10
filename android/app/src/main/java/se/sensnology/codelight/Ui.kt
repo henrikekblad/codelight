@@ -4,6 +4,7 @@ import android.app.Activity
 import android.content.Context
 import android.content.Intent
 import android.content.SharedPreferences
+import android.widget.Toast
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
@@ -54,7 +55,8 @@ fun StatusScreen() {
                 key == CodelightService.KEY_PER_AGENT_STATUS ||
                 key == CodelightService.KEY_STATUS ||
                 key == CodelightService.KEY_CONNECTED ||
-                key == CodelightService.KEY_AGENTS_META
+                key == CodelightService.KEY_AGENTS_META ||
+                key == CodelightService.KEY_SESSION_RESET_RESULT
             ) revision++
         }
         state.registerOnSharedPreferenceChangeListener(listener)
@@ -65,6 +67,50 @@ fun StatusScreen() {
     val agents = loadAgentUsage(state, System.currentTimeMillis() / 1000)
     val connected = state.getBoolean(CodelightService.KEY_CONNECTED, false)
     val brandings = AgentBrandings.fromPrefs(state)
+    val resetResult = state.getString(CodelightService.KEY_SESSION_RESET_RESULT, "") ?: ""
+    var confirmResetAgent by remember { mutableStateOf<AgentUsage?>(null) }
+
+    LaunchedEffect(resetResult) {
+        if (resetResult.isBlank()) return@LaunchedEffect
+        val obj = try { JSONObject(resetResult) } catch (_: Exception) { return@LaunchedEffect }
+        if (obj.optBoolean("pending", false)) return@LaunchedEffect
+        val outcome = obj.optString("outcome")
+        if (outcome.isBlank()) return@LaunchedEffect
+        val message = when (outcome) {
+            "reset" -> "Session limits reset"
+            "alreadyRedeemed" -> "Reset already redeemed; limits refreshed"
+            "nothingToReset" -> "No eligible rate-limit window to reset"
+            "noCredit" -> "No rateLimitResetCredits available"
+            "unsupported" -> "This agent does not support session resets"
+            else -> obj.optString("message").takeIf { it.isNotBlank() }
+                ?: "Reset result: $outcome"
+        }
+        Toast.makeText(context, message, Toast.LENGTH_SHORT).show()
+    }
+
+    confirmResetAgent?.let { agent ->
+        AlertDialog(
+            onDismissRequest = { confirmResetAgent = null },
+            title = { Text("Reset session limits?") },
+            text = {
+                Text(
+                    "This consumes one rateLimitResetCredits credit for ${agent.display}. " +
+                        "Are you sure?"
+                )
+            },
+            confirmButton = {
+                TextButton(onClick = {
+                    context.startService(Intent(context, CodelightService::class.java)
+                        .setAction(CodelightService.ACTION_SESSION_RESET)
+                        .putExtra(CodelightService.EXTRA_AGENT_ID, agent.id))
+                    confirmResetAgent = null
+                }) { Text("Reset") }
+            },
+            dismissButton = {
+                TextButton(onClick = { confirmResetAgent = null }) { Text("Cancel") }
+            },
+        )
+    }
 
     Column(
         Modifier.fillMaxSize().verticalScroll(rememberScrollState())
@@ -100,6 +146,30 @@ fun StatusScreen() {
                         color = usageColor(limit.pct),
                         trackColor = Color(0xFF444444),
                     )
+                }
+                if (agent.sessionResetSupported) {
+                    val available = agent.rateLimitResetCreditsAvailableCount
+                    HorizontalDivider(color = Color(0xFF333333), thickness = 1.dp)
+                    Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+                        Text(
+                            "Available rate reset credits: ${available?.toString() ?: "unknown"}",
+                            color = Palette.muted,
+                            fontSize = 11.sp,
+                            modifier = Modifier.weight(1f),
+                        )
+                        Button(
+                            onClick = { confirmResetAgent = agent },
+                            enabled = connected && (available == null || available > 0),
+                            colors = ButtonDefaults.buttonColors(
+                                containerColor = Palette.accent,
+                                contentColor = Color.Black,
+                                disabledContainerColor = Color(0xFF333333),
+                                disabledContentColor = Palette.muted,
+                            ),
+                        ) {
+                            Text("Reset session limits")
+                        }
+                    }
                 }
             }
         }

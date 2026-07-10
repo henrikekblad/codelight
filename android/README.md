@@ -55,7 +55,8 @@ The widget connects automatically and stays updated in the background.
 The app uses a bottom tab bar:
 
 - **Status** — grouped agent state and every usage window exposed by the
-  companion.
+  companion. Agents that expose session reset credits also show
+  `rateLimitResetCredits` and a confirmable **Reset session limits** action.
 - **Conversation** — the last N lines of the active session (configurable),
   with tool calls and output normalized by the companion; read-only.
 - **Request** — appears when an agent is waiting on you: **Allow / Deny** for a
