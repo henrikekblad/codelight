@@ -5,6 +5,13 @@ import sys
 import threading
 from typing import Callable
 
+try:
+    from zeroconf import ServiceInfo, Zeroconf
+
+    HAVE_ZEROCONF = True
+except ImportError:
+    HAVE_ZEROCONF = False
+
 
 Logger = Callable[[str], None]
 
@@ -39,13 +46,19 @@ def advertise_mdns(
     port: int,
     name: str,
     shutdown: threading.Event,
-    zeroconf_cls,
-    service_info_cls,
     log: Logger,
     verbose_log: Logger | None = None,
     local_ip: Callable[[], str] = get_local_ip,
+    zeroconf_cls=None,
+    service_info_cls=None,
 ) -> None:
     """Advertise the WebSocket service via mDNS and re-register on IP changes."""
+    if (zeroconf_cls is None or service_info_cls is None) and not HAVE_ZEROCONF:
+        unavailable_message()
+        return
+    zeroconf_cls = zeroconf_cls or Zeroconf
+    service_info_cls = service_info_cls or ServiceInfo
+
     zc = None
     current_ip: str | None = None
     info = None
