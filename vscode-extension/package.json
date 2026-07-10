@@ -2,7 +2,7 @@
   "name": "codelight",
   "displayName": "codelight",
   "description": "Coding-agent status (Claude, Copilot, Codex, …) in the VS Code status bar",
-  "version": "1.4.0",
+  "version": "1.4.1",
   "publisher": "sensnology",
   "license": "MIT",
   "repository": {

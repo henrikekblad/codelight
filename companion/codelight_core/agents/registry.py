@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+import importlib
+import inspect
+import pkgutil
+from types import ModuleType
 from typing import Callable, Sequence
 
-from codelight_core.agents import claude as claude_agent
-from codelight_core.agents import codex as codex_agent
-from codelight_core.agents import copilot as copilot_agent
+from codelight_core import agents as agents_pkg
 from codelight_core.agents.base import (
     AgentIntegration,
     AgentSpec,
@@ -14,6 +16,36 @@ from codelight_core.agents.base import (
 
 
 Logger = Callable[[str], None]
+BUILTIN_EXCLUDE = frozenset({"base", "registry"})
+
+
+def discover_agent_modules() -> list[ModuleType]:
+    """Import every built-in agent module that exposes build_integration().
+
+    Adding a built-in integration should be additive: drop a new .py file into
+    codelight_core/agents/ and export build_integration(config, ...). The
+    registry owns ordering and duplicate checks, while the module owns all
+    agent-specific behavior.
+    """
+    modules: list[ModuleType] = []
+    for info in sorted(pkgutil.iter_modules(agents_pkg.__path__),
+                       key=lambda item: item.name):
+        if info.name in BUILTIN_EXCLUDE or info.ispkg:
+            continue
+        module = importlib.import_module(f"{agents_pkg.__name__}.{info.name}")
+        if callable(getattr(module, "build_integration", None)):
+            modules.append(module)
+    return modules
+
+
+def _supported_kwargs(func: Callable, candidates: dict) -> dict:
+    """Return only the keyword-only test/runtime hooks a builder accepts."""
+    params = inspect.signature(func).parameters
+    return {
+        name: value
+        for name, value in candidates.items()
+        if name in params and value is not None
+    }
 
 
 class AgentRegistry:
@@ -21,18 +53,19 @@ class AgentRegistry:
 
     The rest of the companion should ask this object for agent-owned behavior
     instead of importing individual agent modules. Each agent module exports
-    ``build_integration(...)``; adding an agent means adding its module to the
-    integration list below (or injecting one via ``extra_agents``) — clients
-    need no changes.
+    ``build_integration(...)``; adding an agent means adding its module to
+    ``codelight_core/agents`` (or injecting one via ``extra_agents`` in tests)
+    — clients need no changes.
     """
 
     def __init__(
         self,
         *,
         agents_config: dict | None = None,
-        claude_usage_api: str = claude_agent.USAGE_API,
+        claude_usage_api: str | None = None,
         github_api: Callable[[str, str], dict] | None = None,
         log: Logger | None = None,
+        modules: Sequence[ModuleType] | None = None,
         extra_agents: Sequence[AgentIntegration] = (),
     ) -> None:
         """``agents_config`` is the "agents" section of the user's
@@ -45,14 +78,27 @@ class AgentRegistry:
             value = config.get(agent_id)
             return value if isinstance(value, dict) else {}
 
-        integrations = [
-            claude_agent.build_integration(
-                section("claude"), usage_api=claude_usage_api, log=log),
-            copilot_agent.build_integration(
-                section("copilot"), api=github_api, log=log),
-            codex_agent.build_integration(section("codex")),
-            *extra_agents,
-        ]
+        build_kwargs = {
+            # Historical test hooks. The registry only passes them to modules
+            # that declare the corresponding parameter.
+            "usage_api": claude_usage_api,
+            "api": github_api,
+            "log": log,
+        }
+        integrations = []
+        for module in modules if modules is not None else discover_agent_modules():
+            builder = getattr(module, "build_integration")
+            module_spec = getattr(module, "SPEC", None)
+            provisional_id = getattr(
+                module_spec,
+                "agent_id",
+                module.__name__.rsplit(".", 1)[-1],
+            )
+            integrations.append(builder(
+                section(provisional_id),
+                **_supported_kwargs(builder, build_kwargs),
+            ))
+        integrations.extend(extra_agents)
         self._integrations: dict[str, AgentIntegration] = {}
         for integration in integrations:
             agent_id = integration.spec.agent_id

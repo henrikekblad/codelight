@@ -1,9 +1,11 @@
 # codelight — Android app
 
-A home-screen widget and app that show grouped Claude, Copilot, and Codex status
-and available usage limits, updated instantly via WebSocket. The widget adapts
-to its size: compact layouts show the latest agent, while taller or wider
-layouts show more agent groups. When the companion
+A home-screen widget and app that show grouped supported-agent status and
+available usage limits, updated instantly via WebSocket. Agent names, colors,
+and logos come from the companion, so the UI can follow new integrations
+without app-specific assets. The widget adapts to its size: compact layouts
+show the latest agent, while taller or wider layouts show more agent groups.
+When the companion
 runs with `--remote-control`, the app also becomes a small **control surface**:
 approve permission prompts, answer agent questions, and follow the live
 conversation — all from your phone.
@@ -53,12 +55,12 @@ The widget connects automatically and stays updated in the background.
 The app uses a bottom tab bar:
 
 - **Status** — grouped agent state and every usage window exposed by the
-  companion, including optional company Copilot monthly credits.
+  companion.
 - **Conversation** — the last N lines of the active session (configurable),
-  with tool calls and output from Claude, Copilot, or Codex; read-only.
+  with tool calls and output normalized by the companion; read-only.
 - **Request** — appears when an agent is waiting on you: **Allow / Deny** for a
   permission, or the options + an "Other…" free-text field for an
-  AskUserQuestion. Whoever answers first (phone, GNOME, or VSCode) wins.
+  agent question. Whoever answers first (phone, GNOME, or VSCode) wins.
 - **Settings** — everything below.
 
 A request also raises a notification; tapping it opens the Request tab. Enable

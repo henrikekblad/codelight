@@ -1,14 +1,26 @@
 # codelight - coding-agent status & remote control
 
-Live Claude Code, GitHub Copilot, and Codex status **and a remote-control surface**, built from five
-components. Watch grouped usage and working/waiting status on a desk screen, phone,
-GNOME panel, or in VSCode - and, when you're away from the keyboard, **approve
-permission prompts and answer agent questions** from any of them. Pick and
-choose whatever suits your needs:
+Live status, usage, conversation following, and **remote-control prompts** for
+supported coding agents. Watch grouped working/waiting/idle state on a desk
+screen, phone, GNOME panel, or in VSCode — and, when you're away from the
+keyboard, **approve permission prompts and answer agent questions** from any of
+them. Pick and choose whatever suits your needs:
+
+## Currently supported agents
+
+| Agent | Status | Usage | Remote control | Conversation |
+|---|---|---|---|---|
+| Claude Code | ✅ | ✅ | Permissions + questions | ✅ |
+| Codex CLI / IDE extension | ✅ | ✅ | Permissions + questions | ✅ |
+| GitHub Copilot / Copilot Chat | ✅ | Optional org monthly pool | Permissions; questions where exposed by the IDE hook path | ✅ |
+
+Agent-specific setup, caveats, and config keys live in
+[companion/AGENTS.md](companion/AGENTS.md). New integrations are discovered from
+the companion's agent modules and clients render the metadata they receive.
 
 | Component | Description | Example
 |---|---|---|
-| [**companion/**](companion/README.md) | Python daemon that polls Claude, Codex, and optional company Copilot usage, tracks supported agents, pushes status over WebSocket + D-Bus, and brokers remote control. Agent config keys: [companion/AGENTS.md](companion/AGENTS.md). |
+| [**companion/**](companion/README.md) | Python daemon that detects supported agents, installs their hooks, polls usage where available, pushes status over WebSocket + D-Bus, and brokers remote control. Agent config and quirks: [companion/AGENTS.md](companion/AGENTS.md). |
 | [**screen/**](screen/README.md) | ESP8266 firmware for the GeekMagic Ultra — renders usage bars and status | <img src="assets/demo.jpg" width="600" alt="GeekMagic Ultra showing the codelight IDLE screen"> |
 | [**android/**](android/README.md) | Responsive Android widget + Status and Conversation views, permission review, and question answering | <img src="assets/android-widget-compact.jpg" width="280" alt="Compact codelight Android widget"> |
 | [**gnome-extension/**](gnome-extension/README.md) | GNOME Shell panel extension: status + approve/answer prompts from a popup | <img src="assets/gnome-extension-grouped.png" width="600" alt="Grouped codelight GNOME Shell popup">|
@@ -25,14 +37,13 @@ client so you can respond from wherever you are:
 - **Questions** (multiple-choice + free text) - from the **Android app**,
   the **GNOME panel**, or **VSCode** (a themed WebView in the editor).
 
-Claude uses `AskUserQuestion`; Codex uses `request_user_input`, which is
-available in Plan Mode by default. Whoever answers first wins. If no capable
-client is connected, codelight falls through to the agent's built-in prompt.
-See
-[companion/README.md](companion/README.md#remote-control).
+Whoever answers first wins. If no capable client is connected, codelight falls
+through to the agent's built-in prompt. See
+[companion/README.md](companion/README.md#remote-control); agent-specific
+prompt details live in [companion/AGENTS.md](companion/AGENTS.md).
 
 Persistent folder and exact-command approvals are stored once in codelight's
-agent-neutral policy and enforced for Claude, Copilot, and Codex. See
+agent-neutral policy and enforced in the shared hook path. See
 [Persistent folder and command approvals](companion/README.md#persistent-folder-and-command-approvals).
 
 The status UIs all show the same core information:
@@ -48,22 +59,24 @@ The status UIs all show the same core information:
 
 ```mermaid
 flowchart LR
-    CC["Claude Code"] -->|hooks| D
-    CP["GitHub Copilot"] -->|optional hooks| D
-    CX["Codex<br/>(CLI + IDE extension)"] -->|optional hooks| D
+    A1["Supported agent"] -->|hooks| D
+    A2["Supported agent"] -->|hooks| D
+    A3["Supported agent"] -->|hooks| D
 
     subgraph D["codelight.py daemon"]
         SOCK["Unix socket thread<br/>receives hook events"]
-        USAGE["Multi-agent usage poller<br/>Claude, Codex, optional Copilot pool"]
+        REG["Agent registry<br/>metadata + hook modes + branding"]
+        USAGE["Multi-agent usage poller"]
         WS["WebSocket server :8765"]
         DBUS["D-Bus service<br/>se.sensnology.codelight"]
     end
 
     WS -->|status| SCREEN["GeekMagic Ultra<br/>(mDNS)"]
-    WS -->|status + remote control<br/>+ conversation| ANDROID["Android app<br/>(mDNS)"]
-    WS -->|status + questions| VSCODE["VSCode extension"]
-    DBUS -->|status + remote control| GNOME["GNOME extension"]
+    WS -->|status + questions + remote control<br/>+ conversation| ANDROID["Android app<br/>(mDNS)"]
+    WS -->|status + questions + remote control| VSCODE["VSCode extension"]
+    DBUS -->|status + questions + remote control| GNOME["GNOME extension"]
 
+    REG -.-> USAGE
     USAGE -.-> WS
     SOCK -.-> WS
     SOCK -.-> DBUS
@@ -87,8 +100,8 @@ never see them). See
    python3 companion/codelight.py --name my-laptop
    ```
    Add `--secret mypassword --remote-control` to enable remote approval and
-   question answering. Installed Claude, Copilot, and Codex agents are detected
-   automatically and their hooks are managed together. Full setup:
+   question answering. Installed supported agents are detected automatically and
+   their hooks are managed together. Full setup:
    [companion/README.md](companion/README.md).
 
 3. *(Optional)* Install the Android app: [android/README.md](android/README.md).

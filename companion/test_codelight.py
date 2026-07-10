@@ -1,6 +1,8 @@
 import base64
+import asyncio
 import contextlib
 import io
+import importlib.util
 import json
 import os
 import sys
@@ -9,6 +11,7 @@ import threading
 import unittest
 import urllib.error
 from datetime import datetime, timezone
+from types import ModuleType
 from unittest import mock
 
 sys.path.insert(0, os.path.dirname(__file__))
@@ -29,8 +32,17 @@ from codelight_core import lifecycle
 from codelight_core import remote_control
 from codelight_core import remote_payloads
 from codelight_core import service as service_core
-from codelight_core.agents.registry import AgentRegistry
+from codelight_core.ws_server import CodelightWebsocketHub
+from codelight_core.agents.registry import AgentRegistry, discover_agent_modules
 from codelight_core.usage import UsagePoller, usage_summary
+
+
+def load_logo_bitmap_tool():
+    path = os.path.join(os.path.dirname(__file__), "tools", "logo_bitmap.py")
+    spec = importlib.util.spec_from_file_location("logo_bitmap_tool", path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
 
 
 class TranscriptParserTests(unittest.TestCase):
@@ -317,6 +329,75 @@ class AuthenticationTests(unittest.TestCase):
         self.assertFalse(codelight._valid_auth_response(
             {"auth_hmac": "wrong"}, secret, nonce))
 
+    def make_hub(self):
+        return CodelightWebsocketHub(
+            websockets_module=None,
+            shutdown=threading.Event(),
+            remote_permissions=lambda: False,
+            remote_questions=lambda: False,
+            client_config=lambda client: {},
+            status_snapshot=lambda: {},
+            overall_status=lambda: (0, "idle", {}, ""),
+            pending_payloads=lambda: [],
+            conversation_payload=lambda: None,
+            notify_conversation_changed=lambda: None,
+            note_question_client_gone=lambda: None,
+            respond_permission=lambda request_id, decision, by: False,
+            respond_question=lambda request_id, answers, by: False,
+            extend_request=lambda request_id: False,
+            announce_gnome=lambda features: False,
+            log=lambda message: None,
+            verbose_log=lambda message: None,
+        )
+
+    def test_invalid_hmac_sends_unauthorized(self):
+        class FakeWebSocket:
+            remote_address = ("192.168.178.190", 12345)
+
+            def __init__(self):
+                self.sent = []
+                self.closed = None
+
+            async def send(self, message):
+                self.sent.append(message)
+
+            async def recv(self):
+                return json.dumps({"auth_hmac": "wrong"})
+
+            async def close(self, code, reason):
+                self.closed = (code, reason)
+
+        ws = FakeWebSocket()
+        ok = asyncio.run(self.make_hub()._authenticate(ws, "secret"))
+
+        self.assertFalse(ok)
+        self.assertEqual(ws.closed, (1008, "Unauthorized"))
+        self.assertTrue(any("unauthorized" in message for message in ws.sent))
+
+    def test_auth_timeout_does_not_send_sticky_unauthorized(self):
+        class FakeWebSocket:
+            remote_address = ("192.168.178.190", 12345)
+
+            def __init__(self):
+                self.sent = []
+                self.closed = None
+
+            async def send(self, message):
+                self.sent.append(message)
+
+            async def recv(self):
+                raise asyncio.TimeoutError()
+
+            async def close(self, code, reason):
+                self.closed = (code, reason)
+
+        ws = FakeWebSocket()
+        ok = asyncio.run(self.make_hub()._authenticate(ws, "secret"))
+
+        self.assertFalse(ok)
+        self.assertEqual(ws.closed, (1011, "Authentication timeout"))
+        self.assertFalse(any("unauthorized" in message for message in ws.sent))
+
 
 class AgentDetectionTests(unittest.TestCase):
     def test_detects_cli_and_vscode_agents(self):
@@ -395,6 +476,39 @@ class ClientConfigTests(unittest.TestCase):
 class FakeAgentIntegrationTests(unittest.TestCase):
     """Prove the registry path is additive: a new agent registers one
     AgentIntegration and flows through every client surface unchanged."""
+
+    def test_builtin_agent_modules_are_discovered(self):
+        module_names = {
+            module.__name__.rsplit(".", 1)[-1]
+            for module in discover_agent_modules()
+        }
+
+        self.assertGreaterEqual(module_names, {"claude", "copilot", "codex"})
+        self.assertNotIn("base", module_names)
+        self.assertNotIn("registry", module_names)
+
+    def test_module_with_build_integration_is_enough_to_register_agent(self):
+        module = ModuleType("codelight_core.agents.pluggy")
+        module.SPEC = agents_base.AgentSpec("pluggy", "Pluggy")
+        seen = {}
+
+        def build_integration(config, *, log=None):
+            seen["config"] = config
+            seen["log"] = log
+            return agents_base.AgentIntegration(
+                spec=module.SPEC,
+            )
+
+        module.build_integration = build_integration
+        registry = AgentRegistry(
+            agents_config={"pluggy": {"enabled": True}},
+            modules=(module,),
+            log=lambda message: None,
+        )
+
+        self.assertEqual(registry.supported_agent_ids(), {"pluggy"})
+        self.assertEqual(seen["config"], {"enabled": True})
+        self.assertIsNotNone(seen["log"])
 
     def make_fake_integration(self):
         return agents_base.AgentIntegration(
@@ -512,6 +626,21 @@ class FakeAgentIntegrationTests(unittest.TestCase):
         )
         with self.assertRaises(ValueError):
             AgentRegistry(extra_agents=(mode_clone,)).hook_modes()
+
+
+class LogoBitmapToolTests(unittest.TestCase):
+    def test_pack_bitmap_is_msb_first_and_fixed_size(self):
+        tool = load_logo_bitmap_tool()
+        pixels = [False] * (48 * 48)
+        pixels[0] = True
+        pixels[7] = True
+        pixels[8] = True
+
+        packed = tool.pack_bitmap(pixels)
+
+        self.assertEqual(len(packed), 48 * 48 // 8)
+        self.assertEqual(packed[0], 0b10000001)
+        self.assertEqual(packed[1], 0b10000000)
 
 
 class StateSnapshotTests(unittest.TestCase):
@@ -989,8 +1118,10 @@ class RemotePayloadTests(unittest.TestCase):
 
 class RemoteControlTests(unittest.TestCase):
     def test_completion_event_policy_matches_pending_prompt_lifecycle(self):
-        self.assertTrue(remote_control.should_cancel_pending_for_hook(
+        self.assertFalse(remote_control.should_cancel_pending_for_hook(
             "working", "PostToolUse"))
+        self.assertTrue(remote_control.should_cancel_pending_for_hook(
+            "working", "PermissionDenied"))
         self.assertTrue(remote_control.should_cancel_pending_for_hook(
             "ended", ""))
         self.assertFalse(remote_control.should_cancel_pending_for_hook(
@@ -1146,9 +1277,18 @@ class PendingRequestCancellationTests(unittest.TestCase):
         self.assertIsNone(entry["by"])
         self.assertFalse(entry["event"].is_set())
 
-    def test_completion_events_cancel_pending_question(self):
+    def test_unrelated_post_tool_status_does_not_cancel_question(self):
+        entry = self.add_question()
+
+        cancelled = codelight._cancel_pending_for_hook(
+            "session-1", "working", "PostToolUse")
+
+        self.assertFalse(cancelled)
+        self.assertIsNone(entry["by"])
+        self.assertFalse(entry["event"].is_set())
+
+    def test_strong_completion_events_cancel_pending_question(self):
         for event, state in (
-            ("PostToolUse", "working"),
             ("PermissionDenied", "working"),
             ("Stop", "ended"),
             ("SessionEnd", "ended"),

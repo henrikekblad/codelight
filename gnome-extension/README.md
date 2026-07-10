@@ -1,10 +1,10 @@
 # codelight — GNOME Shell extension
 
-A GNOME Shell extension that shows the active Claude, Copilot, or Codex status
-in the top bar.
+A GNOME Shell extension that shows the active supported-agent status in the top
+bar. Agent names, colors, and logos are delivered by the companion.
 
 <img src="../assets/gnome-extension-grouped.png" width="624"
-     alt="codelight GNOME popup with grouped Claude, Copilot, and Codex status and usage">
+     alt="codelight GNOME popup with grouped agent status and usage">
 
 The panel indicator shows the active agent plus **WORKING**, **WAITING**, or
 **IDLE**. Click it to see usage grouped by agent and the number of active
@@ -13,10 +13,11 @@ only. The extension connects to the companion daemon via **D-Bus**.
 
 When the companion runs with `--remote-control`, the same popup also lets you
 answer agent prompts: **Allow / Deny** for a permission request, or the
-options + an "Other…" free-text field for an AskUserQuestion. Whoever answers
-first (GNOME, the phone, or VSCode) wins. Turn each kind on or off in the
-extension's preferences (*Permission prompts* / *Question prompts*, both default
-on).
+options + an "Other…" free-text field for a supported question. Whoever answers
+first (GNOME, the phone, or VSCode) wins. The exact native question tool is
+agent-specific; the companion normalizes it before it reaches the extension.
+Turn each kind on or off in the extension's preferences (*Permission prompts* /
+*Question prompts*, both default on).
 
 Permission prompts can also trust the repository for narrowly safe edits or
 persist the exact command for that repository. Rules are enforced across all

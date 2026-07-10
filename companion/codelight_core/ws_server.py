@@ -216,6 +216,7 @@ class CodelightWebsocketHub:
             self._log(f"[ws] client disconnected ({len(self.clients)} remaining)")
 
     async def _authenticate(self, ws, secret: str) -> bool:
+        invalid_proof = False
         try:
             nonce = secrets.token_hex(16)
             await ws.send(json.dumps({"type": "challenge", "nonce": nonce}))
@@ -223,18 +224,26 @@ class CodelightWebsocketHub:
             data = json.loads(raw)
             if auth_core.valid_auth_response(data, secret, nonce):
                 return True
+            invalid_proof = True
             self._log(f"[ws] auth failed from {ws.remote_address}")
         except Exception:
             self._log(f"[ws] auth error from {ws.remote_address}")
 
-        try:
-            await ws.send(json.dumps({
-                "error": "unauthorized",
-                "message": "Wrong password",
-            }))
-        except Exception:
-            pass
-        await ws.close(1008, "Unauthorized")
+        if invalid_proof:
+            try:
+                await ws.send(json.dumps({
+                    "error": "unauthorized",
+                    "message": "Wrong password",
+                }))
+            except Exception:
+                pass
+            await ws.close(1008, "Unauthorized")
+        else:
+            # A reconnecting ESP8266 may miss the 5s challenge window while the
+            # companion restarts or the screen is in a throttled sleep-probe
+            # loop. Do not send the sticky "wrong password" frame for those
+            # transient failures; just close and let the client retry.
+            await ws.close(1011, "Authentication timeout")
         return False
 
     async def _handle_client_message(

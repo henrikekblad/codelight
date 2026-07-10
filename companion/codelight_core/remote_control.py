@@ -8,7 +8,6 @@ from collections.abc import Callable
 
 
 PENDING_COMPLETION_EVENTS = {
-    "PostToolUse",
     "PermissionDenied",
     "Stop",
     "SessionEnd",

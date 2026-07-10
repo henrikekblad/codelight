@@ -7,8 +7,9 @@ coding-agent dashboard. The screen connects outbound to the companion daemon as 
 WebSocket client, discovers it automatically via mDNS, and re-renders on every
 push.
 
-The compact 240×240 layout follows the latest active Claude, Copilot, or Codex
-agent rather than attempting the multi-agent groups used by larger clients.
+The compact 240×240 layout follows the latest active agent rather than
+attempting the multi-agent groups used by larger clients. Agent logos and
+colors are delivered by the companion in the connection config and are shown in the screensaver.
 
 ## Hardware
 

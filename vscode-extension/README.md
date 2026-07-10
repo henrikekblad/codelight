@@ -1,8 +1,8 @@
 # codelight — VSCode extension
 
-Shows the active Claude, Copilot, or Codex status in the VS Code status bar.
-Hovering shows usage grouped by agent, including optional company Copilot
-monthly credits. When detailed usage is unavailable, that agent remains
+Shows the active supported-agent status in the VS Code status bar. Hovering
+shows usage grouped by agent. Agent names, colors, and logos are delivered by
+the companion; when detailed usage is unavailable, that agent remains
 status-only.
 
 <table>
@@ -17,7 +17,7 @@ status-only.
 
 ## Questions and permissions
 
-When Claude asks a multiple-choice question, a themed **WebView panel** opens
+When an agent asks a supported question, a themed **WebView panel** opens
 beside your editor with the question(s), options (radio or checkboxes for
 multi-select), a free-text "Other…" field, and **Submit** / **Skip** buttons.
 The status-bar item turns into an agent question indicator you can click
@@ -28,7 +28,7 @@ elsewhere or times out.
 Permission requests open a separate review webview with **Allow**, **Deny**, and
 fallback actions. A request may also be allowed while trusting the repository
 for narrowly safe edits, or while persisting the exact command in that
-repository. The policy is shared across Claude, Copilot, and Codex; see
+repository. The policy is shared across supported agents; see
 [Persistent folder and command approvals](../companion/README.md#persistent-folder-and-command-approvals).
 
 ## Install

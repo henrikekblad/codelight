@@ -65,8 +65,8 @@ class AgentIntegration:
     Each agent module exports ``build_integration(config, ...)`` returning
     one of these, where ``config`` is the agent's section of the user's
     ~/.config/codelight/config.json (all keys optional; the module supplies
-    defaults). Adding an agent means adding a module and registering its
-    integration — no registry or client branching.
+    defaults). Adding a built-in agent means adding a module that exports
+    ``build_integration`` — no registry or client branching.
 
     ``install_hooks`` is keyword-only: (script_path, hook_wait_ceiling,
     remote_permissions, remote_questions, permission_timeout, log).

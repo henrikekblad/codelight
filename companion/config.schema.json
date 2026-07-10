@@ -1,0 +1,60 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/henrikekblad/codelight/blob/main/companion/config.schema.json",
+  "title": "codelight companion config",
+  "type": "object",
+  "additionalProperties": true,
+  "properties": {
+    "agents": {
+      "type": "object",
+      "description": "Agent-specific configuration keyed by agent id.",
+      "additionalProperties": {
+        "type": "object"
+      },
+      "properties": {
+        "claude": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "settings_path": {
+              "type": "string",
+              "description": "Override Claude settings.json path."
+            },
+            "credentials_path": {
+              "type": "string",
+              "description": "Override Claude credentials path used for usage polling."
+            }
+          }
+        },
+        "codex": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "home": {
+              "type": "string",
+              "description": "Override Codex home directory."
+            }
+          }
+        },
+        "copilot": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "home": {
+              "type": "string",
+              "description": "Override Copilot home directory."
+            },
+            "github_org": {
+              "type": "string",
+              "description": "GitHub organization slug for optional pooled monthly usage."
+            },
+            "github_token_file": {
+              "type": "string",
+              "description": "Path to a token file used for GitHub API usage calls."
+            }
+          }
+        }
+      }
+    }
+  }
+}

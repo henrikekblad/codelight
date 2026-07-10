@@ -2,10 +2,11 @@
 
 The Python daemon `codelight.py` runs on your computer and pushes coding-agent
 status to all connected clients — the GeekMagic Ultra screen, Android app,
-GNOME extension, and VSCode extension. Claude Code is enabled automatically;
-GitHub Copilot and Codex hooks are optional. With `--remote-control` it also
-brokers supported interactive prompts to those clients so you can approve
-permissions and answer questions remotely (see [Remote control](#remote-control)).
+GNOME extension, and VSCode extension. It detects supported agent integrations,
+installs their hooks, and normalizes their status/usage/prompt events into one
+client protocol. With `--remote-control` it also brokers supported interactive
+prompts to those clients so you can approve permissions and answer questions
+remotely (see [Remote control](#remote-control)).
 
 When run in a terminal it shows a live dashboard. When run as a systemd service
 it is silent (key events are logged to the journal via stdout).
@@ -44,56 +45,39 @@ Set the same secret in the screen's config page and in the Android app.
 The GNOME extension uses D-Bus (session bus) and does not need a secret.
 
 On startup the script detects supported agents from installed CLIs and VSCode
-extensions, then manages hooks for all detected agents:
-
-- Claude Code CLI or `anthropic.claude-code`
-- GitHub Copilot CLI or `github.copilot` / `github.copilot-chat`
-- Codex CLI or `openai.chatgpt`
-
-Claude hooks are merged into `~/.claude/settings.json`, Copilot hooks are written
-to the codelight-owned `~/.copilot/hooks/codelight.json`, and Codex hooks are
-merged into `~/.codex/hooks.json`. Codex CLI and the local Codex IDE extension
-share this configuration.
-
-Codex requires non-managed command hooks to be reviewed by hash. After the
-initial install—or whenever Codex says a new/changed hook needs review—open
-Codex CLI and run `/hooks`, inspect the codelight commands, and trust them. This
-cannot safely be persisted by the Python installer. Codex offers
-`--dangerously-bypass-hook-trust` for a single
-already-vetted automation launch, but codelight deliberately does not make it a
-permanent bypass. See the official
-[Codex hooks documentation](https://developers.openai.com/codex/hooks).
+extensions, then manages hooks for every detected integration. The public daemon
+path is agent-neutral: each integration contributes its own detection metadata,
+hook installer, usage fetcher, transcript extractor, remote-control hook modes,
+and client branding. Supported built-in integrations and their quirks are
+documented in [AGENTS.md](AGENTS.md).
 
 Use `--verbose` (`-v`) to add low-level debug events (per-hook socket events,
 raw API responses) to the activity log.
 
-### Company Copilot usage
+### Agent configuration
 
-To show the organization's pooled monthly Copilot AI-credit limit in supported
-clients, configure its GitHub slug in `~/.config/codelight/config.json`:
+Agent-specific options live in:
+
+```text
+~/.config/codelight/config.json
+```
+
+The file is optional. Missing keys use each integration's defaults. The shape is:
 
 ```json
 {
   "agents": {
-    "copilot": {
-      "github_org": "Sensnology-AB"
-    }
+    "agent-id": {}
   }
 }
 ```
 
-Agent-specific configuration keys are documented in `companion/AGENTS.md`.
+See [AGENTS.md](AGENTS.md) for the current built-in agent IDs, supported keys,
+usage sources, hook locations, and remote-control quirks.
 
-The companion calls GitHub's REST API directly; the `gh` command is not
-required. Credentials are resolved in this order:
-
-1. `CODELIGHT_GITHUB_TOKEN`, `GITHUB_TOKEN`, or `GH_TOKEN`
-2. `agents.copilot.github_token_file` in `~/.config/codelight/config.json`
-3. The existing `gh auth token`, when the CLI happens to be installed
-
-The token needs read access to Copilot subscription and organization billing
-usage. If the organization or token does not expose detailed billing, clients
-simply show Copilot's activity status without a usage bar.
+Some integrations expose extra usage sources or credential options. Full
+details live in [AGENTS.md](AGENTS.md). Editors that understand JSON Schema can
+use [config.schema.json](config.schema.json) for validation/completion.
 
 ## Run as a systemd user service
 
@@ -135,25 +119,10 @@ kinds of prompt are handled:
   from the **Android app**, the **GNOME extension**, or **VSCode** (a themed
   WebView in the editor).
 
-Works across supported Claude, Copilot, and Codex hooks. Whoever answers first
-wins; a local fallback remains available when the native agent prompt is
-preferred.
-
-Local Codex CLI and Codex IDE extension sessions also report status and forward
-permission requests when Codex is detected. Codex's question tool is named
-`request_user_input`; it is available in Plan Mode by default, or in Default
-Mode when this Codex feature is enabled:
-
-```toml
-[features]
-default_mode_request_user_input = true
-```
-
-Codex lifecycle hooks cannot submit a native `request_user_input` response.
-Codelight therefore uses an experimental fallback: it blocks the local question
-tool after a remote answer and injects the answer into model context. If no
-question-capable client is connected or the request times out, codelight emits
-no hook decision and Codex shows its normal local question UI.
+Works across integrations that expose compatible permission/question hook
+modes. Whoever answers first wins; a local fallback remains available when the
+native agent prompt is preferred. The exact hook names and fallback semantics
+are agent-specific; see [AGENTS.md](AGENTS.md#remote-control-quirks).
 
 ```bash
 python3 companion/codelight.py --install --name my-laptop \
@@ -168,20 +137,19 @@ python3 companion/codelight.py --install --name my-laptop \
   the latest GitHub release — and writes `codelight.secret` into your VSCode
   user settings automatically. VSCode picks the setting up live: no restart
   needed. `--uninstall` removes the extension and its settings again.
-- If no client that can answer is connected, the prompt falls through to Claude
-  Code's built-in dialog **immediately** — you're never stuck waiting on a
-  device that isn't there. A briefly reconnecting client (e.g. VSCode
-  restarting) is not mistaken for "nobody home". Otherwise, if nobody answers
-  within `--permission-timeout` seconds (default 60), it also falls back.
-  Answering the built-in dialog dismisses the remote prompts.
+- If no capable client is connected, the prompt falls through to the native
+  agent UI quickly — you're never stuck waiting on a device that isn't there. A
+  briefly reconnecting client (e.g. VSCode restarting) is not mistaken for
+  "nobody home". Otherwise, if nobody answers within `--permission-timeout`
+  seconds (default 60), it also falls back. Answering the built-in dialog
+  dismisses the remote prompts.
 - Toggle prompts per client: the Android app's *Permission prompts* /
   *Question prompts* checkboxes, the GNOME extension's preferences switches, and
   the VSCode `codelight.questionPrompts` setting (all default on).
 
-Under the hood Claude Code uses `PermissionRequest` and a `PreToolUse` hook
-matching `AskUserQuestion`. Codex uses `PermissionRequest` and a `PreToolUse`
-hook matching `request_user_input`. Normal auto-allowed tool calls are
-unaffected.
+Normal auto-allowed tool calls are unaffected. Agent modules declare their
+remote-control hook modes in the integration registry so the common hook path
+can forward requests without clients knowing which agent produced them.
 
 ### Persistent folder and command approvals
 
@@ -195,7 +163,7 @@ narrow forms:
   literally and only auto-allows that exact string inside the same repository.
   There are no prefixes, globs, regexes, or shell rewriting.
 
-These rules apply consistently to Claude, Copilot, and Codex because enforcement
+These rules apply consistently across supported agents because enforcement
 happens in the common codelight hook path. They live in:
 
 ```text
@@ -253,9 +221,10 @@ needed for that.
 python3 companion/codelight.py --uninstall
 ```
 
-This removes every codelight-owned Claude, Copilot, and Codex hook, even if an
-agent is no longer installed. It also deletes `~/.claude/codelight.sock` and
-`~/.claude/monitor_state/`, and stops, disables, and removes the systemd service.
+This removes every codelight-owned hook/file declared by the registered
+integrations, even if an agent is no longer installed. It also deletes
+`~/.config/codelight/codelight.sock`, `~/.config/codelight/monitor_state/`,
+the shared policy file, and the systemd service.
 
 > **Stop the daemon before uninstalling.** If it is still running it will
 > re-install the hooks on its next startup.
@@ -264,23 +233,28 @@ agent is no longer installed. It also deletes `~/.claude/codelight.sock` and
 
 ```mermaid
 flowchart LR
-    CC["Claude Code"] -->|--hook mode<br/>on tool use / messages| SOCK
+    A1["Supported agent"] -->|hooks| D
+    A2["Supported agent"] -->|hooks| D
+    A3["Supported agent"] -->|hooks| D
 
     subgraph D["codelight.py daemon"]
-        SOCK["Unix socket thread<br/>receives event, updates state"]
-        USAGE["Usage poller<br/>Claude + Codex + optional Copilot company pool"]
+        REG["Agent registry<br/>metadata + hook modes + branding"]
+        SOCK["Unix socket thread<br/>receives hook events"]
+        USAGE["Multi-agent usage poller"]
         WS["WebSocket server :8765"]
-        DBUS["D-Bus service (session bus)<br/>se.sensnology.codelight"]
+        DBUS["D-Bus service<br/>se.sensnology.codelight"]
     end
 
-    SOCK -.->|broadcast| WS
-    USAGE -.->|push on each poll| WS
-    SOCK -.-> DBUS
+    WS -->|status| SCREEN["GeekMagic Ultra<br/>(mDNS)"]
+    WS -->|status + questions + remote control<br/>+ conversation| ANDROID["Android app<br/>(mDNS)"]
+    WS -->|status + questions + remote control| VSCODE["VSCode extension"]
+    DBUS -->|status + questions + remote control| GNOME["GNOME extension"]
 
-    WS -->|status| SCREEN["GeekMagic Ultra<br/>discovers via mDNS"]
-    WS -->|status + remote control| ANDROID["Android app<br/>discovers via mDNS"]
-    WS -->|status + questions| VSCODE["VSCode extension"]
-    DBUS -->|status + remote control| GNOME["GNOME extension<br/>auto-discovers"]
+    REG -.-> USAGE
+    REG -.-> WS
+    USAGE -.-> WS
+    SOCK -.-> WS
+    SOCK -.-> DBUS
 ```
 
 Status updates reach clients the moment an enabled agent hook fires — there is no
@@ -289,12 +263,11 @@ polling delay on the client side.
 ### Status detection and conversation following
 
 Status detection is now agent-agnostic and driven by the integration registry.
-At startup, codelight detects installed agents (Claude, Copilot, Codex), then
-installs hooks for each enabled integration:
-
-- Claude hooks are merged into the configured Claude settings file.
-- Copilot hooks are written to codelight's owned hooks file under its home directory.
-- Codex hooks are merged into its hooks file (with Codex trust review via `/hooks`).
+At startup, codelight builds an `AgentRegistry`, detects installed integrations
+from each agent's CLI/VSCode metadata, then installs hooks for each enabled
+integration. Each agent module contributes its own hook installer and removable
+files; the daemon does not need per-agent branches for hook installation.
+Built-in modules are discovered automatically from `codelight_core/agents/`.
 
 Each hook invokes codelight in hook mode and sends one normalized event over the
 Unix socket at `~/.config/codelight/codelight.sock`. The daemon updates per-session
@@ -303,10 +276,10 @@ the snapshot to WebSocket and D-Bus clients immediately. If the daemon is not
 available, hooks fall back to monitor-state files under
 `~/.config/codelight/monitor_state`.
 
-Conversation following uses agent-specific transcript extractors registered by each
-integration. Claude JSONL, Codex rollout JSONL, and Copilot events JSONL are all
-normalized into the same read-only `user`/`assistant`/`tool`/`output` feed so clients
-do not need agent-specific parsing. The feed is observational only and never injects
+Conversation following uses transcript extractors registered by each
+integration. Agent-specific JSONL/event formats are normalized into the same
+read-only `user`/`assistant`/`tool`/`output` feed so clients do not need
+agent-specific parsing. The feed is observational only and never injects
 messages into a running agent session.
 
 ### Usage data — multi-agent poller
@@ -315,20 +288,22 @@ Every 60 seconds, one usage poll cycle runs across all registered agent
 integrations. Each integration provides its own usage fetcher and data mapping,
 so failures in one source do not block others.
 
-- Claude usage is fetched from the Claude OAuth usage API (`five_hour` and
-  `seven_day` utilization windows with reset timestamps).
-- Codex usage is read locally from recent rollout `token_count` rate-limit events
-  (session and weekly windows).
-- Copilot usage is fetched from GitHub organization billing and Copilot seat data
-  when `agents.copilot.github_org` is configured.
+Each integration decides whether it has usage data and how to map it into
+client-facing limits. Built-in usage sources, credentials, and caveats are
+listed in [AGENTS.md](AGENTS.md).
 
 The daemon stores usage per agent and publishes a unified `per_agent_usage` model
-to all clients. Each client can then render grouped limits (for example, Claude
-session/weekly, Codex session/weekly, Copilot monthly) with consistent labels and
-agent branding.
+to all clients. Each client renders whatever limits an integration exposes with
+consistent labels and agent branding delivered in the connection handshake.
 
 Configuration for usage credentials and agent homes lives in
 `~/.config/codelight/config.json`; see `companion/AGENTS.md` for all supported keys.
 
+When adding a new branded integration, generate the ESP8266 bitmap logo with:
+
+```bash
+python3 companion/tools/logo_bitmap.py path/to/logo.svg
+```
+
 <img src="../assets/companion-dashboard.png" width="760"
-     alt="codelight terminal dashboard with grouped Claude, Copilot, and Codex usage">
+     alt="codelight terminal dashboard with grouped agent usage">
