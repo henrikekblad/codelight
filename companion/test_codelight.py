@@ -24,7 +24,8 @@ from codelight_core import lifecycle
 from codelight_core import remote_control
 from codelight_core import remote_payloads
 from codelight_core import service as service_core
-from codelight_core.usage import UsageFetchers, UsagePoller, usage_summary
+from codelight_core.agents.registry import AgentRegistry
+from codelight_core.usage import UsagePoller, usage_summary
 
 
 class TranscriptParserTests(unittest.TestCase):
@@ -388,9 +389,11 @@ class UsagePollerTests(unittest.TestCase):
     def test_usage_summary_formats_available_agents(self):
         self.assertEqual(
             usage_summary(
-                claude={"session_pct": 0.12, "weekly_pct": 0.34},
-                codex={"session_pct": 0.56, "weekly_pct": 0.78},
-                copilot={"monthly_pct": 0.9},
+                usages={
+                    "claude": {"session_pct": 0.12, "weekly_pct": 0.34},
+                    "codex": {"session_pct": 0.56, "weekly_pct": 0.78},
+                    "copilot": {"monthly_pct": 0.9},
+                },
             ),
             "Claude 12%/34%  Codex 56%/78%  Copilot 90%",
         )
@@ -406,9 +409,11 @@ class UsagePollerTests(unittest.TestCase):
 
         poller = UsagePoller(
             state=state,
-            fetch_claude=lambda: {"session_pct": 0.1, "weekly_pct": 0.2},
-            fetch_codex=lambda: None,
-            fetch_copilot=lambda: None,
+            fetchers={
+                "claude": lambda: {"session_pct": 0.1, "weekly_pct": 0.2},
+                "codex": lambda: None,
+                "copilot": lambda: None,
+            },
             interval=60,
             shutdown=threading.Event(),
             log=logs.append,
@@ -424,7 +429,7 @@ class UsagePollerTests(unittest.TestCase):
         self.assertEqual(logs[-1], "[usage] Claude 10%/20%")
         self.assertEqual(pushes, [True])
 
-    def test_usage_fetchers_compose_agent_specific_fetchers(self):
+    def test_agent_registry_composes_agent_specific_fetchers(self):
         with tempfile.TemporaryDirectory() as tmp:
             token_file = os.path.join(tmp, "token")
             with open(token_file, "w") as stream:
@@ -445,7 +450,8 @@ class UsagePollerTests(unittest.TestCase):
                     "seat_breakdown": {"total": 1},
                 }
 
-            fetchers = UsageFetchers(
+            registry = AgentRegistry(
+                claude_settings_path="",
                 claude_credentials_path=os.path.join(tmp, "missing.json"),
                 claude_usage_api="https://example.invalid",
                 codex_home=tmp,
@@ -455,11 +461,12 @@ class UsagePollerTests(unittest.TestCase):
                 github_api=api,
             )
 
-            usage = fetchers.get_copilot_usage(
+            usage = registry.copilot.get_usage(
                 now=datetime(2026, 7, 9, tzinfo=timezone.utc)
             )
 
-            self.assertEqual(fetchers.github_token(), "token")
+            self.assertEqual(registry.github_token(), "token")
+            self.assertEqual(set(registry.usage_fetchers()), {"claude", "codex", "copilot"})
             self.assertIsNotNone(usage)
             self.assertEqual(usage["used_credits"], 100)
 

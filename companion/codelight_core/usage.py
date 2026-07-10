@@ -4,7 +4,6 @@ import sys
 import threading
 from typing import Callable
 
-from codelight_core.agents.registry import AgentRegistry
 from codelight_core.state import CodelightState
 
 
@@ -13,80 +12,21 @@ Logger = Callable[[str], None]
 Push = Callable[[], None]
 
 
-class UsageFetchers:
-    def __init__(
-        self,
-        *,
-        claude_credentials_path: str,
-        claude_usage_api: str,
-        codex_home: str,
-        copilot_home: str,
-        github_org: str = "",
-        github_token_file: str = "",
-        github_api: Callable[[str, str], dict] | None = None,
-        log: Logger | None = None,
-    ) -> None:
-        self.registry = AgentRegistry(
-            claude_settings_path="",
-            claude_credentials_path=claude_credentials_path,
-            claude_usage_api=claude_usage_api,
-            codex_home=codex_home,
-            copilot_home=copilot_home,
-            github_org=github_org,
-            github_token_file=github_token_file,
-            github_api=github_api,
-            log=log,
-        )
-
-    def get_claude_usage(self) -> dict | None:
-        return self.registry.claude.get_usage()
-
-    def codex_usage_from_rollout(self, path: str) -> dict | None:
-        return self.registry.codex.usage_from_rollout(path)
-
-    def get_codex_usage(self) -> dict | None:
-        return self.registry.codex.get_usage()
-
-    def github_token(self) -> str:
-        return self.registry.github_token()
-
-    def get_copilot_usage(self, *, org: str | None = None,
-                          token: str | None = None,
-                          now=None) -> dict | None:
-        return self.registry.copilot.get_usage(org=org, token=token, now=now)
-
-    def usage_fetchers(self) -> dict[str, UsageFetcher]:
-        return self.registry.usage_fetchers()
-
-
 def usage_summary(
     *,
-    usages: dict[str, dict | None] | None = None,
+    usages: dict[str, dict | None],
     display_name: Callable[[str], str] | None = None,
-    claude: dict | None = None,
-    codex: dict | None = None,
-    copilot: dict | None = None,
 ) -> str:
-    if usages is not None:
-        parts: list[str] = []
-        for agent_id, usage in usages.items():
-            if usage is None:
-                continue
-            display = display_name(agent_id) if display_name else agent_id.capitalize()
-            if "monthly_pct" in usage and "weekly_pct" not in usage:
-                parts.append(f"{display} {usage['monthly_pct']:.0%}")
-            elif "session_pct" in usage and "weekly_pct" in usage:
-                parts.append(
-                    f"{display} {usage['session_pct']:.0%}/{usage['weekly_pct']:.0%}")
-        return "  ".join(parts)
-
     parts: list[str] = []
-    if claude is not None:
-        parts.append(f"Claude {claude['session_pct']:.0%}/{claude['weekly_pct']:.0%}")
-    if codex is not None:
-        parts.append(f"Codex {codex['session_pct']:.0%}/{codex['weekly_pct']:.0%}")
-    if copilot is not None:
-        parts.append(f"Copilot {copilot['monthly_pct']:.0%}")
+    for agent_id, usage in usages.items():
+        if usage is None:
+            continue
+        display = display_name(agent_id) if display_name else agent_id.capitalize()
+        if "monthly_pct" in usage and "weekly_pct" not in usage:
+            parts.append(f"{display} {usage['monthly_pct']:.0%}")
+        elif "session_pct" in usage and "weekly_pct" in usage:
+            parts.append(
+                f"{display} {usage['session_pct']:.0%}/{usage['weekly_pct']:.0%}")
     return "  ".join(parts)
 
 
@@ -97,23 +37,14 @@ class UsagePoller:
         self,
         *,
         state: CodelightState,
-        fetchers: dict[str, UsageFetcher] | None = None,
-        fetch_claude: UsageFetcher | None = None,
-        fetch_codex: UsageFetcher | None = None,
-        fetch_copilot: UsageFetcher | None = None,
+        fetchers: dict[str, UsageFetcher],
         interval: int,
         shutdown: threading.Event,
         log: Logger,
         push: Push,
     ) -> None:
         self.state = state
-        self.fetchers = dict(fetchers or {})
-        if fetch_claude is not None:
-            self.fetchers["claude"] = fetch_claude
-        if fetch_codex is not None:
-            self.fetchers["codex"] = fetch_codex
-        if fetch_copilot is not None:
-            self.fetchers["copilot"] = fetch_copilot
+        self.fetchers = dict(fetchers)
         self.interval = interval
         self.shutdown = shutdown
         self.log = log
