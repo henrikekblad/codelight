@@ -67,8 +67,8 @@ class CodelightWidget : GlanceAppWidget() {
         currentState<Preferences>()[KEY_TICK]
         val prefs = context.getSharedPreferences(CodelightService.STATE_PREFS, Context.MODE_PRIVATE)
         val now          = System.currentTimeMillis() / 1000
-        val agentDisplay = prefs.getString(CodelightService.KEY_AGENT_DISPLAY, "Claude") ?: "Claude"
-        val activeId     = prefs.getString(CodelightService.KEY_AGENT_ID, "claude") ?: "claude"
+        val agentDisplay = prefs.getString(CodelightService.KEY_AGENT_DISPLAY, "Agent") ?: "Agent"
+        val activeId     = prefs.getString(CodelightService.KEY_AGENT_ID, "") ?: ""
         val status       = prefs.getString(CodelightService.KEY_STATUS, "idle") ?: "idle"
         val connected    = prefs.getBoolean(CodelightService.KEY_CONNECTED, false)
         val size          = LocalSize.current

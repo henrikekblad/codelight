@@ -28,9 +28,13 @@ internal fun loadAgentUsage(prefs: SharedPreferences, now: Long): List<AgentUsag
     } catch (_: Exception) {
         JSONObject()
     }
-    val activeId = prefs.getString(CodelightService.KEY_AGENT_ID, "claude") ?: "claude"
-    val ids = linkedSetOf("claude", "copilot", "codex")
-        .filter { usage.has(it) || statuses.has(it) || it == activeId }
+    val activeId = prefs.getString(CodelightService.KEY_AGENT_ID, "") ?: ""
+    // Whatever agents the daemon reports, in payload order — no client-side list.
+    val ids = buildSet {
+        addAll(usage.keys().asSequence())
+        addAll(statuses.keys().asSequence())
+        if (activeId.isNotBlank()) add(activeId)
+    }
 
     return ids.map { id ->
         val value = usage.optJSONObject(id)

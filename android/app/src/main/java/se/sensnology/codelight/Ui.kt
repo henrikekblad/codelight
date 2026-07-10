@@ -53,7 +53,8 @@ fun StatusScreen() {
             if (key == CodelightService.KEY_PER_AGENT_USAGE ||
                 key == CodelightService.KEY_PER_AGENT_STATUS ||
                 key == CodelightService.KEY_STATUS ||
-                key == CodelightService.KEY_CONNECTED
+                key == CodelightService.KEY_CONNECTED ||
+                key == CodelightService.KEY_AGENTS_META
             ) revision++
         }
         state.registerOnSharedPreferenceChangeListener(listener)
@@ -63,6 +64,7 @@ fun StatusScreen() {
     revision
     val agents = loadAgentUsage(state, System.currentTimeMillis() / 1000)
     val connected = state.getBoolean(CodelightService.KEY_CONNECTED, false)
+    val brandings = AgentBrandings.fromPrefs(state)
 
     Column(
         Modifier.fillMaxSize().verticalScroll(rememberScrollState())
@@ -76,7 +78,10 @@ fun StatusScreen() {
                     .padding(14.dp),
                 verticalArrangement = Arrangement.spacedBy(8.dp),
             ) {
-                Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+                Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    val branding = brandings[agent.id]
+                    AgentLogo(branding, tint = branding?.color ?: Palette.text, size = 18.dp)
                     Text(agent.display, color = Palette.text, fontWeight = FontWeight.Bold,
                         modifier = Modifier.weight(1f))
                     Text(if (connected) agent.status.uppercase() else "OFFLINE",
@@ -427,13 +432,17 @@ fun ConversationScreen() {
     val maxLines = settings.getInt(CodelightService.KEY_CONV_LINES, 50)
 
     var lines by remember { mutableStateOf(loadConversation(state)) }
+    var metaRevision by remember { mutableIntStateOf(0) }
     DisposableEffect(Unit) {
         val listener = SharedPreferences.OnSharedPreferenceChangeListener { p, k ->
             if (k == CodelightService.KEY_CONVERSATION) lines = loadConversation(p)
+            if (k == CodelightService.KEY_AGENTS_META) metaRevision++
         }
         state.registerOnSharedPreferenceChangeListener(listener)
         onDispose { state.unregisterOnSharedPreferenceChangeListener(listener) }
     }
+    @Suppress("UNUSED_EXPRESSION")
+    metaRevision
 
     val text  = Palette.text
     val muted = Palette.muted
@@ -460,12 +469,16 @@ fun ConversationScreen() {
         Modifier.fillMaxSize().verticalScroll(scroll).padding(horizontal = 16.dp, vertical = 12.dp),
         verticalArrangement = Arrangement.spacedBy(10.dp),
     ) {
-        shown.forEach { (role, body) ->
+        val brandings = AgentBrandings.fromPrefs(state)
+        shown.forEach { line ->
+            val role = line.role
+            val body = line.text
+            val branding = brandings[line.agentId]
             val label = when (role) {
                 "user"   -> "you"
                 "tool"   -> "tool"
                 "output" -> "output"
-                else     -> agentDisplay.lowercase()
+                else     -> (branding?.display ?: agentDisplay).lowercase()
             }
             val labelColor = when (role) {
                 "user"   -> Palette.accent
@@ -478,10 +491,18 @@ fun ConversationScreen() {
                 else             -> Palette.card
             }
             val mono = role == "tool" || role == "output"
+            val fromAgent = role != "user" && !mono
             Column(
                 Modifier.fillMaxWidth().background(bgColor, RoundedCornerShape(8.dp)).padding(10.dp),
             ) {
-                Text(label, style = TextStyle(color = labelColor, fontSize = 10.sp, letterSpacing = 1.sp))
+                Row(verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(5.dp)) {
+                    if (fromAgent) {
+                        // Mark the message's origin with its agent's logo.
+                        AgentLogo(branding, tint = branding?.color ?: muted, size = 12.dp)
+                    }
+                    Text(label, style = TextStyle(color = labelColor, fontSize = 10.sp, letterSpacing = 1.sp))
+                }
                 Spacer(Modifier.height(3.dp))
                 if (mono) {
                     Text(body, style = TextStyle(color = if (role == "output") muted else text,
@@ -604,13 +625,16 @@ private fun AnnotatedString.Builder.appendInline(s: String, accent: Color) {
     if (last < s.length) append(s.substring(last))
 }
 
-private fun loadConversation(prefs: SharedPreferences): List<Pair<String, String>> {
+private data class ConvLine(val role: String, val text: String, val agentId: String)
+
+private fun loadConversation(prefs: SharedPreferences): List<ConvLine> {
     return try {
         val arr = JSONArray(prefs.getString(CodelightService.KEY_CONVERSATION, "[]") ?: "[]")
         (0 until arr.length()).mapNotNull {
             val o = arr.optJSONObject(it) ?: return@mapNotNull null
-            o.optString("role", "assistant") to o.optString("text", "")
-        }.filter { it.second.isNotBlank() }
+            ConvLine(o.optString("role", "assistant"), o.optString("text", ""),
+                     o.optString("agent_id", ""))
+        }.filter { it.text.isNotBlank() }
     } catch (_: Exception) { emptyList() }
 }
 
@@ -902,5 +926,5 @@ internal fun loadPending(prefs: SharedPreferences): List<JSONObject> {
 
 private fun currentAgentDisplayName(context: Context, state: SharedPreferences? = null): String {
     val prefs = state ?: context.getSharedPreferences(CodelightService.STATE_PREFS, Context.MODE_PRIVATE)
-    return prefs.getString(CodelightService.KEY_AGENT_DISPLAY, "Claude") ?: "Claude"
+    return prefs.getString(CodelightService.KEY_AGENT_DISPLAY, "Agent") ?: "Agent"
 }
