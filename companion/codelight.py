@@ -14,7 +14,6 @@ import collections
 import json
 import os
 import secrets
-import shlex
 import shutil
 import signal
 import socket
@@ -23,21 +22,26 @@ import sys
 import threading
 import time
 import uuid
-import urllib.parse
-import urllib.request
-import urllib.error
 from datetime import datetime, timezone
 from codelight_core.agents import claude as claude_agent
 from codelight_core.agents import codex as codex_agent
 from codelight_core.agents import copilot as copilot_agent
 from codelight_core import auth as auth_core
+from codelight_core.conversation import ConversationRefresher
 from codelight_core import dashboard_client
+from codelight_core import discovery as discovery_core
+from codelight_core import hook_io
 from codelight_core import hooks as hooks_core
+from codelight_core import hook_runtime
 from codelight_core import policy as policy_core
+from codelight_core import remote_control
+from codelight_core import remote_payloads
+from codelight_core import service as service_core
 from codelight_core.state import CodelightState
 from codelight_core import transcript as transcript_core
 from codelight_core import timefmt
-from codelight_core.usage import UsagePoller
+from codelight_core.usage import UsageFetchers, UsagePoller
+from codelight_core import vscode as vscode_core
 
 try:
     import websockets as _websockets
@@ -117,16 +121,13 @@ _gnome_features: set = set()
 # merely reconnecting (e.g. VSCode restarting) isn't mistaken for "nobody home"
 # and cut off before it re-subscribes.
 _last_qclient_gone: float = 0.0
-# Last transcript we saw, kept even after the session ends so the trailing
-# assistant message (flushed just after the Stop hook) still reaches clients.
-_last_conv_mtime: float = 0.0
-
 _log_lines:       collections.deque = collections.deque(maxlen=10)
+_conversation_refresher: ConversationRefresher | None = None
 
 AGENT_REGISTRY: dict[str, dict[str, str]] = {
-    "claude": {"display": "Claude", "short": "C"},
-    "copilot": {"display": "Copilot", "short": "P"},
-    "codex": {"display": "Codex", "short": "X"},
+    "claude": {"display": "Claude"},
+    "copilot": {"display": "Copilot"},
+    "codex": {"display": "Codex"},
 }
 DEFAULT_AGENT_ID = "claude"
 _state = CodelightState(
@@ -189,15 +190,7 @@ def _valid_auth_response(data: dict, secret: str, nonce: str) -> bool:
 
 
 def _get_local_ip() -> str:
-    """Return the LAN IP this machine uses for outbound traffic."""
-    try:
-        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        s.connect(("8.8.8.8", 80))
-        ip = s.getsockname()[0]
-        s.close()
-        return ip
-    except Exception:
-        return "127.0.0.1"
+    return discovery_core.get_local_ip()
 
 
 def _broadcast(payload: dict) -> None:
@@ -258,35 +251,11 @@ def _active_transcript() -> tuple[str, str]:
 
 
 def _copilot_events_path_for_session(session_id: str) -> str:
-    sid = str(session_id or "").strip()
-    if not sid:
-        return ""
-    base = os.path.realpath(os.path.join(COPILOT_HOME, "session-state"))
-    p = os.path.realpath(os.path.join(base, sid, "events.jsonl"))
-    if not p.startswith(base + os.sep):
-        return ""
-    return p if os.path.isfile(p) else ""
+    return copilot_agent.events_path_for_session(COPILOT_HOME, session_id)
 
 
 def _latest_copilot_events_path() -> str:
-    try:
-        base = os.path.join(COPILOT_HOME, "session-state")
-        newest_path = ""
-        newest_mtime = 0.0
-        for root, _, files in os.walk(base):
-            if "events.jsonl" not in files:
-                continue
-            p = os.path.join(root, "events.jsonl")
-            try:
-                m = os.path.getmtime(p)
-            except OSError:
-                continue
-            if m > newest_mtime:
-                newest_mtime = m
-                newest_path = p
-        return newest_path
-    except Exception:
-        return ""
+    return copilot_agent.latest_events_path(COPILOT_HOME)
 
 
 def _codex_rollout_path_for_session(session_id: str) -> str:
@@ -343,26 +312,22 @@ def _conversation_payload() -> dict | None:
     }
 
 
-def _conv_poll_thread() -> None:
-    """Push the conversation feed whenever the active transcript grows. This is
-    the safety net for the last assistant message: the Stop hook fires (and pops
-    the session) before Claude Code flushes its final line to the JSONL, so a
-    hook-only feed would miss it until the next user prompt."""
-    global _last_conv_mtime
-    while not _shutdown.is_set():
-        time.sleep(1.0)
-        if not _conv_clients:
-            continue
-        _, path = _active_transcript()
-        if not path:
-            continue
-        try:
-            m = os.path.getmtime(path)
-        except OSError:
-            continue
-        if m != _last_conv_mtime:
-            _last_conv_mtime = m
-            _broadcast_conversation()
+def _active_conversation_path() -> str:
+    return _active_transcript()[1]
+
+
+def _has_conversation_clients() -> bool:
+    return bool(_conv_clients)
+
+
+def _conversation_refresh_thread() -> None:
+    if _conversation_refresher is not None:
+        _conversation_refresher.run()
+
+
+def _notify_conversation_changed() -> None:
+    if _conversation_refresher is not None:
+        _conversation_refresher.notify()
 
 
 def _broadcast_conversation() -> None:
@@ -514,20 +479,12 @@ def _perm_request_payload(entry: dict) -> dict:
     cwd = str(entry.get("cwd") or "")
     can_allow_folder = bool(cwd) and (not _is_trusted_repo_cwd(cwd))
     can_allow_command = bool(cwd) and bool(entry.get("policy_command"))
-    return {
-        "type":       "permission_request",
-        "id":         entry["id"],
-        "tool_name":  entry["tool_name"],
-        "summary":    entry["summary"],
-        "tool_input": entry["tool_input"],
-        "session_id": entry["session_id"],
-        "agent_id":   _normalize_agent_id(entry.get("agent_id")),
-        "agent_display": _agent_display_name(entry.get("agent_id")),
-        "cwd":        cwd,
-        "allow_folder_available": can_allow_folder,
-        "allow_command_available": can_allow_command,
-        "expires_at": int(entry["expires"]),
-    }
+    return remote_payloads.permission_request_payload(
+        {**entry, "agent_id": _normalize_agent_id(entry.get("agent_id"))},
+        agent_display_name=_agent_display_name,
+        allow_folder_available=can_allow_folder,
+        allow_command_available=can_allow_command,
+    )
 
 
 def _resolve_permission(request_id: str, decision: str, by: str) -> bool:
@@ -579,11 +536,7 @@ def _wait_with_extend(entry: dict) -> None:
     """Block until the request is resolved (event set) or its deadline passes.
     Re-reads entry['expires'] each loop so a client keepalive (_extend_request)
     can push the deadline out while a human is still interacting."""
-    while not entry["event"].is_set():
-        remaining = entry["expires"] - time.time()
-        if remaining <= 0:
-            break
-        entry["event"].wait(min(remaining, 5.0))
+    remote_control.wait_with_extend(entry)
 
 
 # Grace window for a question to reach an answering client before it falls
@@ -603,16 +556,13 @@ def _wait_question(entry: dict) -> None:
     reconnecting (e.g. VSCode restarting) — the normal extendable deadline
     applies so the replayed prompt reaches it. Only a session that has had no
     answering client present or recently gone falls through quickly."""
-    grace_deadline = time.time() + NO_CLIENT_GRACE
-    while not entry["event"].is_set():
-        now = time.time()
-        if _can_answer_questions() or (now - _last_qclient_gone) < RECONNECT_WINDOW:
-            remaining = entry["expires"] - now
-        else:
-            remaining = grace_deadline - now
-        if remaining <= 0:
-            break
-        entry["event"].wait(min(remaining, 2.0))
+    remote_control.wait_question(
+        entry,
+        can_answer_questions=_can_answer_questions,
+        last_client_gone=lambda: _last_qclient_gone,
+        no_client_grace=NO_CLIENT_GRACE,
+        reconnect_window=RECONNECT_WINDOW,
+    )
 
 
 def _extend_request(request_id: str) -> bool:
@@ -642,21 +592,9 @@ def _cancel_permissions_for(session_id: str) -> None:
         e["event"].set()
 
 
-_PENDING_COMPLETION_EVENTS = {
-    "PostToolUse",
-    "PermissionDenied",
-    "Stop",
-    "SessionEnd",
-}
-
-
 def _should_cancel_pending_for_hook(state: str, hook_event: str) -> bool:
     """Whether a lifecycle event proves a local prompt is no longer pending."""
-    event = str(hook_event or "").strip()
-    if event:
-        return event in _PENDING_COMPLETION_EVENTS
-    # Older codelight hooks did not forward their event name.
-    return state in ("working", "ended")
+    return remote_control.should_cancel_pending_for_hook(state, hook_event)
 
 
 def _cancel_pending_for_hook(session_id: str, state: str,
@@ -692,17 +630,13 @@ def _permission_waiter(entry: dict) -> None:
         outcome = f"allow_{persistence.get('kind', 'once')}"
     _log(f"[perm] {entry['summary'][:60]} → {outcome}"
          + (f" (by {by})" if decision else ""))
-    _broadcast_rc({
-        "type": "permission_resolved",
-        "id": entry["id"],
-        "decision": outcome,
-        "by": by or "",
-        "agent_id": _normalize_agent_id(entry.get("agent_id")),
-        "agent_display": _agent_display_name(entry.get("agent_id")),
-        "policy_kind": (persistence or {}).get("kind", ""),
-        "policy_value": (persistence or {}).get("value", ""),
-        "policy_persisted": bool((persistence or {}).get("persisted")),
-    }, "PermissionResolved")
+    _broadcast_rc(remote_payloads.permission_resolved_payload(
+        {**entry, "agent_id": _normalize_agent_id(entry.get("agent_id"))},
+        decision=outcome,
+        by=by or "",
+        persistence=persistence,
+        agent_display_name=_agent_display_name,
+    ), "PermissionResolved")
     _push()
 
 
@@ -747,16 +681,10 @@ def _register_permission(conn, msg: dict) -> None:
 # ── Remote question answering via PreToolUse ──────────────────────────────────
 
 def _question_request_payload(entry: dict) -> dict:
-    return {
-        "type":       "question_request",
-        "id":         entry["id"],
-        "questions":  entry["questions"],
-        "session_id": entry["session_id"],
-        "agent_id":   _normalize_agent_id(entry.get("agent_id")),
-        "agent_display": _agent_display_name(entry.get("agent_id")),
-        "cwd":        entry["cwd"],
-        "expires_at": int(entry["expires"]),
-    }
+    return remote_payloads.question_request_payload(
+        {**entry, "agent_id": _normalize_agent_id(entry.get("agent_id"))},
+        agent_display_name=_agent_display_name,
+    )
 
 
 def _resolve_question(request_id: str, answers, by: str) -> bool:
@@ -795,13 +723,11 @@ def _question_waiter(entry: dict) -> None:
 
     outcome = "answered" if answers else ("cancelled" if by == "cancelled" else "timeout")
     _log(f"[question] {entry['id'][:8]}… → {outcome}" + (f" (by {by})" if answers else ""))
-    _broadcast_rc({
-        "type": "question_resolved",
-        "id": entry["id"],
-        "by": by or "",
-        "agent_id": _normalize_agent_id(entry.get("agent_id")),
-        "agent_display": _agent_display_name(entry.get("agent_id")),
-    }, "QuestionResolved")
+    _broadcast_rc(remote_payloads.question_resolved_payload(
+        {**entry, "agent_id": _normalize_agent_id(entry.get("agent_id"))},
+        by=by or "",
+        agent_display_name=_agent_display_name,
+    ), "QuestionResolved")
     _push()
 
 
@@ -966,34 +892,14 @@ def run_hook(state: str, agent_id: str = DEFAULT_AGENT_ID) -> None:
     Fallback: writes a state file if the daemon is not running.
     Must exit immediately so it never blocks the host agent.
     """
-    raw = ""
-    data = {}
-    try:
-        raw = sys.stdin.read()
-        if raw.strip():
-            data = json.loads(raw)
-    except Exception:
-        pass
-
-    session_id = (data.get("session_id")
-                  or data.get("sessionId")
-                  or data.get("session")
-                  or "unknown")
-
+    data = hook_runtime.parse_json_object(sys.stdin.read())
+    session_id = hook_runtime.session_id(data)
     transcript_path = _extract_transcript_path(data)
-    hook_event = str(
-        data.get("hook_event_name")
-        or data.get("hookEventName")
-        or data.get("event_name")
-        or ""
-    )
+    hook_event = hook_runtime.hook_event_name(data)
 
-    # Fast path: daemon is running
-    try:
-        sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-        sock.settimeout(0.5)
-        sock.connect(SOCKET_PATH)
-        sock.sendall(json.dumps({
+    if hook_io.send_json(
+        SOCKET_PATH,
+        {
             "state": state,
             "session_id": session_id,
             "agent_id": _normalize_agent_id(agent_id),
@@ -1001,32 +907,18 @@ def run_hook(state: str, agent_id: str = DEFAULT_AGENT_ID) -> None:
             "transcript_path": transcript_path,
             "cwd": data.get("cwd", ""),
             "hook_event": hook_event,
-        }).encode())
-        sock.close()
+        },
+        timeout=0.5,
+    ):
         return
-    except Exception:
-        pass
 
-    # Fallback: write state file (daemon not running)
-    os.makedirs(MONITOR_STATE_DIR, exist_ok=True)
-    path = os.path.join(MONITOR_STATE_DIR, f"{session_id}.json")
-    if state == "ended":
-        try:
-            os.unlink(path)
-        except FileNotFoundError:
-            pass
-        return
-    try:
-        with open(path, "w") as f:
-            json.dump({
-                "state": state,
-                "time": time.time(),
-                "session_id": session_id,
-                "agent_id": _normalize_agent_id(agent_id),
-                "hook_event": hook_event,
-            }, f)
-    except Exception:
-        pass
+    hook_io.write_monitor_state(
+        MONITOR_STATE_DIR,
+        session_id=session_id,
+        state=state,
+        agent_id=_normalize_agent_id(agent_id),
+        hook_event=hook_event,
+    )
 
 
 def _truncate_tool_input(tool_input, max_str: int = 500, max_total: int = 3000):
@@ -1109,27 +1001,12 @@ def _emit_permission_decision(decision: str, copilot_mode: bool,
                               vscode_prettool_mode: bool,
                               reason: str = "") -> None:
     """Emit the host-specific decision envelope from one shared policy path."""
-    if vscode_prettool_mode:
-        output = {
-            "hookSpecificOutput": {
-                "hookEventName": "PreToolUse",
-                "permissionDecision": decision,
-            },
-        }
-        if reason:
-            output["hookSpecificOutput"]["permissionDecisionReason"] = reason
-    elif copilot_mode:
-        output = {"behavior": decision}
-        if reason and decision == "deny":
-            output["message"] = reason
-    else:
-        output = {
-            "hookSpecificOutput": {
-                "hookEventName": "PermissionRequest",
-                "decision": {"behavior": decision},
-            },
-        }
-    print(json.dumps(output))
+    print(json.dumps(hook_runtime.permission_decision_output(
+        decision,
+        copilot_mode=copilot_mode,
+        vscode_prettool_mode=vscode_prettool_mode,
+        reason=reason,
+    )))
 
 
 def run_permission_hook(wait_secs: int, copilot_mode: bool = False,
@@ -1141,21 +1018,13 @@ def run_permission_hook(wait_secs: int, copilot_mode: bool = False,
     times out. Prints the Claude Code decision JSON on allow/deny; prints
     nothing otherwise, which makes Claude Code show its normal built-in prompt.
     """
-    raw = ""
-    try:
-        raw = sys.stdin.read()
-        data = json.loads(raw) if raw.strip() else {}
-    except Exception:
-        data = {}
-
-    session_id = (data.get("session_id") or data.get("sessionId") or "unknown")
+    data = hook_runtime.parse_json_object(sys.stdin.read())
+    session_id = hook_runtime.session_id(data)
     normalized_agent = _normalize_agent_id(
         agent_id or ("copilot" if (copilot_mode or vscode_prettool_mode) else "claude")
     )
-    tool_name  = data.get("tool_name") or data.get("toolName") or "?"
-    tool_input = data.get("tool_input")
-    if tool_input is None:
-        tool_input = data.get("toolArgs") or {}
+    tool_name = hook_runtime.tool_name(data)
+    tool_input = hook_runtime.tool_input(data)
     cwd = str(data.get("cwd") or "")
 
     # The shared ~/.copilot/hooks file is loaded by both Copilot CLI and VS Code.
@@ -1166,9 +1035,7 @@ def run_permission_hook(wait_secs: int, copilot_mode: bool = False,
 
     # Question tools are answered through run_question_hook (updatedInput), not
     # this allow/deny path. Skip so PreToolUse question hooks can handle them.
-    question_tools = {"AskUserQuestion", "ask_user", "askUser", "vscode_askQuestions"}
-    has_questions = isinstance(tool_input, dict) and isinstance(tool_input.get("questions"), list) and bool(tool_input.get("questions"))
-    if tool_name in question_tools or has_questions:
+    if hook_runtime.is_question_tool(tool_name, tool_input):
         return
 
     # Memory policy: allow only read-only view access for repo/session scopes.
@@ -1222,23 +1089,14 @@ def run_permission_hook(wait_secs: int, copilot_mode: bool = False,
     }
 
     try:
-        sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-        sock.settimeout(2.0)
-        sock.connect(SOCKET_PATH)
-        sock.sendall((json.dumps(request) + "\n").encode())
-
-        # The daemon always replies (decision or null at its own timeout);
-        # the extra headroom only matters if the daemon misbehaves.
-        sock.settimeout(HOOK_WAIT_CEILING)
-        buf = b""
-        while b"\n" not in buf and len(buf) < 4096:
-            chunk = sock.recv(4096)
-            if not chunk:
-                break
-            buf += chunk
-        sock.close()
-
-        decision = json.loads(buf.decode()).get("decision") if buf.strip() else None
+        response = hook_io.request_json(
+            SOCKET_PATH,
+            request,
+            connect_timeout=2.0,
+            response_timeout=HOOK_WAIT_CEILING,
+            max_bytes=4096,
+        )
+        decision = response.get("decision") if response else None
         if decision in ("allow", "deny"):
             _emit_permission_decision(
                 decision, copilot_mode, vscode_prettool_mode,
@@ -1250,14 +1108,12 @@ def run_permission_hook(wait_secs: int, copilot_mode: bool = False,
     # Daemon unreachable: behave like the plain status hook so the session
     # still shows as waiting, and let Claude Code prompt normally.
     try:
-        os.makedirs(MONITOR_STATE_DIR, exist_ok=True)
-        with open(os.path.join(MONITOR_STATE_DIR, f"{session_id}.json"), "w") as f:
-            json.dump({
-                "state": "waiting",
-                "time": time.time(),
-                "session_id": session_id,
-                "agent_id": normalized_agent,
-            }, f)
+        hook_io.write_monitor_state(
+            MONITOR_STATE_DIR,
+            session_id=session_id,
+            state="waiting",
+            agent_id=normalized_agent,
+        )
     except Exception:
         pass
 
@@ -1278,31 +1134,15 @@ def run_question_hook(wait_secs: int, vscode_prettool_mode: bool = False,
         agent_id or ("copilot" if vscode_prettool_mode else "claude")
     )
 
-    try:
-        raw = sys.stdin.read()
-        data = json.loads(raw) if raw.strip() else {}
-    except Exception:
-        data = {}
-
-    tool_input = data.get("tool_input")
-    if tool_input is None:
-        tool_input = data.get("toolArgs") or {}
-    if not isinstance(tool_input, dict):
-        tool_input = {}
-
-    questions = tool_input.get("questions")
-    if not isinstance(questions, list):
-        questions = data.get("questions") if isinstance(data.get("questions"), list) else []
-    if not questions:
-        q = tool_input.get("question") or data.get("question")
-        if isinstance(q, str) and q.strip():
-            questions = [{"question": q.strip()}]
+    data = hook_runtime.parse_json_object(sys.stdin.read())
+    tool_input = hook_runtime.tool_input(data)
+    questions = hook_runtime.questions_from_input(data, tool_input)
     if not questions:
         return   # nothing to answer → fall through
 
     request = {
         "type":       "question_request",
-        "session_id": data.get("session_id") or data.get("sessionId") or "unknown",
+        "session_id": hook_runtime.session_id(data),
         "agent_id":   normalized_agent,
         "agent_display": _agent_display_name(normalized_agent),
         "prompt_id":  data.get("prompt_id") or uuid.uuid4().hex,
@@ -1311,61 +1151,26 @@ def run_question_hook(wait_secs: int, vscode_prettool_mode: bool = False,
     }
 
     try:
-        sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-        sock.settimeout(2.0)
-        sock.connect(SOCKET_PATH)
-        sock.sendall((json.dumps(request) + "\n").encode())
-
-        sock.settimeout(HOOK_WAIT_CEILING)
-        buf = b""
-        while b"\n" not in buf and len(buf) < 65536:
-            chunk = sock.recv(4096)
-            if not chunk:
-                break
-            buf += chunk
-        sock.close()
-
-        answers = json.loads(buf.decode()).get("answers") if buf.strip() else None
+        response = hook_io.request_json(
+            SOCKET_PATH,
+            request,
+            connect_timeout=2.0,
+            response_timeout=HOOK_WAIT_CEILING,
+            max_bytes=65536,
+        )
+        answers = response.get("answers") if response else None
         if isinstance(answers, dict) and answers:
             if vscode_prettool_mode or codex_context_mode:
-                qa_lines = []
-                for k, v in answers.items():
-                    qa_lines.append(f"- {k}: {v}")
-                context = (
-                    "The user already answered the ask-user prompt via codelight remote UI. "
-                    "Do not ask the same question again; continue using these answers:\n"
-                    + "\n".join(qa_lines)
-                )
-                print(json.dumps({
-                    "hookSpecificOutput": {
-                        "hookEventName": "PreToolUse",
-                        "permissionDecision": "deny",
-                        "permissionDecisionReason": "Answered by codelight remote prompt",
-                        "additionalContext": context,
-                    }
-                }))
+                print(json.dumps(hook_runtime.question_context_output(answers)))
             else:
                 # VS Code/Copilot and Claude variants may look for different
                 # override fields/shapes. Provide a rich replacement object so a
                 # remote answer can short-circuit the native ask dialog.
-                updated = {**tool_input, "answers": answers}
-                if len(answers) == 1:
-                    try:
-                        updated["answer"] = next(iter(answers.values()))
-                    except Exception:
-                        pass
-                updated["responses"] = [{"question": k, "answer": v} for k, v in answers.items()]
-
                 # updatedInput REPLACES tool_input for Claude-style hooks.
                 # modifiedArgs is the equivalent shape used by Copilot CLI docs.
-                print(json.dumps({
-                    "hookSpecificOutput": {
-                        "hookEventName": "PreToolUse",
-                        "permissionDecision": "allow",
-                        "updatedInput": updated,
-                        "modifiedArgs": updated,
-                    }
-                }))
+                print(json.dumps(
+                    hook_runtime.question_updated_input_output(tool_input, answers)
+                ))
     except Exception:
         pass
     # Any failure → print nothing → Claude Code shows its own dialog.
@@ -1377,28 +1182,40 @@ _USAGE_API  = "https://claude.ai/api/oauth/usage"
 _CREDS_PATH = os.path.expanduser("~/.claude/.credentials.json")
 
 
+def _usage_fetchers() -> UsageFetchers:
+    return UsageFetchers(
+        claude_credentials_path=_CREDS_PATH,
+        claude_usage_api=_USAGE_API,
+        codex_home=CODEX_HOME,
+        copilot_home=COPILOT_HOME,
+        github_org=_github_org,
+        github_token_file=_github_token_file,
+        github_api=_github_api,
+        log=vprint,
+    )
+
+
 def get_usage() -> dict | None:
     """
     Fetch usage from the claude.ai OAuth usage API.
     Returns a dict with session_pct/weekly_pct/resets, or None on failure
     (caller keeps cached values).
     """
-    return claude_agent.ClaudeAgent(
-        _CREDS_PATH, usage_api=_USAGE_API, log=vprint).get_usage()
+    return _usage_fetchers().get_claude_usage()
 
 
 def _usage_from_codex_rollout(path: str) -> dict | None:
     """Read the newest Codex 5-hour and weekly rate-limit snapshot."""
-    return codex_agent.CodexAgent(CODEX_HOME).usage_from_rollout(path)
+    return _usage_fetchers().codex_usage_from_rollout(path)
 
 
 def get_codex_usage() -> dict | None:
-    return codex_agent.CodexAgent(CODEX_HOME).get_usage()
+    return _usage_fetchers().get_codex_usage()
 
 
 def _github_token() -> str:
     """Resolve a GitHub token without making the gh CLI a requirement."""
-    return copilot_agent.github_token(_github_token_file)
+    return _usage_fetchers().github_token()
 
 
 def _github_api(path: str, token: str) -> dict:
@@ -1417,13 +1234,7 @@ def get_copilot_usage(org: str | None = None, token: str | None = None,
     without enhanced billing all return None. Clients then keep showing the
     Copilot activity status without inventing a zero-percent limit.
     """
-    agent = copilot_agent.CopilotAgent(
-        _github_org,
-        token_file=_github_token_file,
-        api=_github_api,
-        log=vprint,
-    )
-    return agent.get_usage(org=org, token=token, now=now)
+    return _usage_fetchers().get_copilot_usage(org=org, token=token, now=now)
 
 
 def _push() -> None:
@@ -1538,6 +1349,7 @@ def _ws_thread(port: int, secret: str) -> None:
                             snapshot = _conversation_payload()
                             if snapshot is not None:
                                 await ws.send(json.dumps(snapshot))
+                            _notify_conversation_changed()
 
                     elif mtype == "permission_response":
                         rid      = str(m.get("id", ""))
@@ -1614,92 +1426,18 @@ def _ws_thread(port: int, secret: str) -> None:
 
 
 def _mdns_thread(port: int, name: str) -> None:
-    """Advertise the WebSocket service via mDNS so clients find it automatically.
-    Re-registers whenever the local IP changes (e.g. switching WiFi networks)."""
     if not _have_zeroconf:
-        print("[mdns] zeroconf not installed — skipping advertisement", file=sys.stderr)
-        print("[mdns] Install: pip install zeroconf", file=sys.stderr)
+        discovery_core.unavailable_message()
         return
-
-    zc: Zeroconf | None = None
-    current_ip: str | None = None
-    info = None
-    while not _shutdown.is_set():
-        ip = _get_local_ip()
-
-        # Skip loopback — no network yet (e.g. just woke from sleep).
-        # Retry quickly so we pick up the real IP as soon as it's available.
-        if ip.startswith("127."):
-            if current_ip is not None:
-                # Network just went away — tear down so we re-register when it returns
-                if info is not None and zc is not None:
-                    try:
-                        zc.unregister_service(info)
-                    except Exception:
-                        pass
-                if zc is not None:
-                    try:
-                        zc.close()
-                    except Exception:
-                        pass
-                zc = None
-                info = None
-                current_ip = None
-                _log("[mdns] network lost, waiting for reconnect…")
-            _shutdown.wait(5)
-            continue
-
-        if ip != current_ip:
-            # Tear down old instance before rebinding to the new interface
-            if info is not None and zc is not None:
-                try:
-                    zc.unregister_service(info)
-                except Exception:
-                    pass
-            if zc is not None:
-                try:
-                    zc.close()
-                except Exception:
-                    pass
-            zc = None
-            info = None
-            try:
-                # Bind to the specific IPv4 interface so the mDNS response stays
-                # small — the ESP8266 UDP buffer drops oversized multi-interface packets
-                zc = Zeroconf(interfaces=[ip])
-                info = ServiceInfo(
-                    "_codelight._tcp.local.",
-                    f"{name}._codelight._tcp.local.",
-                    addresses=[socket.inet_aton(ip)],
-                    port=port,
-                    properties={},
-                )
-                zc.register_service(info)
-                current_ip = ip
-                _log(f"[mdns] advertising on {ip}:{port}")
-            except Exception as e:
-                _log(f"[mdns] registration failed: {e}")
-                if zc is not None:
-                    try:
-                        zc.close()
-                    except Exception:
-                        pass
-                zc = None
-                info = None
-                # Don't update current_ip — forces a retry next iteration
-                _shutdown.wait(5)
-                continue
-
-        _shutdown.wait(10)   # re-check IP every 10 s
-
-    if info is not None and zc is not None:
-        try:
-            zc.unregister_service(info)
-        except Exception:
-            pass
-    if zc is not None:
-        zc.close()
-    vprint("[mdns] stopped")
+    discovery_core.advertise_mdns(
+        port=port,
+        name=name,
+        shutdown=_shutdown,
+        zeroconf_cls=Zeroconf,
+        service_info_cls=ServiceInfo,
+        log=_log,
+        verbose_log=vprint,
+    )
 
 
 def _socket_thread() -> None:
@@ -1723,13 +1461,9 @@ def _socket_thread() -> None:
                 continue
             try:
                 conn.settimeout(2.0)
-                raw = b""
-                while b"\n" not in raw and len(raw) < 8192:
-                    chunk = conn.recv(4096)
-                    if not chunk:
-                        break
-                    raw += chunk
-                msg = json.loads(raw.decode())
+                msg = hook_io.read_json_message(conn, max_bytes=8192)
+                if msg is None:
+                    continue
 
                 if msg.get("type") == "permission_request":
                     _register_permission(conn, msg)   # takes ownership of conn
@@ -1761,7 +1495,7 @@ def _socket_thread() -> None:
                     vprint(f"[socket] {sid[:8]}… → {state}")
                     _push()
                     # The transcript just grew — refresh the conversation feed.
-                    _broadcast_conversation()
+                    _notify_conversation_changed()
             except Exception as e:
                 vprint(f"[socket] error: {e}")
             finally:
@@ -1836,14 +1570,7 @@ def uninstall() -> None:
         except FileNotFoundError:
             pass
 
-    service_path = os.path.expanduser("~/.config/systemd/user/codelight.service")
-    if os.path.exists(service_path):
-        import subprocess
-        subprocess.run(["systemctl", "--user", "disable", "--now", "codelight"],
-                       capture_output=True)
-        os.unlink(service_path)
-        subprocess.run(["systemctl", "--user", "daemon-reload"], capture_output=True)
-        print(f"[uninstall] removed {service_path}")
+    service_core.uninstall_service(run=subprocess.run)
 
     uninstall_vscode_extension()
 
@@ -1852,195 +1579,35 @@ def uninstall() -> None:
 
 # ── Systemd service install ───────────────────────────────────────────────────
 
-# CLI name → user settings.json path (Linux)
-_VSCODE_FLAVORS = [
-    ("code",          "~/.config/Code/User/settings.json"),
-    ("code-insiders", "~/.config/Code - Insiders/User/settings.json"),
-    ("codium",        "~/.config/VSCodium/User/settings.json"),
-]
-_VSCODE_EXT_ID = "sensnology.codelight"
-_AGENT_EXECUTABLES = {
-    "claude": ("claude",),
-    "copilot": ("copilot",),
-    "codex": ("codex",),
-}
-_AGENT_VSCODE_EXTENSIONS = {
-    "claude": {"anthropic.claude-code"},
-    "copilot": {"github.copilot", "github.copilot-chat"},
-    "codex": {"openai.chatgpt"},
-}
-
-
 def detect_installed_agents() -> set[str]:
-    """Detect supported agents from CLIs and local VSCode extensions."""
-    import subprocess
-
-    detected = {
-        agent for agent, executables in _AGENT_EXECUTABLES.items()
-        if any(shutil.which(exe) for exe in executables)
-    }
-    installed_extensions: set[str] = set()
-    for cli, _ in _VSCODE_FLAVORS:
-        exe = shutil.which(cli)
-        if not exe:
-            continue
-        try:
-            result = subprocess.run([exe, "--list-extensions"],
-                                    capture_output=True, text=True, timeout=15)
-            installed_extensions.update(
-                line.strip().lower() for line in result.stdout.splitlines()
-                if line.strip()
-            )
-        except Exception:
-            continue
-    for agent, extension_ids in _AGENT_VSCODE_EXTENSIONS.items():
-        if installed_extensions.intersection(extension_ids):
-            detected.add(agent)
-    return detected
+    return vscode_core.detect_installed_agents(
+        which=shutil.which, run=subprocess.run)
 
 
 def _parse_agent_set(value: str | None) -> set[str]:
-    if not value:
-        return set()
-    supported = set(AGENT_REGISTRY)
-    return {
-        item.strip().lower() for item in value.split(",")
-        if item.strip().lower() in supported
-    }
+    return vscode_core.parse_agent_set(value, set(AGENT_REGISTRY))
 
 
 def _find_vscode_cli() -> tuple[str, str] | None:
-    """Return (cli_path, settings_path) for the first VSCode flavor found."""
-    for cli, settings in _VSCODE_FLAVORS:
-        exe = shutil.which(cli)
-        if exe:
-            return exe, os.path.expanduser(settings)
-    return None
+    return vscode_core.find_vscode_cli(which=shutil.which)
 
 
 def _configure_vscode_settings(settings_path: str, secret: str, ws_port: int) -> None:
-    """Write codelight.* keys into the VSCode user settings. VSCode reloads
-    settings.json live, so the extension picks this up without a restart."""
-    settings = {}
-    try:
-        with open(settings_path) as f:
-            settings = json.load(f)
-    except FileNotFoundError:
-        pass
-    except Exception:
-        # settings.json may legally contain comments (JSONC) — never risk
-        # clobbering a file we can't round-trip
-        print(f"[vscode] could not parse {settings_path} (comments?) — set "
-              f"codelight.secret = {secret!r} manually", file=sys.stderr)
-        return
-
-    desired = {"codelight.secret": secret}
-    if ws_port != 8765:
-        desired["codelight.port"] = ws_port
-    if all(settings.get(k) == v for k, v in desired.items()):
-        return
-    settings.update(desired)
-
-    os.makedirs(os.path.dirname(settings_path), exist_ok=True)
-    with open(settings_path, "w") as f:
-        json.dump(settings, f, indent=4)
-        f.write("\n")
-    print(f"[vscode] configured codelight.secret in {settings_path}")
+    vscode_core.configure_vscode_settings(settings_path, secret, ws_port)
 
 
 def _find_local_vsix() -> str | None:
-    """A repo checkout with a freshly built .vsix beats downloading."""
-    import glob
-    ext_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                           "..", "vscode-extension")
-    candidates = sorted(glob.glob(os.path.join(ext_dir, "codelight-*.vsix")),
-                        key=os.path.getmtime)
-    return candidates[-1] if candidates else None
+    return vscode_core.find_local_vsix(__file__)
 
 
 def install_vscode_extension(secret: str = "", ws_port: int = 8765) -> None:
-    """Install the codelight VSCode extension (local build or latest GitHub
-    release) and configure its settings to match this daemon."""
-    import subprocess
-
-    found = _find_vscode_cli()
-    release_url = "https://github.com/henrikekblad/codelight/releases"
-    if found is None:
-        print("[vscode] 'code' CLI not found — install the extension manually:",
-              file=sys.stderr)
-        print(f"[vscode]   download codelight-*.vsix from {release_url}", file=sys.stderr)
-        print("[vscode]   then: code --install-extension <file.vsix>", file=sys.stderr)
-        return
-    code, settings_path = found
-
-    vsix_path = _find_local_vsix()
-    if vsix_path:
-        print(f"[vscode] using local build {os.path.basename(vsix_path)}")
-    else:
-        try:
-            api = "https://api.github.com/repos/henrikekblad/codelight/releases/latest"
-            with urllib.request.urlopen(api, timeout=15) as r:
-                release = json.load(r)
-            asset = next((a for a in release.get("assets", [])
-                          if a.get("name", "").endswith(".vsix")), None)
-            if asset is None:
-                print(f"[vscode] no .vsix asset in the latest release — see {release_url}",
-                      file=sys.stderr)
-                return
-            cache = os.path.expanduser("~/.cache/codelight")
-            os.makedirs(cache, exist_ok=True)
-            vsix_path = os.path.join(cache, asset["name"])
-            print(f"[vscode] downloading {asset['name']}…")
-            urllib.request.urlretrieve(asset["browser_download_url"], vsix_path)
-        except Exception as e:
-            print(f"[vscode] could not download extension: {e}", file=sys.stderr)
-            return
-
-    try:
-        result = subprocess.run([code, "--install-extension", vsix_path, "--force"],
-                                capture_output=True, text=True)
-        if result.returncode != 0:
-            print(f"[vscode] install failed: {result.stderr.strip()}", file=sys.stderr)
-            return
-        print(f"[vscode] extension installed ({os.path.basename(vsix_path)})")
-    except Exception as e:
-        print(f"[vscode] could not install extension: {e}", file=sys.stderr)
-        return
-
-    if secret:
-        _configure_vscode_settings(settings_path, secret, ws_port)
+    vscode_core.install_vscode_extension(
+        __file__, secret, ws_port, which=shutil.which, run=subprocess.run)
 
 
 def uninstall_vscode_extension() -> None:
-    """Remove the extension and its settings from every VSCode flavor present."""
-    import subprocess
-
-    for cli, settings in _VSCODE_FLAVORS:
-        exe = shutil.which(cli)
-        if not exe:
-            continue
-        try:
-            listed = subprocess.run([exe, "--list-extensions"],
-                                    capture_output=True, text=True)
-            if _VSCODE_EXT_ID in listed.stdout:
-                subprocess.run([exe, "--uninstall-extension", _VSCODE_EXT_ID],
-                               capture_output=True, text=True)
-                print(f"[vscode] extension removed from {cli}")
-        except Exception:
-            pass
-
-        settings_path = os.path.expanduser(settings)
-        try:
-            with open(settings_path) as f:
-                data = json.load(f)
-            cleaned = {k: v for k, v in data.items() if not k.startswith("codelight.")}
-            if cleaned != data:
-                with open(settings_path, "w") as f:
-                    json.dump(cleaned, f, indent=4)
-                    f.write("\n")
-                print(f"[vscode] settings cleaned in {settings_path}")
-        except Exception:
-            pass
+    vscode_core.uninstall_vscode_extension(
+        which=shutil.which, run=subprocess.run)
 
 
 def install_service(name: str, secret: str, ws_port: int, verbose: bool,
@@ -2049,73 +1616,25 @@ def install_service(name: str, secret: str, ws_port: int, verbose: bool,
                     agents: set[str] | None = None,
                     github_org: str = "",
                     github_token_file: str = "") -> None:
-    """Write ~/.config/systemd/user/codelight.service and enable it."""
-    import subprocess
-
-    script_path = os.path.abspath(__file__)
-    python_path = shutil.which("python3") or "python3"
-
-    args_line = f"--name {shlex.quote(name)}"
-    if secret:
-        args_line += f" --secret {shlex.quote(secret)}"
-    if ws_port != 8765:
-        args_line += f" --ws-port {ws_port}"
-    if verbose:
-        args_line += " --verbose"
-    if remote_control:
-        args_line += " --remote-control"
-        if permission_timeout != 60:
-            args_line += f" --permission-timeout {permission_timeout}"
-    enabled_agents = sorted(agents or set())
-    if enabled_agents:
-        args_line += f" --agents {','.join(enabled_agents)}"
-    if github_org:
-        args_line += f" --github-org {shlex.quote(github_org)}"
-    if github_token_file:
-        args_line += f" --github-token-file {shlex.quote(github_token_file)}"
-
-    unit = f"""\
-[Unit]
-Description=codelight coding-agent status monitor
-PartOf=graphical-session.target
-After=graphical-session.target
-
-[Service]
-ExecStart={python_path} -u {script_path} {args_line}
-Restart=on-failure
-RestartSec=5
-
-[Install]
-WantedBy=graphical-session.target
-"""
-
-    service_dir = os.path.expanduser("~/.config/systemd/user")
-    os.makedirs(service_dir, exist_ok=True)
-    service_path = os.path.join(service_dir, "codelight.service")
-
-    with open(service_path, "w") as f:
-        f.write(unit)
-    print(f"[install] wrote {service_path}")
-
-    for cmd in [
-        ["systemctl", "--user", "daemon-reload"],
-        ["systemctl", "--user", "reenable", "codelight"],  # re-link under the current WantedBy target
-        ["systemctl", "--user", "restart", "codelight"],   # replace an already-running old instance
-    ]:
-        result = subprocess.run(cmd, capture_output=True, text=True)
-        label = " ".join(cmd[2:])
-        if result.returncode == 0:
-            print(f"[install] systemctl {label}: ok")
-        else:
-            print(f"[install] systemctl {label}: {result.stderr.strip()}", file=sys.stderr)
-
-    print("[install] done — check status with: systemctl --user status codelight")
+    service_core.install_service(
+        name=name,
+        secret=secret,
+        ws_port=ws_port,
+        verbose=verbose,
+        script_path=os.path.abspath(__file__),
+        remote_control=remote_control,
+        permission_timeout=permission_timeout,
+        agents=agents,
+        github_org=github_org,
+        github_token_file=github_token_file,
+        run=subprocess.run,
+    )
 
 
 # ── Main ──────────────────────────────────────────────────────────────────────
 
 def main():
-    global _verbose
+    global _verbose, _conversation_refresher
 
     parser = argparse.ArgumentParser()
     parser.add_argument("command", nargs="?", choices=["dashboard"],
@@ -2244,9 +1763,16 @@ def main():
 
     print(f"codelight  [ws://0.0.0.0:{args.ws_port}]  (Ctrl-C to stop)", flush=True)
 
+    _conversation_refresher = ConversationRefresher(
+        active_path=_active_conversation_path,
+        has_clients=_has_conversation_clients,
+        broadcast=_broadcast_conversation,
+        shutdown=_shutdown,
+    )
+
     threading.Thread(target=_socket_thread, daemon=True).start()
     threading.Thread(target=_usage_thread,  daemon=True).start()
-    threading.Thread(target=_conv_poll_thread, daemon=True).start()
+    threading.Thread(target=_conversation_refresh_thread, daemon=True).start()
 
     threading.Thread(
         target=_ws_thread,

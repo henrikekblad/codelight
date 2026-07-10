@@ -13,16 +13,50 @@ from typing import Callable
 from codelight_core.timefmt import format_epoch_countdown
 
 
+def events_path_for_session(copilot_home: str, session_id: str) -> str:
+    sid = str(session_id or "").strip()
+    if not sid:
+        return ""
+    base = os.path.realpath(os.path.join(copilot_home, "session-state"))
+    path = os.path.realpath(os.path.join(base, sid, "events.jsonl"))
+    if not path.startswith(base + os.sep):
+        return ""
+    return path if os.path.isfile(path) else ""
+
+
+def latest_events_path(copilot_home: str) -> str:
+    try:
+        base = os.path.join(copilot_home, "session-state")
+        newest_path = ""
+        newest_mtime = 0.0
+        for root, _, files in os.walk(base):
+            if "events.jsonl" not in files:
+                continue
+            path = os.path.join(root, "events.jsonl")
+            try:
+                mtime = os.path.getmtime(path)
+            except OSError:
+                continue
+            if mtime > newest_mtime:
+                newest_mtime = mtime
+                newest_path = path
+        return newest_path
+    except Exception:
+        return ""
+
+
 class CopilotAgent:
     def __init__(
         self,
         org: str = "",
         *,
+        copilot_home: str = "",
         token_file: str = "",
         api: Callable[[str, str], dict] | None = None,
         log: Callable[[str], None] | None = None,
     ) -> None:
         self.org = org
+        self.copilot_home = copilot_home
         self.token_file = token_file
         self.api = api or github_api
         self.log = log
@@ -48,6 +82,12 @@ class CopilotAgent:
             api=self.api,
             log=self.log,
         )
+
+    def events_path_for_session(self, session_id: str) -> str:
+        return events_path_for_session(self.copilot_home, session_id)
+
+    def latest_events_path(self) -> str:
+        return latest_events_path(self.copilot_home)
 
 
 def github_token(token_file: str = "") -> str:

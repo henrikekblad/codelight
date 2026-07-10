@@ -4,15 +4,24 @@ import sys
 import tempfile
 import threading
 import unittest
+import urllib.error
 from unittest import mock
 
 sys.path.insert(0, os.path.dirname(__file__))
 import codelight
+from codelight_core.agents import copilot as copilot_agent
 from codelight_core.state import CodelightState
 from codelight_core import auth as auth_core
 from codelight_core import dashboard_client
 from codelight_core import hooks as hooks_core
-from codelight_core.usage import UsagePoller, usage_summary
+from codelight_core.conversation import ConversationRefresher
+from codelight_core import discovery as discovery_core
+from codelight_core import hook_io
+from codelight_core import hook_runtime
+from codelight_core import remote_control
+from codelight_core import remote_payloads
+from codelight_core import service as service_core
+from codelight_core.usage import UsageFetchers, UsagePoller, usage_summary
 
 
 class TranscriptParserTests(unittest.TestCase):
@@ -194,12 +203,30 @@ class CopilotUsageTests(unittest.TestCase):
         self.assertEqual(usage["limits"][0]["label"], "Monthly")
 
     def test_permission_failure_omits_detailed_usage(self):
-        error = codelight.urllib.error.HTTPError(
+        error = urllib.error.HTTPError(
             "https://api.github.com/test", 403, "Forbidden", {}, None)
         with mock.patch.object(codelight, "_github_api", side_effect=error):
             self.assertIsNone(codelight.get_copilot_usage(
                 "Drivec-AB", "token",
                 codelight.datetime(2026, 7, 9, tzinfo=codelight.timezone.utc)))
+
+    def test_events_path_for_session_stays_inside_copilot_home(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            home = os.path.join(tmp, "copilot")
+            session_dir = os.path.join(home, "session-state", "session-1")
+            os.makedirs(session_dir)
+            events = os.path.join(session_dir, "events.jsonl")
+            with open(events, "w") as stream:
+                stream.write("{}\n")
+
+            self.assertEqual(
+                copilot_agent.events_path_for_session(home, "session-1"),
+                events,
+            )
+            self.assertEqual(
+                copilot_agent.events_path_for_session(home, "../outside"),
+                "",
+            )
 
 
 class PermissionPolicyTests(unittest.TestCase):
@@ -389,6 +416,415 @@ class UsagePollerTests(unittest.TestCase):
         self.assertNotIn("copilot", snapshot["per_agent_usage"])
         self.assertEqual(logs[-1], "[usage] Claude 10%/20%")
         self.assertEqual(pushes, [True])
+
+    def test_usage_fetchers_compose_agent_specific_fetchers(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            token_file = os.path.join(tmp, "token")
+            with open(token_file, "w") as stream:
+                stream.write("token")
+
+            def api(path, token):
+                self.assertEqual(token, "token")
+                if "/ai_credit/usage?" in path:
+                    return {
+                        "usageItems": [{
+                            "product": "Copilot",
+                            "unitType": "ai-credits",
+                            "grossQuantity": 100,
+                        }],
+                    }
+                return {
+                    "plan_type": "business",
+                    "seat_breakdown": {"total": 1},
+                }
+
+            fetchers = UsageFetchers(
+                claude_credentials_path=os.path.join(tmp, "missing.json"),
+                claude_usage_api="https://example.invalid",
+                codex_home=tmp,
+                copilot_home=tmp,
+                github_org="Org",
+                github_token_file=token_file,
+                github_api=api,
+            )
+
+            usage = fetchers.get_copilot_usage(
+                now=codelight.datetime(2026, 7, 9, tzinfo=codelight.timezone.utc)
+            )
+
+            self.assertEqual(fetchers.github_token(), "token")
+            self.assertIsNotNone(usage)
+            self.assertEqual(usage["used_credits"], 100)
+
+
+class ConversationRefresherTests(unittest.TestCase):
+    def test_refreshes_only_when_clients_have_changed_transcript(self):
+        with tempfile.NamedTemporaryFile() as stream:
+            path = stream.name
+            broadcasts: list[bool] = []
+            has_clients = False
+            refresher = ConversationRefresher(
+                active_path=lambda: path,
+                has_clients=lambda: has_clients,
+                broadcast=lambda: broadcasts.append(True),
+                shutdown=threading.Event(),
+            )
+
+            os.utime(path, (1, 1))
+            self.assertFalse(refresher.refresh_if_changed())
+            self.assertEqual(broadcasts, [])
+
+            has_clients = True
+            self.assertTrue(refresher.refresh_if_changed())
+            self.assertEqual(broadcasts, [True])
+
+            self.assertFalse(refresher.refresh_if_changed())
+            self.assertEqual(broadcasts, [True])
+
+            os.utime(path, (2, 2))
+            self.assertTrue(refresher.refresh_if_changed())
+            self.assertEqual(broadcasts, [True, True])
+
+    def test_refresh_detects_size_change_when_mtime_is_unchanged(self):
+        with tempfile.NamedTemporaryFile() as stream:
+            path = stream.name
+            broadcasts: list[bool] = []
+            refresher = ConversationRefresher(
+                active_path=lambda: path,
+                has_clients=lambda: True,
+                broadcast=lambda: broadcasts.append(True),
+                shutdown=threading.Event(),
+            )
+
+            stream.write(b"one")
+            stream.flush()
+            os.utime(path, (10, 10))
+            self.assertTrue(refresher.refresh_if_changed())
+
+            stream.write(b"two")
+            stream.flush()
+            os.utime(path, (10, 10))
+            self.assertTrue(refresher.refresh_if_changed())
+            self.assertEqual(broadcasts, [True, True])
+
+
+class ServiceInstallTests(unittest.TestCase):
+    def test_build_args_line_quotes_user_values_and_sorts_agents(self):
+        args = service_core.build_args_line(
+            name="henrik laptop",
+            secret="secret value",
+            ws_port=9999,
+            verbose=True,
+            remote_control=True,
+            permission_timeout=42,
+            agents={"codex", "claude"},
+            github_org="Drivec AB",
+            github_token_file="/tmp/token file",
+        )
+
+        self.assertEqual(
+            args,
+            "--name 'henrik laptop' --secret 'secret value' --ws-port 9999 "
+            "--verbose --remote-control --permission-timeout 42 "
+            "--agents claude,codex --github-org 'Drivec AB' "
+            "--github-token-file '/tmp/token file'",
+        )
+
+    def test_uninstall_service_removes_unit_and_reloads_systemd(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            service_dir = os.path.join(tmp, ".config", "systemd", "user")
+            os.makedirs(service_dir)
+            service_path = os.path.join(service_dir, "codelight.service")
+            with open(service_path, "w") as stream:
+                stream.write("unit")
+            calls: list[list[str]] = []
+
+            def run(cmd, **_kwargs):
+                calls.append(cmd)
+                return mock.Mock(returncode=0, stderr="")
+
+            with mock.patch.dict(os.environ, {"HOME": tmp}):
+                service_core.uninstall_service(run=run)
+
+            self.assertFalse(os.path.exists(service_path))
+            self.assertEqual(calls, [
+                ["systemctl", "--user", "disable", "--now", "codelight"],
+                ["systemctl", "--user", "daemon-reload"],
+            ])
+
+
+class DiscoveryTests(unittest.TestCase):
+    def test_mdns_advertiser_registers_and_cleans_up(self):
+        events: list[str] = []
+        logs: list[str] = []
+
+        class StopAfterOne:
+            def __init__(self):
+                self.count = 0
+
+            def is_set(self):
+                return self.count > 0
+
+            def wait(self, _timeout):
+                self.count += 1
+
+        class FakeZeroconf:
+            def __init__(self, interfaces):
+                events.append(f"zc:{interfaces[0]}")
+
+            def register_service(self, info):
+                events.append(f"register:{info.name}:{info.port}")
+
+            def unregister_service(self, info):
+                events.append(f"unregister:{info.name}")
+
+            def close(self):
+                events.append("close")
+
+        class FakeServiceInfo:
+            def __init__(self, _type, name, addresses, port, properties):
+                self.name = name
+                self.addresses = addresses
+                self.port = port
+                self.properties = properties
+
+        discovery_core.advertise_mdns(
+            port=8765,
+            name="laptop",
+            shutdown=StopAfterOne(),
+            zeroconf_cls=FakeZeroconf,
+            service_info_cls=FakeServiceInfo,
+            log=logs.append,
+            local_ip=lambda: "192.168.1.2",
+        )
+
+        self.assertEqual(events, [
+            "zc:192.168.1.2",
+            "register:laptop._codelight._tcp.local.:8765",
+            "unregister:laptop._codelight._tcp.local.",
+            "close",
+        ])
+        self.assertEqual(logs, ["[mdns] advertising on 192.168.1.2:8765"])
+
+
+class HookRuntimeTests(unittest.TestCase):
+    def test_hook_input_helpers_accept_agent_field_variants(self):
+        data = hook_runtime.parse_json_object(json.dumps({
+            "sessionId": "s1",
+            "hookEventName": "PreToolUse",
+            "toolName": "Bash",
+            "toolArgs": {"command": "npm test"},
+        }))
+
+        self.assertEqual(hook_runtime.session_id(data), "s1")
+        self.assertEqual(hook_runtime.hook_event_name(data), "PreToolUse")
+        self.assertEqual(hook_runtime.tool_name(data), "Bash")
+        self.assertEqual(hook_runtime.tool_input(data), {"command": "npm test"})
+        self.assertEqual(hook_runtime.parse_json_object("not json"), {})
+
+    def test_question_helpers_extract_supported_shapes(self):
+        self.assertTrue(hook_runtime.is_question_tool(
+            "Bash", {"questions": [{"question": "Proceed?"}]}
+        ))
+        self.assertTrue(hook_runtime.is_question_tool("AskUserQuestion", {}))
+        self.assertEqual(
+            hook_runtime.questions_from_input({}, {"question": "  Continue? "}),
+            [{"question": "Continue?"}],
+        )
+        self.assertEqual(
+            hook_runtime.questions_from_input({"questions": [{"q": "x"}]}, {}),
+            [{"q": "x"}],
+        )
+
+    def test_permission_decision_outputs_host_shapes(self):
+        self.assertEqual(
+            hook_runtime.permission_decision_output("allow"),
+            {
+                "hookSpecificOutput": {
+                    "hookEventName": "PermissionRequest",
+                    "decision": {"behavior": "allow"},
+                },
+            },
+        )
+        self.assertEqual(
+            hook_runtime.permission_decision_output("deny", copilot_mode=True,
+                                                   reason="nope"),
+            {"behavior": "deny", "message": "nope"},
+        )
+        self.assertEqual(
+            hook_runtime.permission_decision_output(
+                "deny", vscode_prettool_mode=True, reason="nope"
+            ),
+            {
+                "hookSpecificOutput": {
+                    "hookEventName": "PreToolUse",
+                    "permissionDecision": "deny",
+                    "permissionDecisionReason": "nope",
+                },
+            },
+        )
+
+    def test_question_updated_input_output_includes_answer_aliases(self):
+        output = hook_runtime.question_updated_input_output(
+            {"question": "Proceed?"}, {"Proceed?": "yes"}
+        )
+        hook = output["hookSpecificOutput"]
+
+        self.assertEqual(hook["permissionDecision"], "allow")
+        self.assertEqual(hook["updatedInput"]["answer"], "yes")
+        self.assertEqual(hook["modifiedArgs"], hook["updatedInput"])
+
+
+class HookIoTests(unittest.TestCase):
+    def test_write_monitor_state_writes_and_removes_session_file(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            hook_io.write_monitor_state(
+                tmp,
+                session_id="s1",
+                state="working",
+                agent_id="claude",
+                hook_event="PreToolUse",
+            )
+            path = os.path.join(tmp, "s1.json")
+            with open(path) as stream:
+                data = json.load(stream)
+
+            self.assertEqual(data["state"], "working")
+            self.assertEqual(data["agent_id"], "claude")
+            self.assertEqual(data["hook_event"], "PreToolUse")
+
+            hook_io.write_monitor_state(
+                tmp,
+                session_id="s1",
+                state="ended",
+                agent_id="claude",
+            )
+            self.assertFalse(os.path.exists(path))
+
+    def test_read_json_message_reads_until_newline(self):
+        class FakeConn:
+            def __init__(self):
+                self.chunks = [b'{"hello": "world"}\nignored']
+
+            def recv(self, _size):
+                return self.chunks.pop(0) if self.chunks else b""
+
+        self.assertEqual(
+            hook_io.read_json_message(FakeConn(), max_bytes=1024),
+            {"hello": "world"},
+        )
+
+
+class RemotePayloadTests(unittest.TestCase):
+    def display(self, agent_id):
+        return {"claude": "Claude", "codex": "Codex"}.get(agent_id, "Unknown")
+
+    def test_permission_payload_contains_policy_actions_and_agent_display(self):
+        payload = remote_payloads.permission_request_payload(
+            {
+                "id": "p1",
+                "tool_name": "Bash",
+                "summary": "Bash: npm test",
+                "tool_input": {"command": "npm test"},
+                "session_id": "s1",
+                "agent_id": "claude",
+                "cwd": "/repo",
+                "expires": 123.9,
+            },
+            agent_display_name=self.display,
+            allow_folder_available=True,
+            allow_command_available=False,
+        )
+
+        self.assertEqual(payload["type"], "permission_request")
+        self.assertEqual(payload["agent_display"], "Claude")
+        self.assertTrue(payload["allow_folder_available"])
+        self.assertFalse(payload["allow_command_available"])
+        self.assertEqual(payload["expires_at"], 123)
+
+    def test_resolved_payload_includes_policy_persistence_metadata(self):
+        payload = remote_payloads.permission_resolved_payload(
+            {"id": "p1", "agent_id": "codex"},
+            decision="allow_command",
+            by="android",
+            persistence={"kind": "command", "value": "npm test", "persisted": True},
+            agent_display_name=self.display,
+        )
+
+        self.assertEqual(payload["type"], "permission_resolved")
+        self.assertEqual(payload["agent_display"], "Codex")
+        self.assertEqual(payload["policy_kind"], "command")
+        self.assertTrue(payload["policy_persisted"])
+
+    def test_question_payloads_include_agent_identity(self):
+        request = remote_payloads.question_request_payload(
+            {
+                "id": "q1",
+                "questions": [{"question": "Proceed?"}],
+                "session_id": "s1",
+                "agent_id": "claude",
+                "cwd": "/repo",
+                "expires": 456,
+            },
+            agent_display_name=self.display,
+        )
+        resolved = remote_payloads.question_resolved_payload(
+            {"id": "q1", "agent_id": "claude"},
+            by="vscode",
+            agent_display_name=self.display,
+        )
+
+        self.assertEqual(request["type"], "question_request")
+        self.assertEqual(request["agent_display"], "Claude")
+        self.assertEqual(resolved["type"], "question_resolved")
+        self.assertEqual(resolved["by"], "vscode")
+
+
+class RemoteControlTests(unittest.TestCase):
+    def test_completion_event_policy_matches_pending_prompt_lifecycle(self):
+        self.assertTrue(remote_control.should_cancel_pending_for_hook(
+            "working", "PostToolUse"))
+        self.assertTrue(remote_control.should_cancel_pending_for_hook(
+            "ended", ""))
+        self.assertFalse(remote_control.should_cancel_pending_for_hook(
+            "working", "PreToolUse"))
+
+    def test_question_wait_remaining_uses_grace_only_when_nobody_can_answer(self):
+        entry = {"expires": 200.0}
+
+        self.assertEqual(
+            remote_control.question_wait_remaining(
+                entry,
+                can_answer=True,
+                last_client_gone=0.0,
+                reconnect_window=30.0,
+                grace_deadline=110.0,
+                now=100.0,
+            ),
+            100.0,
+        )
+        self.assertEqual(
+            remote_control.question_wait_remaining(
+                entry,
+                can_answer=False,
+                last_client_gone=90.0,
+                reconnect_window=30.0,
+                grace_deadline=110.0,
+                now=100.0,
+            ),
+            100.0,
+        )
+        self.assertEqual(
+            remote_control.question_wait_remaining(
+                entry,
+                can_answer=False,
+                last_client_gone=0.0,
+                reconnect_window=30.0,
+                grace_deadline=110.0,
+                now=100.0,
+            ),
+            10.0,
+        )
 
 
 class HookConfigTests(unittest.TestCase):

@@ -63,14 +63,13 @@ def dashboard_lines(
         if aid not in per_agent_usage and aid not in per_agent_status:
             continue
         display = _agent_display_name(agent_registry, default_agent_id, aid)
-        short = agent_registry.get(aid, {}).get("short", "?")
         astate = str(per_agent_status.get(aid, "idle"))
         acolor = STATUS_COLOR.get(astate, "")
 
         usage = per_agent_usage.get(aid, {})
         limits = usage.get("limits") if isinstance(usage, dict) else None
         agent_lines.append(
-            f"  {acolor}● [{short}] {BOLD}{display}{RESET} "
+            f"  {acolor}● {BOLD}{display}{RESET} "
             f"{DIM}{astate.upper()}{RESET}"
         )
         if not isinstance(limits, list):

@@ -4,12 +4,60 @@ import sys
 import threading
 from typing import Callable
 
+from codelight_core.agents import claude as claude_agent
+from codelight_core.agents import codex as codex_agent
+from codelight_core.agents import copilot as copilot_agent
 from codelight_core.state import CodelightState
 
 
 UsageFetcher = Callable[[], dict | None]
 Logger = Callable[[str], None]
 Push = Callable[[], None]
+
+
+class UsageFetchers:
+    def __init__(
+        self,
+        *,
+        claude_credentials_path: str,
+        claude_usage_api: str,
+        codex_home: str,
+        copilot_home: str,
+        github_org: str = "",
+        github_token_file: str = "",
+        github_api: Callable[[str, str], dict] | None = None,
+        log: Logger | None = None,
+    ) -> None:
+        self.claude = claude_agent.ClaudeAgent(
+            claude_credentials_path,
+            usage_api=claude_usage_api,
+            log=log,
+        )
+        self.codex = codex_agent.CodexAgent(codex_home)
+        self.copilot = copilot_agent.CopilotAgent(
+            github_org,
+            copilot_home=copilot_home,
+            token_file=github_token_file,
+            api=github_api,
+            log=log,
+        )
+
+    def get_claude_usage(self) -> dict | None:
+        return self.claude.get_usage()
+
+    def codex_usage_from_rollout(self, path: str) -> dict | None:
+        return self.codex.usage_from_rollout(path)
+
+    def get_codex_usage(self) -> dict | None:
+        return self.codex.get_usage()
+
+    def github_token(self) -> str:
+        return self.copilot.token()
+
+    def get_copilot_usage(self, *, org: str | None = None,
+                          token: str | None = None,
+                          now=None) -> dict | None:
+        return self.copilot.get_usage(org=org, token=token, now=now)
 
 
 def usage_summary(
