@@ -36,7 +36,6 @@ from codelight_core import service as service_core
 from codelight_core import socket_server
 from codelight_core.state import CodelightState
 from codelight_core import transcript as transcript_core
-from codelight_core import timefmt
 from codelight_core.usage import UsageFetchers, UsagePoller
 from codelight_core import vscode as vscode_core
 from codelight_core.ws_server import CodelightWebsocketHub
@@ -128,24 +127,6 @@ def _log(msg: str) -> None:
     print(f"[{ts}] {msg}", flush=True)
 
 
-def _format_countdown(diff_secs: int) -> str:
-    return timefmt.format_countdown(diff_secs)
-
-
-def _epoch(iso_ts: str) -> int:
-    """ISO-8601 timestamp → epoch seconds (0 if unparseable)."""
-    return timefmt.epoch(iso_ts)
-
-
-def _format_iso_countdown(iso_ts: str) -> str:
-    """Convert an ISO-8601 timestamp to a human-readable countdown like '3h 45m'."""
-    return timefmt.format_iso_countdown(iso_ts)
-
-
-def _format_epoch_countdown(epoch_seconds: int) -> str:
-    return timefmt.format_epoch_countdown(epoch_seconds)
-
-
 def _normalize_agent_id(agent_id: str | None) -> str:
     return _state.normalize_agent_id(agent_id)
 
@@ -162,10 +143,6 @@ def _valid_auth_response(data: dict, secret: str, nonce: str) -> bool:
     if not isinstance(data, dict) or "auth_hmac" not in data:
         return False
     return auth_core.valid_auth_response(data, secret, nonce)
-
-
-def _get_local_ip() -> str:
-    return discovery_core.get_local_ip()
 
 
 def _broadcast(payload: dict) -> None:
@@ -229,27 +206,6 @@ def _parse_transcript(path: str, max_msgs: int = 60) -> list[dict]:
         path, tool_summary=_tool_summary, max_msgs=max_msgs)
 
 
-def _extract_transcript_path(data: dict) -> str:
-    """Read transcript path across hook payload variants."""
-    return transcript_core.extract_transcript_path(data)
-
-
-def _is_noise(s: str) -> bool:
-    """True for machine-generated wrappers (slash-commands, IDE hints, injected
-    reminders) that aren't turns the human actually typed."""
-    return transcript_core.is_noise(s)
-
-
-def _tool_result_text(content) -> str:
-    """Extract a short plain-text snippet from a tool_result block's content."""
-    return transcript_core.tool_result_text(content)
-
-
-def _codex_tool_result_text(content) -> str:
-    """Remove Codex's execution envelope from a tool result."""
-    return transcript_core.codex_tool_result_text(content)
-
-
 def _conversation_payload() -> dict | None:
     """Build the {"type":"conversation", ...} feed for the active session."""
     return conversation_core.build_payload(
@@ -284,10 +240,6 @@ def _broadcast_conversation() -> None:
         _ws_hub.broadcast_conversation()
 
 
-def _status_rank(status: str) -> int:
-    return CodelightState._status_rank(status)
-
-
 def _overall_status() -> tuple[int, str, dict[str, str], str]:
     """Return (active_count, overall_status) from in-memory session state.
     Cleans up sessions that have been silent longer than IDLE_WINDOW."""
@@ -305,10 +257,6 @@ def _status_snapshot() -> dict:
     }
     return payload
 
-
-def _usage_limit(label: str, usage: dict, prefix: str) -> dict:
-    """Return the generic limit shape understood by multi-agent clients."""
-    return CodelightState._usage_limit(label, usage, prefix)
 
 # ── Remote permission approval ────────────────────────────────────────────────
 #
@@ -587,32 +535,8 @@ def install_copilot_hooks(script_path: str, remote_permissions: bool = False,
 
 # ── Permission policy compatibility helpers ──────────────────────────────────
 
-def _norm_path(path: str) -> str:
-    return policy_core.norm_path(path)
-
-
-def _load_policy() -> dict:
-    return policy_core.load_policy(POLICY_PATH)
-
-
-def _write_policy(policy: dict) -> bool:
-    return policy_core.write_policy(POLICY_PATH, policy)
-
-
-def _trusted_folders() -> list[str]:
-    return policy_core.trusted_folders(POLICY_PATH)
-
-
-def _path_is_within(path: str, root: str) -> bool:
-    return policy_core.path_is_within(path, root)
-
-
 def _is_trusted_repo_cwd(cwd: str) -> bool:
     return policy_core.is_trusted_repo_cwd(POLICY_PATH, cwd)
-
-
-def _repo_root_for(cwd: str) -> str:
-    return policy_core.repo_root_for(cwd)
 
 
 def _allow_folder(cwd: str) -> tuple[bool, str]:
@@ -629,14 +553,6 @@ def _allow_command(command: str, cwd: str) -> tuple[bool, str]:
 
 def _tool_summary(tool_name: str, tool_input: dict) -> str:
     return policy_core.tool_summary(tool_name, tool_input)
-
-
-def _extract_patch_targets(patch_text: str) -> tuple[list[str], bool]:
-    return policy_core.extract_patch_targets(patch_text)
-
-
-def _is_trusted_target_path(path: str, cwd: str) -> bool:
-    return policy_core.is_trusted_target_path(POLICY_PATH, path, cwd)
 
 
 def _is_safe_trusted_apply_patch(tool_name: str, tool_input, cwd: str) -> bool:
@@ -722,11 +638,6 @@ def _usage_from_codex_rollout(path: str) -> dict | None:
 
 def get_codex_usage() -> dict | None:
     return _usage_fetchers().get_codex_usage()
-
-
-def _github_token() -> str:
-    """Resolve a GitHub token without making the gh CLI a requirement."""
-    return _usage_fetchers().github_token()
 
 
 def _github_api(path: str, token: str) -> dict:
@@ -912,18 +823,6 @@ def detect_installed_agents() -> set[str]:
 
 def _parse_agent_set(value: str | None) -> set[str]:
     return vscode_core.parse_agent_set(value, set(AGENT_REGISTRY))
-
-
-def _find_vscode_cli() -> tuple[str, str] | None:
-    return vscode_core.find_vscode_cli(which=shutil.which)
-
-
-def _configure_vscode_settings(settings_path: str, secret: str, ws_port: int) -> None:
-    vscode_core.configure_vscode_settings(settings_path, secret, ws_port)
-
-
-def _find_local_vsix() -> str | None:
-    return vscode_core.find_local_vsix(__file__)
 
 
 def install_vscode_extension(secret: str = "", ws_port: int = 8765) -> None:
