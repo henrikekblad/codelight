@@ -17,7 +17,7 @@ import sys
 import threading
 import time
 from datetime import datetime
-from codelight_core.agents.runtime import AgentRuntime
+from codelight_core.agents.registry import AgentRegistry
 from codelight_core import auth as auth_core
 from codelight_core import conversation as conversation_core
 from codelight_core.conversation import ConversationRefresher
@@ -31,7 +31,7 @@ from codelight_core import remote_payloads
 from codelight_core import socket_server
 from codelight_core.state import CodelightState
 from codelight_core import transcript as transcript_core
-from codelight_core.usage import UsageFetchers, UsagePoller
+from codelight_core.usage import UsagePoller
 from codelight_core.ws_server import CodelightWebsocketHub
 
 try:
@@ -92,19 +92,29 @@ _log_lines:       collections.deque = collections.deque(maxlen=10)
 _conversation_refresher: ConversationRefresher | None = None
 _remote_manager: remote_control.RemoteRequestManager | None = None
 
-AGENT_REGISTRY: dict[str, dict[str, str]] = {
-    "claude": {"display": "Claude"},
-    "copilot": {"display": "Copilot"},
-    "codex": {"display": "Codex"},
-}
 DEFAULT_AGENT_ID = "claude"
+
+
+def _new_agent_registry(log=None) -> AgentRegistry:
+    return AgentRegistry(
+        claude_settings_path=os.path.expanduser("~/.claude/settings.json"),
+        claude_credentials_path=os.path.expanduser("~/.claude/.credentials.json"),
+        codex_home=CODEX_HOME,
+        copilot_home=COPILOT_HOME,
+        github_org=_github_org,
+        github_token_file=_github_token_file,
+        log=log,
+    )
+
+
+_agents = _new_agent_registry()
+AGENT_REGISTRY = _agents.display_registry()
 _state = CodelightState(
     default_agent_id=DEFAULT_AGENT_ID,
     agent_registry=AGENT_REGISTRY,
     idle_window=IDLE_WINDOW,
     idle_window_waiting=IDLE_WINDOW_WAITING,
 )
-_agent_runtime = AgentRuntime(codex_home=CODEX_HOME, copilot_home=COPILOT_HOME)
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -153,7 +163,7 @@ def _update_session(session_id: str, state: str,
                     agent_id: str = DEFAULT_AGENT_ID) -> None:
     normalized_agent = _normalize_agent_id(agent_id)
     if not transcript:
-        transcript = _agent_runtime.transcript_path_for_session(
+        transcript = _agents.transcript_path_for_session(
             normalized_agent, session_id)
     _state.update_session(
         session_id,
@@ -171,7 +181,7 @@ def _active_transcript() -> tuple[str, str]:
     active = _state.active_transcript()
     if active.path:
         return (active.session_id, active.path)
-    for agent_id, path in _agent_runtime.latest_transcript_fallbacks():
+    for agent_id, path in _agents.latest_transcript_fallbacks():
         if path:
             return (agent_id, path)
     return ("", "")
@@ -516,20 +526,8 @@ def run_question_hook(wait_secs: int, vscode_prettool_mode: bool = False,
 # ── Usage API ─────────────────────────────────────────────────────────────────
 # Credentials are read fresh each poll so token rotations are picked up automatically.
 
-_USAGE_API  = "https://claude.ai/api/oauth/usage"
-_CREDS_PATH = os.path.expanduser("~/.claude/.credentials.json")
-
-
-def _usage_fetchers() -> UsageFetchers:
-    return UsageFetchers(
-        claude_credentials_path=_CREDS_PATH,
-        claude_usage_api=_USAGE_API,
-        codex_home=CODEX_HOME,
-        copilot_home=COPILOT_HOME,
-        github_org=_github_org,
-        github_token_file=_github_token_file,
-        log=vprint,
-    )
+def _usage_fetchers():
+    return _new_agent_registry(log=vprint).usage_fetchers()
 
 
 def _push() -> None:
@@ -652,7 +650,7 @@ def _usage_thread() -> None:
     """Refresh supported-agent usage and broadcast after each update."""
     UsagePoller(
         state=_state,
-        fetchers=_usage_fetchers().usage_fetchers(),
+        fetchers=_usage_fetchers(),
         interval=USAGE_INTERVAL,
         shutdown=_shutdown,
         log=_log,
@@ -664,9 +662,7 @@ def _usage_thread() -> None:
 def uninstall() -> None:
     """Remove all codelight hooks, socket file, and state directory."""
     lifecycle.uninstall(
-        claude_settings_path=os.path.expanduser("~/.claude/settings.json"),
-        codex_home=CODEX_HOME,
-        copilot_home=COPILOT_HOME,
+        agent_registry=_new_agent_registry(),
         policy_path=POLICY_PATH,
         config_home=CODELIGHT_CONFIG_HOME,
         socket_path=SOCKET_PATH,
@@ -739,7 +735,7 @@ def main():
         if args.remote_control and not args.secret:
             parser.error("--remote-control requires --secret (remote approval/answers "
                          "are code-execution capability and must not be open to the LAN)")
-        detected_agents = lifecycle.detect_installed_agents()
+        detected_agents = lifecycle.detect_installed_agents(_new_agent_registry())
         print("[install] detected agents: "
               + (", ".join(sorted(detected_agents)) or "none"))
         lifecycle.install_service(
@@ -805,16 +801,14 @@ def main():
 
     enabled_agents = (_parse_agent_set(args.agents)
                       if args.agents is not None
-                      else lifecycle.detect_installed_agents())
+                      else lifecycle.detect_installed_agents(_new_agent_registry()))
     print("[agents] enabled: " + (", ".join(sorted(enabled_agents)) or "none"),
           flush=True)
 
     lifecycle.install_agent_hooks(
+        agent_registry=_new_agent_registry(log=vprint),
         enabled_agents=enabled_agents,
         script_path=os.path.abspath(__file__),
-        claude_settings_path=os.path.expanduser("~/.claude/settings.json"),
-        codex_home=CODEX_HOME,
-        copilot_home=COPILOT_HOME,
         hook_wait_ceiling=HOOK_WAIT_CEILING,
         remote_permissions=_remote_permissions,
         remote_questions=_remote_questions,

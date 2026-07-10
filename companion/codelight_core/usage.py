@@ -4,9 +4,7 @@ import sys
 import threading
 from typing import Callable
 
-from codelight_core.agents import claude as claude_agent
-from codelight_core.agents import codex as codex_agent
-from codelight_core.agents import copilot as copilot_agent
+from codelight_core.agents.registry import AgentRegistry
 from codelight_core.state import CodelightState
 
 
@@ -28,43 +26,37 @@ class UsageFetchers:
         github_api: Callable[[str, str], dict] | None = None,
         log: Logger | None = None,
     ) -> None:
-        self.claude = claude_agent.ClaudeAgent(
-            claude_credentials_path,
-            usage_api=claude_usage_api,
-            log=log,
-        )
-        self.codex = codex_agent.CodexAgent(codex_home)
-        self.copilot = copilot_agent.CopilotAgent(
-            github_org,
+        self.registry = AgentRegistry(
+            claude_settings_path="",
+            claude_credentials_path=claude_credentials_path,
+            claude_usage_api=claude_usage_api,
+            codex_home=codex_home,
             copilot_home=copilot_home,
-            token_file=github_token_file,
-            api=github_api,
+            github_org=github_org,
+            github_token_file=github_token_file,
+            github_api=github_api,
             log=log,
         )
 
     def get_claude_usage(self) -> dict | None:
-        return self.claude.get_usage()
+        return self.registry.claude.get_usage()
 
     def codex_usage_from_rollout(self, path: str) -> dict | None:
-        return self.codex.usage_from_rollout(path)
+        return self.registry.codex.usage_from_rollout(path)
 
     def get_codex_usage(self) -> dict | None:
-        return self.codex.get_usage()
+        return self.registry.codex.get_usage()
 
     def github_token(self) -> str:
-        return self.copilot.token()
+        return self.registry.github_token()
 
     def get_copilot_usage(self, *, org: str | None = None,
                           token: str | None = None,
                           now=None) -> dict | None:
-        return self.copilot.get_usage(org=org, token=token, now=now)
+        return self.registry.copilot.get_usage(org=org, token=token, now=now)
 
     def usage_fetchers(self) -> dict[str, UsageFetcher]:
-        return {
-            "claude": self.get_claude_usage,
-            "codex": self.get_codex_usage,
-            "copilot": self.get_copilot_usage,
-        }
+        return self.registry.usage_fetchers()
 
 
 def usage_summary(
@@ -138,7 +130,7 @@ class UsagePoller:
                 print(f"[usage] {agent_id} error: {e}", file=sys.stderr, flush=True)
                 result = None
             results[agent_id] = result
-            if result is not None or agent_id != "claude":
+            if result is not None or agent_id != self.state.default_agent_id:
                 updates[agent_id] = result
 
         self.state.update_usage(usages=updates)

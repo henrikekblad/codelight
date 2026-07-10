@@ -55,6 +55,10 @@ class CodelightState:
         aid = str(agent_id or "").strip().lower()
         return aid if aid else self._default_agent_id
 
+    @property
+    def default_agent_id(self) -> str:
+        return self._default_agent_id
+
     def agent_display_name(self, agent_id: str | None) -> str:
         aid = self.normalize_agent_id(agent_id)
         if aid in self._agent_registry:

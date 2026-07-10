@@ -1,19 +1,25 @@
 from __future__ import annotations
 
-import os
 import shutil
 import subprocess
 
-from codelight_core.agents import codex as codex_agent
-from codelight_core.agents import copilot as copilot_agent
-from codelight_core.agents import claude as claude_agent
+from codelight_core.agents.registry import AgentRegistry
 from codelight_core import hooks as hooks_core
 from codelight_core import service as service_core
 from codelight_core import vscode as vscode_core
 
 
-def detect_installed_agents() -> set[str]:
+def detect_installed_agents(agent_registry: AgentRegistry | None = None) -> set[str]:
+    agent_executables = (
+        agent_registry.executables_by_agent() if agent_registry is not None else None
+    )
+    agent_vscode_extensions = (
+        agent_registry.vscode_extensions_by_agent()
+        if agent_registry is not None else None
+    )
     return vscode_core.detect_installed_agents(
+        agent_executables=agent_executables,
+        agent_vscode_extensions=agent_vscode_extensions,
         which=shutil.which, run=subprocess.run)
 
 
@@ -62,64 +68,42 @@ def install_service(
 
 def install_agent_hooks(
     *,
+    agent_registry: AgentRegistry,
     enabled_agents: set[str],
     script_path: str,
-    claude_settings_path: str,
-    codex_home: str,
-    copilot_home: str,
     hook_wait_ceiling: int,
     remote_permissions: bool = False,
     remote_questions: bool = False,
     permission_timeout: int = 60,
     log=None,
 ) -> None:
-    if "claude" in enabled_agents:
-        claude_agent.install_hooks(
-            claude_settings_path,
-            script_path,
-            hook_wait_ceiling=hook_wait_ceiling,
-            remote_permissions=remote_permissions,
-            remote_questions=remote_questions,
-            permission_timeout=permission_timeout,
-            vprint=log,
-        )
-    if "copilot" in enabled_agents:
-        copilot_agent.install_hooks(
-            copilot_agent.hooks_path(copilot_home),
-            script_path,
-            hook_wait_ceiling=hook_wait_ceiling,
-            remote_permissions=remote_permissions,
-            permission_timeout=permission_timeout,
-        )
-    if "codex" in enabled_agents:
-        codex_agent.install_hooks(
-            codex_agent.hooks_path(codex_home),
-            script_path,
-            hook_wait_ceiling=hook_wait_ceiling,
-            remote_permissions=remote_permissions,
-            remote_questions=remote_questions,
-            permission_timeout=permission_timeout,
-            vprint=log,
-        )
+    agent_registry.install_hooks(
+        enabled_agents=enabled_agents,
+        script_path=script_path,
+        hook_wait_ceiling=hook_wait_ceiling,
+        remote_permissions=remote_permissions,
+        remote_questions=remote_questions,
+        permission_timeout=permission_timeout,
+        log=log,
+    )
 
 
 def uninstall(
     *,
-    claude_settings_path: str,
-    codex_home: str,
-    copilot_home: str,
+    agent_registry: AgentRegistry,
     policy_path: str,
     config_home: str,
     socket_path: str,
     monitor_state_dir: str,
 ) -> None:
     """Remove codelight hooks, local state, service, and optional clients."""
-    hooks_core.remove_matcher_group_hooks(claude_settings_path)
-    hooks_core.remove_matcher_group_hooks(codex_agent.hooks_path(codex_home))
+    for path in agent_registry.removable_hook_paths():
+        hooks_core.remove_matcher_group_hooks(path)
 
-    copilot_hooks = copilot_agent.hooks_path(copilot_home)
-    service_core.remove_file(copilot_hooks)
-    service_core.remove_empty_dir(os.path.dirname(copilot_hooks))
+    for path in agent_registry.removable_files():
+        service_core.remove_file(path)
+    for path in agent_registry.removable_empty_dirs():
+        service_core.remove_empty_dir(path)
 
     service_core.remove_file(policy_path)
     service_core.remove_empty_dir(config_home)

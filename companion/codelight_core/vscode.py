@@ -31,12 +31,16 @@ AGENT_VSCODE_EXTENSIONS = {
 
 def detect_installed_agents(
     *,
+    agent_executables: dict[str, tuple[str, ...]] | None = None,
+    agent_vscode_extensions: dict[str, set[str]] | None = None,
     which: Callable[[str], str | None] = shutil.which,
     run=subprocess.run,
 ) -> set[str]:
     """Detect supported agents from CLIs and local VSCode extensions."""
+    executables_by_agent = agent_executables or AGENT_EXECUTABLES
+    extensions_by_agent = agent_vscode_extensions or AGENT_VSCODE_EXTENSIONS
     detected = {
-        agent for agent, executables in AGENT_EXECUTABLES.items()
+        agent for agent, executables in executables_by_agent.items()
         if any(which(exe) for exe in executables)
     }
     installed_extensions: set[str] = set()
@@ -53,7 +57,7 @@ def detect_installed_agents(
             )
         except Exception:
             continue
-    for agent, extension_ids in AGENT_VSCODE_EXTENSIONS.items():
+    for agent, extension_ids in extensions_by_agent.items():
         if installed_extensions.intersection(extension_ids):
             detected.add(agent)
     return detected
