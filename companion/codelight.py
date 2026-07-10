@@ -16,7 +16,7 @@ import signal
 import sys
 import threading
 import time
-from datetime import datetime, timezone
+from datetime import datetime
 from codelight_core.agents import codex as codex_agent
 from codelight_core.agents import copilot as copilot_agent
 from codelight_core import auth as auth_core
@@ -547,46 +547,9 @@ def _usage_fetchers() -> UsageFetchers:
         copilot_home=COPILOT_HOME,
         github_org=_github_org,
         github_token_file=_github_token_file,
-        github_api=_github_api,
+        github_api=copilot_agent.github_api,
         log=vprint,
     )
-
-
-def get_usage() -> dict | None:
-    """
-    Fetch usage from the claude.ai OAuth usage API.
-    Returns a dict with session_pct/weekly_pct/resets, or None on failure
-    (caller keeps cached values).
-    """
-    return _usage_fetchers().get_claude_usage()
-
-
-def _usage_from_codex_rollout(path: str) -> dict | None:
-    """Read the newest Codex 5-hour and weekly rate-limit snapshot."""
-    return _usage_fetchers().codex_usage_from_rollout(path)
-
-
-def get_codex_usage() -> dict | None:
-    return _usage_fetchers().get_codex_usage()
-
-
-def _github_api(path: str, token: str) -> dict:
-    return copilot_agent.github_api(path, token)
-
-
-def _next_month_start(now: datetime) -> int:
-    return copilot_agent.next_month_start(now)
-
-
-def get_copilot_usage(org: str | None = None, token: str | None = None,
-                      now: datetime | None = None) -> dict | None:
-    """Fetch the organization's pooled monthly Copilot AI-credit usage.
-
-    Missing credentials, insufficient billing permission, and organizations
-    without enhanced billing all return None. Clients then keep showing the
-    Copilot activity status without inventing a zero-percent limit.
-    """
-    return _usage_fetchers().get_copilot_usage(org=org, token=token, now=now)
 
 
 def _push() -> None:
@@ -709,9 +672,7 @@ def _usage_thread() -> None:
     """Refresh supported-agent usage and broadcast after each update."""
     UsagePoller(
         state=_state,
-        fetch_claude=get_usage,
-        fetch_codex=get_codex_usage,
-        fetch_copilot=get_copilot_usage,
+        fetchers=_usage_fetchers().usage_fetchers(),
         interval=USAGE_INTERVAL,
         shutdown=_shutdown,
         log=_log,

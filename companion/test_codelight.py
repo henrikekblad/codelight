@@ -5,6 +5,7 @@ import tempfile
 import threading
 import unittest
 import urllib.error
+from datetime import datetime, timezone
 from unittest import mock
 
 sys.path.insert(0, os.path.dirname(__file__))
@@ -158,7 +159,7 @@ class CodexUsageTests(unittest.TestCase):
             with os.fdopen(fd, "w") as stream:
                 for record in records:
                     stream.write(json.dumps(record) + "\n")
-            usage = codelight._usage_from_codex_rollout(path)
+            usage = codex_agent.usage_from_rollout(path)
         finally:
             os.unlink(path)
 
@@ -193,10 +194,10 @@ class CopilotUsageTests(unittest.TestCase):
                 "seat_breakdown": {"total": 7},
             }
 
-        with mock.patch.object(codelight, "_github_api", side_effect=api):
-            usage = codelight.get_copilot_usage(
+        usage = copilot_agent.get_usage(
                 "Drivec-AB", "token",
-                codelight.datetime(2026, 7, 9, tzinfo=codelight.timezone.utc))
+                datetime(2026, 7, 9, tzinfo=timezone.utc),
+                api=api)
 
         self.assertIsNotNone(usage)
         self.assertEqual(usage["used_credits"], 2100)
@@ -207,10 +208,13 @@ class CopilotUsageTests(unittest.TestCase):
     def test_permission_failure_omits_detailed_usage(self):
         error = urllib.error.HTTPError(
             "https://api.github.com/test", 403, "Forbidden", {}, None)
-        with mock.patch.object(codelight, "_github_api", side_effect=error):
-            self.assertIsNone(codelight.get_copilot_usage(
+        try:
+            self.assertIsNone(copilot_agent.get_usage(
                 "Drivec-AB", "token",
-                codelight.datetime(2026, 7, 9, tzinfo=codelight.timezone.utc)))
+                datetime(2026, 7, 9, tzinfo=timezone.utc),
+                api=error))
+        finally:
+            error.close()
 
     def test_events_path_for_session_stays_inside_copilot_home(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -452,7 +456,7 @@ class UsagePollerTests(unittest.TestCase):
             )
 
             usage = fetchers.get_copilot_usage(
-                now=codelight.datetime(2026, 7, 9, tzinfo=codelight.timezone.utc)
+                now=datetime(2026, 7, 9, tzinfo=timezone.utc)
             )
 
             self.assertEqual(fetchers.github_token(), "token")

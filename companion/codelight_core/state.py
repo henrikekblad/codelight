@@ -45,9 +45,9 @@ class CodelightState:
         self._idle_window = idle_window
         self._idle_window_waiting = idle_window_waiting
         self._sessions: dict[str, dict[str, Any]] = {}
-        self._usage_cache: dict[str, Any] = dict(DEFAULT_USAGE)
-        self._codex_usage_cache: dict[str, Any] = {}
-        self._copilot_usage_cache: dict[str, Any] = {}
+        self._usage_caches: dict[str, dict[str, Any]] = {
+            self._default_agent_id: dict(DEFAULT_USAGE),
+        }
         self._last_transcript: dict[str, str] = {"sid": "", "path": ""}
         self._last_active_agent: str = default_agent_id
 
@@ -161,81 +161,114 @@ class CodelightState:
     def update_usage(
         self,
         *,
+        usages: dict[str, dict[str, Any] | None] | None = None,
+        clear_missing: bool = False,
         claude: dict[str, Any] | None = None,
         codex: dict[str, Any] | None = None,
         copilot: dict[str, Any] | None = None,
         clear_codex: bool = False,
         clear_copilot: bool = False,
     ) -> None:
+        """Update per-agent usage caches.
+
+        ``usages`` is the preferred generic API. The named parameters remain as
+        compatibility sugar for older tests/helpers while the daemon is being
+        split into agent-owned components.
+        """
+        incoming: dict[str, dict[str, Any] | None] = {}
+        if usages:
+            incoming.update(usages)
+        if claude is not None:
+            incoming["claude"] = claude
+        if codex is not None:
+            incoming["codex"] = codex
+        elif clear_codex:
+            incoming["codex"] = None
+        if copilot is not None:
+            incoming["copilot"] = copilot
+        elif clear_copilot:
+            incoming["copilot"] = None
+
         with self._lock:
-            if claude is not None:
-                self._usage_cache.update(claude)
-            if codex is not None:
-                self._codex_usage_cache.update(codex)
-            elif clear_codex:
-                self._codex_usage_cache.clear()
-            if copilot is not None:
-                self._copilot_usage_cache.update(copilot)
-            elif clear_copilot:
-                self._copilot_usage_cache.clear()
+            if clear_missing:
+                for agent_id in list(self._usage_caches):
+                    if agent_id == self._default_agent_id:
+                        continue
+                    if agent_id not in incoming:
+                        del self._usage_caches[agent_id]
+            for agent_id, usage in incoming.items():
+                aid = self.normalize_agent_id(agent_id)
+                if usage is None:
+                    if aid == self._default_agent_id:
+                        self._usage_caches[aid] = dict(DEFAULT_USAGE)
+                    else:
+                        self._usage_caches.pop(aid, None)
+                    continue
+                current = self._usage_caches.setdefault(
+                    aid,
+                    dict(DEFAULT_USAGE) if aid == self._default_agent_id else {},
+                )
+                current.update(usage)
 
     def usage_snapshot(self) -> dict[str, Any]:
         with self._lock:
-            return dict(self._usage_cache)
+            return dict(self._usage_caches.get(self._default_agent_id, DEFAULT_USAGE))
+
+    def _meter_usage(self, agent_id: str,
+                     usage: dict[str, Any]) -> tuple[dict[str, Any], str, str]:
+        if "monthly_pct" in usage and "weekly_pct" not in usage:
+            display = self.agent_display_name(agent_id)
+            return (
+                {
+                    "weekly_pct": usage.get("monthly_pct", 0.0),
+                    "weekly_reset": usage.get("monthly_reset", "--"),
+                    "weekly_reset_at": usage.get("monthly_reset_at", 0),
+                    "session_pct": 0.0,
+                    "session_reset": "--",
+                    "session_reset_at": 0,
+                },
+                f"{display} Monthly",
+                "",
+            )
+        weekly_title, session_title = self.agent_meter_titles(agent_id)
+        return dict(usage), weekly_title, session_title
+
+    def _per_agent_usage(self, snapshots: dict[str, dict[str, Any]]) -> dict[str, Any]:
+        per_agent_usage: dict[str, Any] = {}
+        for agent_id, usage in snapshots.items():
+            if not usage:
+                continue
+            entry = {
+                **usage,
+                "agent_display": self.agent_display_name(agent_id),
+            }
+            limits = self._usage_limits(usage)
+            if limits:
+                entry["limits"] = limits
+            per_agent_usage[agent_id] = entry
+        return per_agent_usage
 
     def status_snapshot(self, pending_session_ids: set[str] | None = None) -> dict[str, Any]:
         sessions, status, per_agent_status, last_agent = self.overall_status(pending_session_ids)
 
         with self._lock:
-            usage_snap = dict(self._usage_cache)
-            codex_snap = dict(self._codex_usage_cache)
-            copilot_snap = dict(self._copilot_usage_cache)
-
-        if last_agent == "copilot" and copilot_snap:
-            meter_agent = "copilot"
-            usage = {
-                "weekly_pct": copilot_snap.get("monthly_pct", 0.0),
-                "weekly_reset": copilot_snap.get("monthly_reset", "--"),
-                "weekly_reset_at": copilot_snap.get("monthly_reset_at", 0),
-                "session_pct": 0.0,
-                "session_reset": "--",
-                "session_reset_at": 0,
+            usage_snaps = {
+                agent_id: dict(usage)
+                for agent_id, usage in self._usage_caches.items()
             }
-            weekly_title = "Copilot Monthly"
-            session_title = ""
-        elif last_agent == "codex" and codex_snap:
-            meter_agent = "codex"
-            usage = codex_snap
-            weekly_title, session_title = self.agent_meter_titles(meter_agent)
+
+        last_usage = usage_snaps.get(last_agent)
+        if last_usage:
+            meter_agent = last_agent
+            usage, weekly_title, session_title = self._meter_usage(
+                meter_agent, last_usage)
         else:
             meter_agent = self._default_agent_id
-            usage = usage_snap
-            weekly_title, session_title = self.agent_meter_titles(meter_agent)
-
-        per_agent_usage = {
-            "claude": {
-                **usage_snap,
-                "agent_display": self.agent_display_name("claude"),
-                "limits": [
-                    self._usage_limit("Weekly", usage_snap, "weekly"),
-                    self._usage_limit("Session", usage_snap, "session"),
-                ],
-            },
-        }
-        if codex_snap:
-            per_agent_usage["codex"] = {
-                **codex_snap,
-                "agent_display": self.agent_display_name("codex"),
-                "limits": [
-                    self._usage_limit("Weekly", codex_snap, "weekly"),
-                    self._usage_limit("Session", codex_snap, "session"),
-                ],
-            }
-        if copilot_snap:
-            per_agent_usage["copilot"] = {
-                **copilot_snap,
-                "agent_display": self.agent_display_name("copilot"),
-            }
+            usage, weekly_title, session_title = self._meter_usage(
+                meter_agent,
+                usage_snaps.get(meter_agent, dict(DEFAULT_USAGE)),
+            )
+        per_agent_usage = self._per_agent_usage(usage_snaps)
 
         return {
             **usage,
@@ -249,6 +282,17 @@ class CodelightState:
             "weekly_title": weekly_title,
             "session_title": session_title,
         }
+
+    @staticmethod
+    def _usage_limits(usage: dict[str, Any]) -> list[dict[str, Any]]:
+        if "weekly_pct" in usage or "session_pct" in usage:
+            return [
+                CodelightState._usage_limit("Weekly", usage, "weekly"),
+                CodelightState._usage_limit("Session", usage, "session"),
+            ]
+        if "monthly_pct" in usage:
+            return [CodelightState._usage_limit("Monthly", usage, "monthly")]
+        return []
 
     @staticmethod
     def _usage_limit(label: str, usage: dict[str, Any], prefix: str) -> dict[str, Any]:
