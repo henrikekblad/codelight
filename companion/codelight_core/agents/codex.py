@@ -97,7 +97,11 @@ def transcript_extractor(record: dict, tool_summary) -> tuple[str, object] | Non
     return None
 
 
-def build_integration(agent: CodexAgent, *, home: str) -> base.AgentIntegration:
+def build_integration(config: dict) -> base.AgentIntegration:
+    """Config keys (~/.config/codelight/config.json, agents.codex): home."""
+    home = (os.path.expanduser(str(config.get("home") or ""))
+            or default_home())
+    agent = CodexAgent(home)
     hooks_file = hooks_path(home)
 
     def _install_hooks(*, script_path, hook_wait_ceiling, remote_permissions,
@@ -114,6 +118,7 @@ def build_integration(agent: CodexAgent, *, home: str) -> base.AgentIntegration:
 
     return base.AgentIntegration(
         spec=SPEC,
+        agent=agent,
         hook_modes=HOOK_MODES,
         usage_fetcher=agent.get_usage,
         install_hooks=_install_hooks,

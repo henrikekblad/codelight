@@ -41,8 +41,6 @@ def install_service(
     remote_control: bool = False,
     permission_timeout: int = 60,
     agents: set[str] | None = None,
-    github_org: str = "",
-    github_token_file: str = "",
 ) -> None:
     service_core.install_service(
         name=name,
@@ -53,8 +51,6 @@ def install_service(
         remote_control=remote_control,
         permission_timeout=permission_timeout,
         agents=agents,
-        github_org=github_org,
-        github_token_file=github_token_file,
         run=subprocess.run,
     )
 
@@ -88,7 +84,6 @@ def uninstall(
     config_home: str,
     socket_path: str,
     monitor_state_dir: str,
-    legacy_paths: tuple[str, ...] = (),
 ) -> None:
     """Remove codelight hooks, local state, service, and optional clients."""
     for path in agent_registry.removable_hook_paths():
@@ -102,7 +97,7 @@ def uninstall(
     service_core.remove_file(policy_path)
     service_core.remove_empty_dir(config_home)
 
-    for path in [socket_path, monitor_state_dir, *legacy_paths]:
+    for path in [socket_path, monitor_state_dir]:
         service_core.remove_path(path)
 
     service_core.uninstall_service(run=subprocess.run)

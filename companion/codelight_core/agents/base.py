@@ -62,8 +62,10 @@ class AgentSpec:
 class AgentIntegration:
     """Everything the registry needs to know about one agent.
 
-    Each agent module exports ``build_integration(...)`` returning one of
-    these; adding an agent means adding a module and registering its
+    Each agent module exports ``build_integration(config, ...)`` returning
+    one of these, where ``config`` is the agent's section of the user's
+    ~/.config/codelight/config.json (all keys optional; the module supplies
+    defaults). Adding an agent means adding a module and registering its
     integration — no registry or client branching.
 
     ``install_hooks`` is keyword-only: (script_path, hook_wait_ceiling,
@@ -71,6 +73,8 @@ class AgentIntegration:
     """
 
     spec: AgentSpec
+    # The module's live agent object (usage fetching, transcript lookups).
+    agent: object = None
     hook_modes: tuple[HookMode, ...] = ()
     usage_fetcher: UsageFetcher | None = None
     install_hooks: Callable[..., None] | None = None

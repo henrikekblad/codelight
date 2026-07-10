@@ -65,7 +65,22 @@ def transcript_extractor(record: dict, tool_summary) -> tuple[str, object] | Non
     return None
 
 
-def build_integration(agent: ClaudeAgent, *, settings_path: str) -> base.AgentIntegration:
+def build_integration(
+    config: dict,
+    *,
+    usage_api: str = USAGE_API,
+    log: Callable[[str], None] | None = None,
+) -> base.AgentIntegration:
+    """Config keys (~/.config/codelight/config.json, agents.claude):
+    settings_path, credentials_path."""
+    settings_path = (
+        os.path.expanduser(str(config.get("settings_path") or ""))
+        or default_settings_path())
+    credentials_path = (
+        os.path.expanduser(str(config.get("credentials_path") or ""))
+        or default_credentials_path())
+    agent = ClaudeAgent(credentials_path, usage_api=usage_api, log=log)
+
     def _install_hooks(*, script_path, hook_wait_ceiling, remote_permissions,
                        remote_questions, permission_timeout, log=None):
         install_hooks(
@@ -80,6 +95,7 @@ def build_integration(agent: ClaudeAgent, *, settings_path: str) -> base.AgentIn
 
     return base.AgentIntegration(
         spec=SPEC,
+        agent=agent,
         hook_modes=HOOK_MODES,
         usage_fetcher=agent.get_usage,
         install_hooks=_install_hooks,

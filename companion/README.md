@@ -70,17 +70,25 @@ raw API responses) to the activity log.
 ### Company Copilot usage
 
 To show the organization's pooled monthly Copilot AI-credit limit in supported
-clients, configure its GitHub slug:
+clients, configure its GitHub slug in `~/.config/codelight/config.json`:
 
-```bash
-python3 companion/codelight.py --name my-laptop --github-org Drivec-AB
+```json
+{
+  "agents": {
+    "copilot": {
+      "github_org": "Sensnology-AB"
+    }
+  }
+}
 ```
+
+Agent-specific configuration keys are documented in `companion/AGENTS.md`.
 
 The companion calls GitHub's REST API directly; the `gh` command is not
 required. Credentials are resolved in this order:
 
 1. `CODELIGHT_GITHUB_TOKEN`, `GITHUB_TOKEN`, or `GH_TOKEN`
-2. `--github-token-file PATH`
+2. `agents.copilot.github_token_file` in `~/.config/codelight/config.json`
 3. The existing `gh auth token`, when the CLI happens to be installed
 
 The token needs read access to Copilot subscription and organization billing
@@ -95,7 +103,7 @@ The `--install` flag writes the unit file and enables the service in one step:
 python3 companion/codelight.py --install --name my-laptop
 python3 companion/codelight.py --install --name my-laptop --secret mypassword
 python3 companion/codelight.py --install --name my-laptop \
-  --secret mypassword --remote-control --github-org Drivec-AB
+  --secret mypassword --remote-control
 ```
 
 No per-agent install flags are needed. The detected agent set is stored in the
@@ -275,51 +283,52 @@ flowchart LR
     DBUS -->|status + remote control| GNOME["GNOME extension<br/>auto-discovers"]
 ```
 
-Status updates reach clients the moment a Claude Code hook fires — there is no
+Status updates reach clients the moment an enabled agent hook fires — there is no
 polling delay on the client side.
 
 ### Status detection and conversation following
 
-Claude Code hooks are shell commands invoked at specific points during a session.
-On first run, `codelight.py` registers entries in `~/.claude/settings.json` for
-events such as `PreToolUse`, `PostToolUse`, `PermissionRequest`, and `SessionEnd`.
-When an event fires, Claude Code runs:
+Status detection is now agent-agnostic and driven by the integration registry.
+At startup, codelight detects installed agents (Claude, Copilot, Codex), then
+installs hooks for each enabled integration:
 
-```
-python3 codelight.py --hook working
-```
+- Claude hooks are merged into the configured Claude settings file.
+- Copilot hooks are written to codelight's owned hooks file under its home directory.
+- Codex hooks are merged into its hooks file (with Codex trust review via `/hooks`).
 
-with session metadata on stdin. The hook mode connects to a Unix socket at
-`~/.claude/codelight.sock`, sends a one-line JSON event, and exits in ~1 ms.
-The daemon's socket thread receives the event, updates its in-memory session
-state, and immediately broadcasts to all connected clients. If the daemon is not
-running the hook falls back to writing a state file so no errors appear in the
-terminal.
+Each hook invokes codelight in hook mode and sends one normalized event over the
+Unix socket at `~/.config/codelight/codelight.sock`. The daemon updates per-session
+state tagged with `agent_id`, computes per-agent and overall status, and broadcasts
+the snapshot to WebSocket and D-Bus clients immediately. If the daemon is not
+available, hooks fall back to monitor-state files under
+`~/.config/codelight/monitor_state`.
 
-When a hook supplies a transcript/event path, the daemon follows the newest
-active conversation and publishes a read-only normalized feed to subscribed
-Android clients. Claude JSONL, Codex rollout events, and Copilot event logs are
-converted into the same user/assistant/tool/output shape. The feed intentionally
-does not inject messages into an active agent session.
+Conversation following uses agent-specific transcript extractors registered by each
+integration. Claude JSONL, Codex rollout JSONL, and Copilot events JSONL are all
+normalized into the same read-only `user`/`assistant`/`tool`/`output` feed so clients
+do not need agent-specific parsing. The feed is observational only and never injects
+messages into a running agent session.
 
-### Usage data — claude.ai API
+### Usage data — multi-agent poller
 
-Every 60 seconds the usage thread fetches `https://claude.ai/api/oauth/usage`
-using the OAuth access token from `~/.claude/.credentials.json` — the same
-credential Claude Code itself uses, so no extra authentication is needed. The
-response contains:
+Every 60 seconds, one usage poll cycle runs across all registered agent
+integrations. Each integration provides its own usage fetcher and data mapping,
+so failures in one source do not block others.
 
-- `five_hour.utilization` — current 5-hour session window (0–100 %)
-- `seven_day.utilization` — rolling 7-day total (0–100 %)
-- `resets_at` — ISO-8601 timestamp for each window reset
+- Claude usage is fetched from the Claude OAuth usage API (`five_hour` and
+  `seven_day` utilization windows with reset timestamps).
+- Codex usage is read locally from recent rollout `token_count` rate-limit events
+  (session and weekly windows).
+- Copilot usage is fetched from GitHub organization billing and Copilot seat data
+  when `agents.copilot.github_org` is configured.
 
-Values are cached so clients always show something even when the API is
-temporarily unreachable.
+The daemon stores usage per agent and publishes a unified `per_agent_usage` model
+to all clients. Each client can then render grouped limits (for example, Claude
+session/weekly, Codex session/weekly, Copilot monthly) with consistent labels and
+agent branding.
 
-Codex usage is read from the newest local rollout rate-limit event. Company
-Copilot usage uses GitHub's organization billing and seat APIs when
-`--github-org` is configured; clients omit the Copilot bar when credentials do
-not have access rather than displaying a misleading zero.
+Configuration for usage credentials and agent homes lives in
+`~/.config/codelight/config.json`; see `companion/AGENTS.md` for all supported keys.
 
 <img src="../assets/companion-dashboard.png" width="760"
      alt="codelight terminal dashboard with grouped Claude, Copilot, and Codex usage">

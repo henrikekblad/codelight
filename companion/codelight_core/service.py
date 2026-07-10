@@ -16,8 +16,6 @@ def build_args_line(
     remote_control: bool = False,
     permission_timeout: int = 60,
     agents: set[str] | None = None,
-    github_org: str = "",
-    github_token_file: str = "",
 ) -> str:
     args_line = f"--name {shlex.quote(name)}"
     if secret:
@@ -33,10 +31,6 @@ def build_args_line(
     enabled_agents = sorted(agents or set())
     if enabled_agents:
         args_line += f" --agents {','.join(enabled_agents)}"
-    if github_org:
-        args_line += f" --github-org {shlex.quote(github_org)}"
-    if github_token_file:
-        args_line += f" --github-token-file {shlex.quote(github_token_file)}"
     return args_line
 
 
@@ -67,8 +61,6 @@ def install_service(
     remote_control: bool = False,
     permission_timeout: int = 60,
     agents: set[str] | None = None,
-    github_org: str = "",
-    github_token_file: str = "",
     run=subprocess.run,
 ) -> None:
     """Write ~/.config/systemd/user/codelight.service and enable it."""
@@ -81,8 +73,6 @@ def install_service(
         remote_control=remote_control,
         permission_timeout=permission_timeout,
         agents=agents,
-        github_org=github_org,
-        github_token_file=github_token_file,
     )
     unit = render_unit(
         python_path=python_path,

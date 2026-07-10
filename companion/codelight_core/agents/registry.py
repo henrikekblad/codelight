@@ -29,48 +29,28 @@ class AgentRegistry:
     def __init__(
         self,
         *,
-        claude_settings_path: str = "",
-        claude_credentials_path: str = "",
-        codex_home: str = "",
-        copilot_home: str = "",
+        agents_config: dict | None = None,
         claude_usage_api: str = claude_agent.USAGE_API,
-        github_org: str = "",
-        github_token_file: str = "",
         github_api: Callable[[str, str], dict] | None = None,
         log: Logger | None = None,
         extra_agents: Sequence[AgentIntegration] = (),
     ) -> None:
-        self.claude_settings_path = (
-            claude_settings_path or claude_agent.default_settings_path())
-        self.claude_credentials_path = (
-            claude_credentials_path or claude_agent.default_credentials_path())
-        self.claude_usage_api = claude_usage_api
-        self.codex_home = codex_home or codex_agent.default_home()
-        self.copilot_home = copilot_home or copilot_agent.default_home()
-        self.github_org = github_org
-        self.github_token_file = github_token_file
-        self.log = log
+        """``agents_config`` is the "agents" section of the user's
+        ~/.config/codelight/config.json: {agent_id: {key: value}}. Each agent
+        module documents and consumes its own keys; everything is optional.
+        """
+        config = agents_config or {}
 
-        self.claude = claude_agent.ClaudeAgent(
-            self.claude_credentials_path,
-            usage_api=claude_usage_api,
-            log=log,
-        )
-        self.codex = codex_agent.CodexAgent(self.codex_home)
-        self.copilot = copilot_agent.CopilotAgent(
-            github_org,
-            copilot_home=self.copilot_home,
-            token_file=github_token_file,
-            api=github_api,
-            log=log,
-        )
+        def section(agent_id: str) -> dict:
+            value = config.get(agent_id)
+            return value if isinstance(value, dict) else {}
 
         integrations = [
             claude_agent.build_integration(
-                self.claude, settings_path=self.claude_settings_path),
+                section("claude"), usage_api=claude_usage_api, log=log),
             copilot_agent.build_integration(
-                self.copilot, home=self.copilot_home),
-            codex_agent.build_integration(self.codex, home=self.codex_home),
+                section("copilot"), api=github_api, log=log),
+            codex_agent.build_integration(section("codex")),
             *extra_agents,
         ]
         self._integrations: dict[str, AgentIntegration] = {}
@@ -92,6 +72,11 @@ class AgentRegistry:
         are shown when nothing is active.
         """
         return next(iter(self._integrations))
+
+    def agent(self, agent_id: str) -> object | None:
+        """The agent module's live agent object, or None if unknown."""
+        integration = self._integrations.get(agent_id)
+        return integration.agent if integration else None
 
     def display_registry(self) -> dict[str, dict[str, str]]:
         return {
@@ -163,9 +148,6 @@ class AgentRegistry:
             for agent_id, integration in self._integrations.items()
             if integration.usage_fetcher is not None
         }
-
-    def github_token(self) -> str:
-        return self.copilot.token()
 
     def install_hooks(
         self,

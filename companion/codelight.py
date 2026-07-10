@@ -11,6 +11,7 @@ Usage:
 import argparse
 import asyncio
 import collections
+import json
 import os
 import signal
 import sys
@@ -47,11 +48,6 @@ CODELIGHT_CONFIG_HOME = os.path.expanduser(
 MONITOR_STATE_DIR = os.path.join(CODELIGHT_CONFIG_HOME, "monitor_state")
 SOCKET_PATH       = os.path.join(CODELIGHT_CONFIG_HOME, "codelight.sock")
 POLICY_PATH       = os.path.join(CODELIGHT_CONFIG_HOME, "policy.json")
-# Pre-1.x locations, cleaned up on uninstall.
-LEGACY_STATE_PATHS = (
-    os.path.expanduser("~/.claude/monitor_state"),
-    os.path.expanduser("~/.claude/codelight.sock"),
-)
 USAGE_INTERVAL      = 60   # seconds between usage API polls
 IDLE_WINDOW         = 600  # seconds before a silent "working" session is dropped
 IDLE_WINDOW_WAITING = 30   # seconds before a "waiting" session is dropped (subagents resolve quickly)
@@ -68,8 +64,6 @@ _shutdown = threading.Event()
 
 _policy_lock: threading.Lock = threading.Lock()
 # session_id → {"state": "working"|"waiting", "time": float}
-_github_org: str = ""
-_github_token_file: str = ""
 
 _ws_hub: CodelightWebsocketHub | None = None
 
@@ -95,10 +89,27 @@ _log_lines:       collections.deque = collections.deque(maxlen=10)
 _conversation_refresher: ConversationRefresher | None = None
 _remote_manager: remote_control.RemoteRequestManager | None = None
 
+def _load_config() -> dict:
+    """~/.config/codelight/config.json — see companion/AGENTS.md for keys."""
+    try:
+        with open(os.path.join(CODELIGHT_CONFIG_HOME, "config.json")) as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else {}
+    except FileNotFoundError:
+        return {}
+    except Exception as e:
+        print(f"[config] could not read config.json: {e}",
+              file=sys.stderr, flush=True)
+        return {}
+
+
+_config = _load_config()
+
+
 def _new_agent_registry(log=None) -> AgentRegistry:
+    agents_config = _config.get("agents")
     return AgentRegistry(
-        github_org=_github_org,
-        github_token_file=_github_token_file,
+        agents_config=agents_config if isinstance(agents_config, dict) else {},
         log=log,
     )
 
@@ -673,7 +684,6 @@ def uninstall() -> None:
         config_home=CODELIGHT_CONFIG_HOME,
         socket_path=SOCKET_PATH,
         monitor_state_dir=MONITOR_STATE_DIR,
-        legacy_paths=LEGACY_STATE_PATHS,
     )
 
 
@@ -720,13 +730,6 @@ def main():
     parser.add_argument("--vscode", action="store_true",
                         help="With --install: also install the codelight VSCode "
                              "extension from the latest GitHub release")
-    parser.add_argument("--github-org", default=os.environ.get("CODELIGHT_GITHUB_ORG", ""),
-                        help="GitHub organization whose pooled Copilot AI-credit "
-                             "usage should be shown")
-    parser.add_argument("--github-token-file", default="",
-                        help="File containing a GitHub token for Copilot billing. "
-                             "Alternatively set CODELIGHT_GITHUB_TOKEN; if neither "
-                             "is set, the gh credential is used when available.")
     args = parser.parse_args()
 
     if args.command == "dashboard":
@@ -755,8 +758,6 @@ def main():
             remote_control=args.remote_control,
             permission_timeout=args.permission_timeout,
             agents=detected_agents,
-            github_org=args.github_org,
-            github_token_file=args.github_token_file,
         )
         if args.vscode:
             lifecycle.install_vscode_extension(
@@ -782,12 +783,9 @@ def main():
     _verbose = args.verbose
 
     global _remote_permissions, _remote_questions, _permission_timeout
-    global _github_org, _github_token_file
     _permission_timeout = args.permission_timeout
     _remote_permissions = args.remote_control
     _remote_questions   = args.remote_control
-    _github_org = args.github_org
-    _github_token_file = args.github_token_file
     if args.remote_control and not args.secret:
         print("[rc] --remote-control requires --secret — feature disabled",
               file=sys.stderr, flush=True)

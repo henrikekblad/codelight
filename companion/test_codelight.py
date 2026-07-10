@@ -201,7 +201,7 @@ class CopilotUsageTests(unittest.TestCase):
             }
 
         usage = copilot_agent.get_usage(
-                "Drivec-AB", "token",
+                "Sensnology-AB", "token",
                 datetime(2026, 7, 9, tzinfo=timezone.utc),
                 api=api)
 
@@ -216,7 +216,7 @@ class CopilotUsageTests(unittest.TestCase):
             "https://api.github.com/test", 403, "Forbidden", {}, None)
         try:
             self.assertIsNone(copilot_agent.get_usage(
-                "Drivec-AB", "token",
+                "Sensnology-AB", "token",
                 datetime(2026, 7, 9, tzinfo=timezone.utc),
                 api=error))
         finally:
@@ -347,6 +347,24 @@ class AgentDetectionTests(unittest.TestCase):
 
 
 class ClientConfigTests(unittest.TestCase):
+    def test_load_config_reads_agents_section(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            with open(os.path.join(tmp, "config.json"), "w") as stream:
+                json.dump({"agents": {"copilot": {"github_org": "Org"}}}, stream)
+            with mock.patch.object(codelight, "CODELIGHT_CONFIG_HOME", tmp):
+                config = codelight._load_config()
+
+        self.assertEqual(config["agents"]["copilot"]["github_org"], "Org")
+
+    def test_load_config_tolerates_missing_or_broken_file(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            with mock.patch.object(codelight, "CODELIGHT_CONFIG_HOME", tmp):
+                self.assertEqual(codelight._load_config(), {})
+            with open(os.path.join(tmp, "config.json"), "w") as stream:
+                stream.write("not json")
+            with mock.patch.object(codelight, "CODELIGHT_CONFIG_HOME", tmp):
+                self.assertEqual(codelight._load_config(), {})
+
     def test_client_config_carries_agent_branding(self):
         config = codelight._client_config()
 
@@ -612,21 +630,28 @@ class UsagePollerTests(unittest.TestCase):
                 }
 
             registry = AgentRegistry(
-                claude_settings_path=os.path.join(tmp, "settings.json"),
-                claude_credentials_path=os.path.join(tmp, "missing.json"),
+                agents_config={
+                    "claude": {
+                        "settings_path": os.path.join(tmp, "settings.json"),
+                        "credentials_path": os.path.join(tmp, "missing.json"),
+                    },
+                    "codex": {"home": tmp},
+                    "copilot": {
+                        "home": tmp,
+                        "github_org": "Org",
+                        "github_token_file": token_file,
+                    },
+                },
                 claude_usage_api="https://example.invalid",
-                codex_home=tmp,
-                copilot_home=tmp,
-                github_org="Org",
-                github_token_file=token_file,
                 github_api=api,
             )
 
-            usage = registry.copilot.get_usage(
+            copilot = registry.agent("copilot")
+            usage = copilot.get_usage(
                 now=datetime(2026, 7, 9, tzinfo=timezone.utc)
             )
 
-            self.assertEqual(registry.github_token(), "token")
+            self.assertEqual(copilot.token(), "token")
             self.assertEqual(set(registry.usage_fetchers()), {"claude", "codex", "copilot"})
             self.assertIsNotNone(usage)
             self.assertEqual(usage["used_credits"], 100)
@@ -693,16 +718,13 @@ class ServiceInstallTests(unittest.TestCase):
             remote_control=True,
             permission_timeout=42,
             agents={"codex", "claude"},
-            github_org="Drivec AB",
-            github_token_file="/tmp/token file",
         )
 
         self.assertEqual(
             args,
             "--name 'henrik laptop' --secret 'secret value' --ws-port 9999 "
             "--verbose --remote-control --permission-timeout 42 "
-            "--agents claude,codex --github-org 'Drivec AB' "
-            "--github-token-file '/tmp/token file'",
+            "--agents claude,codex",
         )
 
     def test_uninstall_service_removes_unit_and_reloads_systemd(self):

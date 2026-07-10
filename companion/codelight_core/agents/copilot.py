@@ -92,7 +92,28 @@ def transcript_extractor(record: dict, tool_summary) -> tuple[str, object] | Non
     return None
 
 
-def build_integration(agent: CopilotAgent, *, home: str) -> base.AgentIntegration:
+def build_integration(
+    config: dict,
+    *,
+    api: Callable[[str, str], dict] | None = None,
+    log: Callable[[str], None] | None = None,
+) -> base.AgentIntegration:
+    """Config keys (~/.config/codelight/config.json, agents.copilot):
+    home, github_org, github_token_file.
+
+    Copilot usage is the organization's pooled monthly AI-credit billing;
+    without github_org (plus a token via CODELIGHT_GITHUB_TOKEN/GITHUB_TOKEN/
+    GH_TOKEN, github_token_file, or the gh CLI) no usage is reported.
+    """
+    home = (os.path.expanduser(str(config.get("home") or ""))
+            or default_home())
+    agent = CopilotAgent(
+        str(config.get("github_org") or ""),
+        copilot_home=home,
+        token_file=str(config.get("github_token_file") or ""),
+        api=api,
+        log=log,
+    )
     hooks_file = hooks_path(home)
 
     def _install_hooks(*, script_path, hook_wait_ceiling, remote_permissions,
@@ -109,6 +130,7 @@ def build_integration(agent: CopilotAgent, *, home: str) -> base.AgentIntegratio
 
     return base.AgentIntegration(
         spec=SPEC,
+        agent=agent,
         hook_modes=HOOK_MODES,
         usage_fetcher=agent.get_usage,
         install_hooks=_install_hooks,
