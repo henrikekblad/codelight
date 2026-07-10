@@ -17,8 +17,7 @@ import sys
 import threading
 import time
 from datetime import datetime
-from codelight_core.agents import codex as codex_agent
-from codelight_core.agents import copilot as copilot_agent
+from codelight_core.agents.runtime import AgentRuntime
 from codelight_core import auth as auth_core
 from codelight_core import conversation as conversation_core
 from codelight_core.conversation import ConversationRefresher
@@ -105,6 +104,7 @@ _state = CodelightState(
     idle_window=IDLE_WINDOW,
     idle_window_waiting=IDLE_WINDOW_WAITING,
 )
+_agent_runtime = AgentRuntime(codex_home=CODEX_HOME, copilot_home=COPILOT_HOME)
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -152,10 +152,9 @@ def _update_session(session_id: str, state: str,
                     transcript: str = "", cwd: str = "",
                     agent_id: str = DEFAULT_AGENT_ID) -> None:
     normalized_agent = _normalize_agent_id(agent_id)
-    if not transcript and normalized_agent == "copilot":
-        transcript = _copilot_events_path_for_session(session_id)
-    elif not transcript and normalized_agent == "codex":
-        transcript = _codex_rollout_path_for_session(session_id)
+    if not transcript:
+        transcript = _agent_runtime.transcript_path_for_session(
+            normalized_agent, session_id)
     _state.update_session(
         session_id,
         state,
@@ -172,28 +171,10 @@ def _active_transcript() -> tuple[str, str]:
     active = _state.active_transcript()
     if active.path:
         return (active.session_id, active.path)
-    # Copilot fallback: if hooks did not pass transcript_path, use the newest
-    # session-state events file.
-    p = _latest_copilot_events_path()
-    if p:
-        return ("copilot", p)
+    for agent_id, path in _agent_runtime.latest_transcript_fallbacks():
+        if path:
+            return (agent_id, path)
     return ("", "")
-
-
-def _copilot_events_path_for_session(session_id: str) -> str:
-    return copilot_agent.events_path_for_session(COPILOT_HOME, session_id)
-
-
-def _latest_copilot_events_path() -> str:
-    return copilot_agent.latest_events_path(COPILOT_HOME)
-
-
-def _codex_rollout_path_for_session(session_id: str) -> str:
-    return codex_agent.rollout_path_for_session(CODEX_HOME, session_id)
-
-
-def _latest_codex_rollout_path() -> str:
-    return codex_agent.latest_rollout_path(CODEX_HOME)
 
 
 def _parse_transcript(path: str, max_msgs: int = 60) -> list[dict]:
@@ -547,7 +528,6 @@ def _usage_fetchers() -> UsageFetchers:
         copilot_home=COPILOT_HOME,
         github_org=_github_org,
         github_token_file=_github_token_file,
-        github_api=copilot_agent.github_api,
         log=vprint,
     )
 
