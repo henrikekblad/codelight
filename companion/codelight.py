@@ -12,9 +12,7 @@ import argparse
 import asyncio
 import collections
 import os
-import shutil
 import signal
-import subprocess
 import sys
 import threading
 import time
@@ -28,16 +26,14 @@ from codelight_core.conversation import ConversationRefresher
 from codelight_core import dashboard_client
 from codelight_core import discovery as discovery_core
 from codelight_core import hook_commands
-from codelight_core import hooks as hooks_core
+from codelight_core import lifecycle
 from codelight_core import policy as policy_core
 from codelight_core import remote_control
 from codelight_core import remote_payloads
-from codelight_core import service as service_core
 from codelight_core import socket_server
 from codelight_core.state import CodelightState
 from codelight_core import transcript as transcript_core
 from codelight_core.usage import UsageFetchers, UsagePoller
-from codelight_core import vscode as vscode_core
 from codelight_core.ws_server import CodelightWebsocketHub
 
 try:
@@ -781,68 +777,19 @@ def _usage_thread() -> None:
 
 def uninstall() -> None:
     """Remove all codelight hooks, socket file, and state directory."""
-
-    settings_path = os.path.expanduser("~/.claude/settings.json")
-    hooks_core.remove_matcher_group_hooks(settings_path)
-    hooks_core.remove_matcher_group_hooks(codex_agent.hooks_path(CODEX_HOME))
-
-    copilot_hooks = copilot_agent.hooks_path(COPILOT_HOME)
-    service_core.remove_file(copilot_hooks)
-    service_core.remove_empty_dir(os.path.dirname(copilot_hooks))
-
-    service_core.remove_file(POLICY_PATH)
-    service_core.remove_empty_dir(CODELIGHT_CONFIG_HOME)
-
-    for path in [SOCKET_PATH, MONITOR_STATE_DIR]:
-        service_core.remove_path(path)
-
-    service_core.uninstall_service(run=subprocess.run)
-
-    uninstall_vscode_extension()
-
-    print("[uninstall] done")
-
-
-# ── Systemd service install ───────────────────────────────────────────────────
-
-def detect_installed_agents() -> set[str]:
-    return vscode_core.detect_installed_agents(
-        which=shutil.which, run=subprocess.run)
+    lifecycle.uninstall(
+        claude_settings_path=os.path.expanduser("~/.claude/settings.json"),
+        codex_home=CODEX_HOME,
+        copilot_home=COPILOT_HOME,
+        policy_path=POLICY_PATH,
+        config_home=CODELIGHT_CONFIG_HOME,
+        socket_path=SOCKET_PATH,
+        monitor_state_dir=MONITOR_STATE_DIR,
+    )
 
 
 def _parse_agent_set(value: str | None) -> set[str]:
-    return vscode_core.parse_agent_set(value, set(AGENT_REGISTRY))
-
-
-def install_vscode_extension(secret: str = "", ws_port: int = 8765) -> None:
-    vscode_core.install_vscode_extension(
-        __file__, secret, ws_port, which=shutil.which, run=subprocess.run)
-
-
-def uninstall_vscode_extension() -> None:
-    vscode_core.uninstall_vscode_extension(
-        which=shutil.which, run=subprocess.run)
-
-
-def install_service(name: str, secret: str, ws_port: int, verbose: bool,
-                    remote_control: bool = False,
-                    permission_timeout: int = 60,
-                    agents: set[str] | None = None,
-                    github_org: str = "",
-                    github_token_file: str = "") -> None:
-    service_core.install_service(
-        name=name,
-        secret=secret,
-        ws_port=ws_port,
-        verbose=verbose,
-        script_path=os.path.abspath(__file__),
-        remote_control=remote_control,
-        permission_timeout=permission_timeout,
-        agents=agents,
-        github_org=github_org,
-        github_token_file=github_token_file,
-        run=subprocess.run,
-    )
+    return lifecycle.parse_agent_set(value, set(AGENT_REGISTRY))
 
 
 # ── Main ──────────────────────────────────────────────────────────────────────
@@ -906,14 +853,24 @@ def main():
         if args.remote_control and not args.secret:
             parser.error("--remote-control requires --secret (remote approval/answers "
                          "are code-execution capability and must not be open to the LAN)")
-        detected_agents = detect_installed_agents()
+        detected_agents = lifecycle.detect_installed_agents()
         print("[install] detected agents: "
               + (", ".join(sorted(detected_agents)) or "none"))
-        install_service(args.name, args.secret, args.ws_port, args.verbose,
-                        args.remote_control, args.permission_timeout,
-                        detected_agents, args.github_org, args.github_token_file)
+        lifecycle.install_service(
+            script_path=os.path.abspath(__file__),
+            name=args.name,
+            secret=args.secret,
+            ws_port=args.ws_port,
+            verbose=args.verbose,
+            remote_control=args.remote_control,
+            permission_timeout=args.permission_timeout,
+            agents=detected_agents,
+            github_org=args.github_org,
+            github_token_file=args.github_token_file,
+        )
         if args.vscode:
-            install_vscode_extension(args.secret, args.ws_port)
+            lifecycle.install_vscode_extension(
+                os.path.abspath(__file__), args.secret, args.ws_port)
         return
 
     if args.hook == "permission":
@@ -961,7 +918,8 @@ def main():
         _remote_permissions = _remote_questions = False
 
     enabled_agents = (_parse_agent_set(args.agents)
-                      if args.agents is not None else detect_installed_agents())
+                      if args.agents is not None
+                      else lifecycle.detect_installed_agents())
     print("[agents] enabled: " + (", ".join(sorted(enabled_agents)) or "none"),
           flush=True)
 

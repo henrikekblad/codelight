@@ -19,6 +19,7 @@ from codelight_core.conversation import ConversationRefresher
 from codelight_core import discovery as discovery_core
 from codelight_core import hook_io
 from codelight_core import hook_runtime
+from codelight_core import lifecycle
 from codelight_core import remote_control
 from codelight_core import remote_payloads
 from codelight_core import service as service_core
@@ -315,15 +316,16 @@ class AgentDetectionTests(unittest.TestCase):
             stdout="openai.chatgpt\ngithub.copilot-chat\n",
             returncode=0,
         )
-        with mock.patch.object(codelight.shutil, "which", side_effect=which), \
+        with mock.patch.object(lifecycle.shutil, "which", side_effect=which), \
              mock.patch("subprocess.run", return_value=extension_result):
-            detected = codelight.detect_installed_agents()
+            detected = lifecycle.detect_installed_agents()
 
         self.assertEqual(detected, {"claude", "copilot", "codex"})
 
     def test_agent_set_ignores_unknown_values(self):
         self.assertEqual(
-            codelight._parse_agent_set("codex, unknown, claude"),
+            lifecycle.parse_agent_set("codex, unknown, claude",
+                                      set(codelight.AGENT_REGISTRY)),
             {"codex", "claude"},
         )
 
