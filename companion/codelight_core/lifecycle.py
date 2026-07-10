@@ -6,6 +6,7 @@ import subprocess
 
 from codelight_core.agents import codex as codex_agent
 from codelight_core.agents import copilot as copilot_agent
+from codelight_core.agents import claude as claude_agent
 from codelight_core import hooks as hooks_core
 from codelight_core import service as service_core
 from codelight_core import vscode as vscode_core
@@ -57,6 +58,49 @@ def install_service(
         github_token_file=github_token_file,
         run=subprocess.run,
     )
+
+
+def install_agent_hooks(
+    *,
+    enabled_agents: set[str],
+    script_path: str,
+    claude_settings_path: str,
+    codex_home: str,
+    copilot_home: str,
+    hook_wait_ceiling: int,
+    remote_permissions: bool = False,
+    remote_questions: bool = False,
+    permission_timeout: int = 60,
+    log=None,
+) -> None:
+    if "claude" in enabled_agents:
+        claude_agent.install_hooks(
+            claude_settings_path,
+            script_path,
+            hook_wait_ceiling=hook_wait_ceiling,
+            remote_permissions=remote_permissions,
+            remote_questions=remote_questions,
+            permission_timeout=permission_timeout,
+            vprint=log,
+        )
+    if "copilot" in enabled_agents:
+        copilot_agent.install_hooks(
+            copilot_agent.hooks_path(copilot_home),
+            script_path,
+            hook_wait_ceiling=hook_wait_ceiling,
+            remote_permissions=remote_permissions,
+            permission_timeout=permission_timeout,
+        )
+    if "codex" in enabled_agents:
+        codex_agent.install_hooks(
+            codex_agent.hooks_path(codex_home),
+            script_path,
+            hook_wait_ceiling=hook_wait_ceiling,
+            remote_permissions=remote_permissions,
+            remote_questions=remote_questions,
+            permission_timeout=permission_timeout,
+            vprint=log,
+        )
 
 
 def uninstall(

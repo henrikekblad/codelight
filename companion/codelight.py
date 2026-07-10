@@ -17,7 +17,6 @@ import sys
 import threading
 import time
 from datetime import datetime, timezone
-from codelight_core.agents import claude as claude_agent
 from codelight_core.agents import codex as codex_agent
 from codelight_core.agents import copilot as copilot_agent
 from codelight_core import auth as auth_core
@@ -464,60 +463,6 @@ def _register_question(conn, msg: dict) -> None:
     _remote_request_manager().register_question(conn, msg)
 
 
-# ── Hook installation ─────────────────────────────────────────────────────────
-
-def install_claude_hooks(script_path: str, remote_permissions: bool = False,
-                         remote_questions: bool = False,
-                         permission_timeout: int = 60) -> None:
-    """
-    Ensure ~/.claude/settings.json has the monitor hooks pointing to this script.
-    Idempotent: safe to call on every startup. Preserves all non-monitor hooks.
-    With remote_permissions the PermissionRequest hook blocks for a remote
-    decision; with remote_questions a PreToolUse hook (matcher AskUserQuestion)
-    blocks for a remote answer.
-    """
-    claude_agent.install_hooks(
-        os.path.expanduser("~/.claude/settings.json"),
-        script_path,
-        hook_wait_ceiling=HOOK_WAIT_CEILING,
-        remote_permissions=remote_permissions,
-        remote_questions=remote_questions,
-        permission_timeout=permission_timeout,
-        vprint=vprint,
-    )
-
-
-def install_codex_hooks(script_path: str, remote_permissions: bool = False,
-                        remote_questions: bool = False,
-                        permission_timeout: int = 60) -> None:
-    """Install user-level Codex hooks in ~/.codex/hooks.json.
-
-    Codex local surfaces (CLI and IDE extension) share CODEX_HOME. Project-local
-    hooks would need trust per repo, so codelight uses the user layer.
-    """
-    codex_agent.install_hooks(
-        codex_agent.hooks_path(CODEX_HOME),
-        script_path,
-        hook_wait_ceiling=HOOK_WAIT_CEILING,
-        remote_permissions=remote_permissions,
-        remote_questions=remote_questions,
-        permission_timeout=permission_timeout,
-        vprint=vprint,
-    )
-
-
-def install_copilot_hooks(script_path: str, remote_permissions: bool = False,
-                          permission_timeout: int = 60) -> None:
-    """Install user-level GitHub Copilot CLI hooks in ~/.copilot/hooks/codelight.json."""
-    copilot_agent.install_hooks(
-        copilot_agent.hooks_path(COPILOT_HOME),
-        script_path,
-        hook_wait_ceiling=HOOK_WAIT_CEILING,
-        remote_permissions=remote_permissions,
-        permission_timeout=permission_timeout,
-    )
-
-
 # ── Permission policy compatibility helpers ──────────────────────────────────
 
 def _is_trusted_repo_cwd(cwd: str) -> bool:
@@ -923,15 +868,18 @@ def main():
     print("[agents] enabled: " + (", ".join(sorted(enabled_agents)) or "none"),
           flush=True)
 
-    if "claude" in enabled_agents:
-        install_claude_hooks(os.path.abspath(__file__), _remote_permissions,
-                             _remote_questions, _permission_timeout)
-    if "copilot" in enabled_agents:
-        install_copilot_hooks(os.path.abspath(__file__), _remote_permissions,
-                              _permission_timeout)
-    if "codex" in enabled_agents:
-        install_codex_hooks(os.path.abspath(__file__), _remote_permissions,
-                            _remote_questions, _permission_timeout)
+    lifecycle.install_agent_hooks(
+        enabled_agents=enabled_agents,
+        script_path=os.path.abspath(__file__),
+        claude_settings_path=os.path.expanduser("~/.claude/settings.json"),
+        codex_home=CODEX_HOME,
+        copilot_home=COPILOT_HOME,
+        hook_wait_ceiling=HOOK_WAIT_CEILING,
+        remote_permissions=_remote_permissions,
+        remote_questions=_remote_questions,
+        permission_timeout=_permission_timeout,
+        log=vprint,
+    )
 
     print(f"codelight  [ws://0.0.0.0:{args.ws_port}]  (Ctrl-C to stop)", flush=True)
 
