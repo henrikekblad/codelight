@@ -9,17 +9,10 @@ from codelight_core import service as service_core
 from codelight_core import vscode as vscode_core
 
 
-def detect_installed_agents(agent_registry: AgentRegistry | None = None) -> set[str]:
-    agent_executables = (
-        agent_registry.executables_by_agent() if agent_registry is not None else None
-    )
-    agent_vscode_extensions = (
-        agent_registry.vscode_extensions_by_agent()
-        if agent_registry is not None else None
-    )
+def detect_installed_agents(agent_registry: AgentRegistry) -> set[str]:
     return vscode_core.detect_installed_agents(
-        agent_executables=agent_executables,
-        agent_vscode_extensions=agent_vscode_extensions,
+        agent_executables=agent_registry.executables_by_agent(),
+        agent_vscode_extensions=agent_registry.vscode_extensions_by_agent(),
         which=shutil.which, run=subprocess.run)
 
 

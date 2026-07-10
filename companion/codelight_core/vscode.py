@@ -17,30 +17,18 @@ VSCODE_FLAVORS = [
     ("codium", "~/.config/VSCodium/User/settings.json"),
 ]
 VSCODE_EXT_ID = "sensnology.codelight"
-AGENT_EXECUTABLES = {
-    "claude": ("claude",),
-    "copilot": ("copilot",),
-    "codex": ("codex",),
-}
-AGENT_VSCODE_EXTENSIONS = {
-    "claude": {"anthropic.claude-code"},
-    "copilot": {"github.copilot", "github.copilot-chat"},
-    "codex": {"openai.chatgpt"},
-}
 
 
 def detect_installed_agents(
     *,
-    agent_executables: dict[str, tuple[str, ...]] | None = None,
-    agent_vscode_extensions: dict[str, set[str]] | None = None,
+    agent_executables: dict[str, tuple[str, ...]],
+    agent_vscode_extensions: dict[str, set[str]],
     which: Callable[[str], str | None] = shutil.which,
     run=subprocess.run,
 ) -> set[str]:
     """Detect supported agents from CLIs and local VSCode extensions."""
-    executables_by_agent = agent_executables or AGENT_EXECUTABLES
-    extensions_by_agent = agent_vscode_extensions or AGENT_VSCODE_EXTENSIONS
     detected = {
-        agent for agent, executables in executables_by_agent.items()
+        agent for agent, executables in agent_executables.items()
         if any(which(exe) for exe in executables)
     }
     installed_extensions: set[str] = set()
@@ -57,7 +45,7 @@ def detect_installed_agents(
             )
         except Exception:
             continue
-    for agent, extension_ids in extensions_by_agent.items():
+    for agent, extension_ids in agent_vscode_extensions.items():
         if installed_extensions.intersection(extension_ids):
             detected.add(agent)
     return detected

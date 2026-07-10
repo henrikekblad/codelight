@@ -323,7 +323,7 @@ class AgentDetectionTests(unittest.TestCase):
         )
         with mock.patch.object(lifecycle.shutil, "which", side_effect=which), \
              mock.patch("subprocess.run", return_value=extension_result):
-            detected = lifecycle.detect_installed_agents()
+            detected = lifecycle.detect_installed_agents(codelight._new_agent_registry())
 
         self.assertEqual(detected, {"claude", "copilot", "codex"})
 
