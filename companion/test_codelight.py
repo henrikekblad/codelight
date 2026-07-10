@@ -9,6 +9,7 @@ from unittest import mock
 
 sys.path.insert(0, os.path.dirname(__file__))
 import codelight
+from codelight_core.agents import codex as codex_agent
 from codelight_core.agents import copilot as copilot_agent
 from codelight_core.state import CodelightState
 from codelight_core import auth as auth_core
@@ -855,7 +856,7 @@ class HookConfigTests(unittest.TestCase):
     def test_codex_question_hook_uses_request_user_input_matcher(self):
         with tempfile.TemporaryDirectory() as tmp:
             hooks_path = os.path.join(tmp, "hooks.json")
-            hooks_core.install_codex_hooks(
+            codex_agent.install_hooks(
                 hooks_path,
                 "/repo/companion/codelight.py",
                 hook_wait_ceiling=590,
