@@ -46,6 +46,16 @@ class AgentSpec:
     # Read-only tools of this agent that are safe to auto-allow when the
     # session cwd is inside a user-trusted folder.
     trusted_auto_allow_tools: frozenset[str] = frozenset()
+    # Client-facing branding, shipped over the wire so clients need no
+    # per-agent assets. logo_svg must fill with currentColor so clients can
+    # tint it (status or brand color); keep it small — every client gets it
+    # in the connect handshake.
+    color: str = ""      # brand color, #rrggbb
+    logo_svg: str = ""
+    # Pre-rasterized 48x48 1-bit bitmap (MSB first, 288 bytes, base64) for
+    # clients that cannot render SVG (the ESP8266 screen). Rasterize from
+    # logo_svg when adding an agent.
+    logo_bitmap: str = ""
 
 
 @dataclass(frozen=True)

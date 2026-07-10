@@ -184,6 +184,18 @@ def _active_transcript() -> tuple[str, str]:
     return ("", "")
 
 
+def _client_config(client: str = "") -> dict:
+    """One-time per-connection client config: agent branding and defaults.
+
+    ``client`` is the requesting client's self-reported type (vscode/android/
+    gnome/screen/…); the screen gets bitmap logos instead of SVGs.
+    """
+    return {
+        "default_agent_id": DEFAULT_AGENT_ID,
+        "agents": _agents.client_metadata(client),
+    }
+
+
 def _parse_transcript(path: str, max_msgs: int = 60) -> list[dict]:
     return transcript_core.parse_transcript(
         path, tool_summary=_tool_summary,
@@ -564,6 +576,7 @@ def _ws_thread(port: int, secret: str) -> None:
         shutdown=_shutdown,
         remote_permissions=lambda: _remote_permissions,
         remote_questions=lambda: _remote_questions,
+        client_config=_client_config,
         status_snapshot=_status_snapshot,
         overall_status=_overall_status,
         pending_payloads=_pending_remote_payloads,

@@ -245,15 +245,15 @@ class CodelightState:
 
         last_usage = usage_snaps.get(last_agent)
         if last_usage:
-            meter_agent = last_agent
             usage, weekly_title, session_title = self._meter_usage(
-                meter_agent, last_usage)
+                last_agent, last_usage)
         else:
-            meter_agent = self._default_agent_id
-            usage, weekly_title, session_title = self._meter_usage(
-                meter_agent,
-                usage_snaps.get(meter_agent, dict(DEFAULT_USAGE)),
-            )
+            # No usage info for the active agent: empty titles tell meter
+            # clients (the screen) to hide the bars rather than show another
+            # agent's numbers.
+            usage = dict(DEFAULT_USAGE)
+            weekly_title = ""
+            session_title = ""
         per_agent_usage = self._per_agent_usage(usage_snaps)
 
         return {

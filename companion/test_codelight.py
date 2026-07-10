@@ -1,3 +1,4 @@
+import base64
 import contextlib
 import io
 import json
@@ -345,6 +346,34 @@ class AgentDetectionTests(unittest.TestCase):
         )
 
 
+class ClientConfigTests(unittest.TestCase):
+    def test_client_config_carries_agent_branding(self):
+        config = codelight._client_config()
+
+        self.assertEqual(config["default_agent_id"], codelight.DEFAULT_AGENT_ID)
+        self.assertEqual(set(config["agents"]), set(codelight.AGENT_REGISTRY))
+        for agent_id, meta in config["agents"].items():
+            self.assertTrue(meta["display"], agent_id)
+            self.assertRegex(meta["color"], r"^#[0-9A-Fa-f]{6}$")
+            self.assertIn("currentColor", meta["logo_svg"])
+            self.assertTrue(meta["logo_svg"].startswith("<svg"))
+        # The whole map rides in every connect handshake — keep it lean.
+        self.assertLess(len(json.dumps(config)), 16384)
+
+    def test_screen_client_gets_bitmap_logos(self):
+        config = codelight._client_config("screen")
+
+        self.assertLessEqual(len(config["agents"]),
+                             AgentRegistry.MAX_SCREEN_AGENTS)
+        for agent_id, meta in config["agents"].items():
+            self.assertNotIn("logo_svg", meta)
+            bitmap = base64.b64decode(meta["logo_bitmap"])
+            self.assertEqual(len(bitmap), 48 * 48 // 8, agent_id)
+            self.assertRegex(meta["color"], r"^#[0-9A-Fa-f]{6}$")
+        # The ESP8266 parses this into a ~45 KB heap — keep it small.
+        self.assertLess(len(json.dumps(config)), 4096)
+
+
 class FakeAgentIntegrationTests(unittest.TestCase):
     """Prove the registry path is additive: a new agent registers one
     AgentIntegration and flows through every client surface unchanged."""
@@ -374,6 +403,8 @@ class FakeAgentIntegrationTests(unittest.TestCase):
         self.assertIn("fake", registry.supported_agent_ids())
         self.assertEqual(registry.display_registry()["fake"],
                          {"display": "Fake Agent"})
+        self.assertEqual(registry.client_metadata()["fake"]["display"],
+                         "Fake Agent")
         self.assertEqual(registry.executables_by_agent()["fake"], ("fake-cli",))
         self.assertEqual(
             lifecycle.parse_agent_set("fake, unknown",

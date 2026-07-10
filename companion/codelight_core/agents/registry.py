@@ -99,6 +99,34 @@ class AgentRegistry:
             for agent_id, spec in self.specs.items()
         }
 
+    # The screen has ~45 KB of RAM; bound the agents map it must parse.
+    MAX_SCREEN_AGENTS = 6
+
+    def client_metadata(self, client: str = "") -> dict[str, dict[str, str]]:
+        """Per-agent branding shipped to a client in the config handshake.
+
+        The ESP8266 screen cannot render SVG, so it gets the pre-rasterized
+        1-bit bitmaps instead, capped to MAX_SCREEN_AGENTS entries.
+        """
+        if client == "screen":
+            return {
+                agent_id: {
+                    "display": spec.display,
+                    "color": spec.color,
+                    "logo_bitmap": spec.logo_bitmap,
+                }
+                for agent_id, spec in
+                list(self.specs.items())[:self.MAX_SCREEN_AGENTS]
+            }
+        return {
+            agent_id: {
+                "display": spec.display,
+                "color": spec.color,
+                "logo_svg": spec.logo_svg,
+            }
+            for agent_id, spec in self.specs.items()
+        }
+
     def supported_agent_ids(self) -> set[str]:
         return set(self.specs)
 

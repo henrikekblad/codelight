@@ -35,6 +35,7 @@ class CodelightWebsocketHub:
         shutdown,
         remote_permissions: Callable[[], bool],
         remote_questions: Callable[[], bool],
+        client_config: Callable[[str], JsonDict],
         status_snapshot: StatusSnapshotCallback,
         overall_status: OverallStatusCallback,
         pending_payloads: PendingPayloadsCallback,
@@ -52,6 +53,7 @@ class CodelightWebsocketHub:
         self._shutdown = shutdown
         self._remote_permissions = remote_permissions
         self._remote_questions = remote_questions
+        self._client_config = client_config
         self._status_snapshot = status_snapshot
         self._overall_status = overall_status
         self._pending_payloads = pending_payloads
@@ -151,6 +153,7 @@ class CodelightWebsocketHub:
     async def _serve(self, *, port: int, secret: str) -> None:
         self.dbus_iface = await dbus_service.export(
             status_snapshot=self._status_snapshot,
+            client_config=self._client_config,
             respond_permission=lambda request_id, decision: self._respond_permission(
                 request_id, decision, "gnome"),
             respond_question=lambda request_id, answers: self._respond_question(
@@ -190,12 +193,6 @@ class CodelightWebsocketHub:
         self.clients.add(ws)
         self._log(f"[ws] client connected ({len(self.clients)} total)")
         try:
-            utc_offset = int(datetime.now().astimezone().utcoffset().total_seconds())
-            await ws.send(json.dumps({
-                "type": "config",
-                "utc_offset": utc_offset,
-                "remote_control": self._remote_permissions(),
-            }))
             await ws.send(json.dumps(self._status_snapshot()))
 
             client_name = "ws"
@@ -269,6 +266,15 @@ class CodelightWebsocketHub:
 
         return client_name
 
+    def _config_message(self, client: str) -> JsonDict:
+        utc_offset = int(datetime.now().astimezone().utcoffset().total_seconds())
+        return {
+            "type": "config",
+            "utc_offset": utc_offset,
+            "remote_control": self._remote_permissions(),
+            **self._client_config(client),
+        }
+
     async def _handle_subscribe(
         self,
         ws,
@@ -277,6 +283,10 @@ class CodelightWebsocketHub:
     ) -> str:
         client_name = str(message.get("client") or "ws")
         features = message.get("features") or []
+
+        # Config is tailored to the client type (e.g. the screen gets bitmap
+        # logos), so it is sent in reply to the subscribe hello, not on connect.
+        await ws.send(json.dumps(self._config_message(client_name)))
 
         wants_remote = (
             ("permissions" in features and self._remote_permissions())

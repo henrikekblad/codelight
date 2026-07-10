@@ -18,6 +18,7 @@ except ImportError:
 
 
 StatusCallback = Callable[[], dict[str, Any]]
+ConfigCallback = Callable[[str], dict[str, Any]]
 PermissionCallback = Callable[[str, str], bool]
 QuestionCallback = Callable[[str, Any], bool]
 ExtendCallback = Callable[[str], bool]
@@ -36,6 +37,7 @@ if HAVE_DBUS:
             self,
             *,
             status_snapshot: StatusCallback,
+            client_config: ConfigCallback,
             respond_permission: PermissionCallback,
             respond_question: QuestionCallback,
             extend_request: ExtendCallback,
@@ -43,6 +45,7 @@ if HAVE_DBUS:
         ):
             super().__init__("se.sensnology.codelight")
             self._status_snapshot = status_snapshot
+            self._client_config = client_config
             self._respond_permission = respond_permission
             self._respond_question = respond_question
             self._extend_request = extend_request
@@ -55,6 +58,13 @@ if HAVE_DBUS:
         @_dbus_method()
         def GetStatus(self) -> "s":  # type: ignore[return]
             return json.dumps(self._status_snapshot())
+
+        @_dbus_method()
+        def GetConfig(self, client: "s") -> "s":  # type: ignore[return]
+            # One-time client config (agent branding etc.), mirroring the
+            # "config" message WebSocket clients get on subscribe. ``client``
+            # is the caller's type (e.g. "gnome") and selects the variant.
+            return json.dumps({"type": "config", **self._client_config(client)})
 
         @_dbus_signal()
         def PermissionRequest(self, request_json: str) -> "s":  # type: ignore[return]
@@ -108,6 +118,7 @@ if HAVE_DBUS:
 async def export(
     *,
     status_snapshot: StatusCallback,
+    client_config: ConfigCallback,
     respond_permission: PermissionCallback,
     respond_question: QuestionCallback,
     extend_request: ExtendCallback,
@@ -120,6 +131,7 @@ async def export(
         dbus_bus = await _DbusMessageBus(bus_type=_DbusBusType.SESSION).connect()
         iface = CodelightDbusInterface(
             status_snapshot=status_snapshot,
+            client_config=client_config,
             respond_permission=respond_permission,
             respond_question=respond_question,
             extend_request=extend_request,
