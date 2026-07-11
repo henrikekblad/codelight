@@ -827,6 +827,29 @@ private fun PermissionContent(req: JSONObject, card: Color, text: Color, muted: 
             Text("Allow + Always Allow Exact Command Here")
         }
     }
+    if (req.optBoolean("allow_tool_available", false)) {
+        Spacer(Modifier.height(12.dp))
+        Text(
+            "Skip further prompts for the '$tool' tool — for this session, or always and for every agent.",
+            style = TextStyle(color = Color(0xFFFFB74D), fontSize = 11.sp),
+        )
+        Spacer(Modifier.height(6.dp))
+        Button(
+            onClick = { respondPermission(context, id, "allow_tool_session"); onDone() },
+            colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF2F6F9F)),
+            modifier = Modifier.fillMaxWidth(),
+        ) {
+            Text("Allow + Allow '$tool' This Session")
+        }
+        Spacer(Modifier.height(6.dp))
+        Button(
+            onClick = { respondPermission(context, id, "allow_tool"); onDone() },
+            colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF2F6F9F)),
+            modifier = Modifier.fillMaxWidth(),
+        ) {
+            Text("Allow + Always Allow '$tool'")
+        }
+    }
 }
 
 private fun extractPatchTarget(patchText: String): String {

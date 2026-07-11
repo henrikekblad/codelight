@@ -52,7 +52,8 @@ export class CodelightClient {
 
     respondPermission(
         id: string,
-        decision: 'allow' | 'allow_folder' | 'allow_command' | 'deny' | 'skip',
+        decision: 'allow' | 'allow_folder' | 'allow_command'
+            | 'allow_tool' | 'allow_tool_session' | 'deny' | 'skip',
     ): void {
         this.send({ type: 'permission_response', id, decision });
     }

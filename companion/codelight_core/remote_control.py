@@ -74,6 +74,40 @@ def wait_question(
         entry["event"].wait(min(remaining, tick))
 
 
+class SessionToolAllowances:
+    """Tools the user allowed for the remainder of a session ("allow this
+    session"). In-memory only — dies with the daemon; a session's entry is
+    cleared when its SessionEnd hook arrives. Bounded so agents without a
+    SessionEnd event can't grow it forever."""
+
+    MAX_SESSIONS = 64
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._by_session: dict[str, set[str]] = {}
+
+    def allow(self, session_id: str, tool_name: str) -> bool:
+        sid = str(session_id or "").strip()
+        tool = str(tool_name or "").strip()
+        if not sid or sid == "unknown" or not tool or tool == "?":
+            return False
+        with self._lock:
+            if sid not in self._by_session \
+                    and len(self._by_session) >= self.MAX_SESSIONS:
+                self._by_session.pop(next(iter(self._by_session)))
+            self._by_session.setdefault(sid, set()).add(tool)
+        return True
+
+    def is_allowed(self, session_id: str, tool_name: str) -> bool:
+        with self._lock:
+            return str(tool_name or "") in self._by_session.get(
+                str(session_id or ""), set())
+
+    def clear(self, session_id: str) -> None:
+        with self._lock:
+            self._by_session.pop(str(session_id or ""), None)
+
+
 class PendingRequests:
     """Thread-safe owner for remote permission/question request state."""
 
@@ -131,13 +165,15 @@ class PendingRequests:
     def permission_persistence_request(
         self,
         request_id: str,
-    ) -> tuple[str, str] | None:
+    ) -> tuple[str, str, str, str] | None:
         with self._lock:
             entry = self._permissions.get(request_id)
             if entry is None or entry["decision"] is not None or entry["by"] is not None:
                 return None
             return (str(entry.get("cwd") or ""),
-                    str(entry.get("policy_command") or ""))
+                    str(entry.get("policy_command") or ""),
+                    str(entry.get("tool_name") or ""),
+                    str(entry.get("session_id") or ""))
 
     def finish_permission_persistence(
         self,
@@ -234,6 +270,7 @@ class RemoteRequestManager:
         log: Callable[[str], None],
         allow_folder: Callable[[str], tuple[bool, str]],
         allow_command: Callable[[str, str], tuple[bool, str]],
+        allow_tool: Callable[[str], tuple[bool, str]],
         can_answer_questions: Callable[[], bool],
         last_question_client_gone: Callable[[], float],
         no_client_grace: float,
@@ -254,6 +291,8 @@ class RemoteRequestManager:
         self.log = log
         self.allow_folder = allow_folder
         self.allow_command = allow_command
+        self.allow_tool = allow_tool
+        self.session_allowances = SessionToolAllowances()
         self.can_answer_questions = can_answer_questions
         self.last_question_client_gone = last_question_client_gone
         self.no_client_grace = no_client_grace
@@ -266,21 +305,30 @@ class RemoteRequestManager:
         )
 
     def resolve_permission(self, request_id: str, decision: str, by: str) -> bool:
-        if decision not in ("allow", "deny", "skip", "allow_folder", "allow_command"):
+        if decision not in ("allow", "deny", "skip", "allow_folder",
+                            "allow_command", "allow_tool", "allow_tool_session"):
             return False
 
-        if decision in ("allow_folder", "allow_command"):
+        if decision in ("allow_folder", "allow_command",
+                        "allow_tool", "allow_tool_session"):
             pending = self.pending.permission_persistence_request(request_id)
             if pending is None:
                 return False
-            cwd, policy_command = pending
+            cwd, policy_command, tool_name, session_id = pending
 
             if decision == "allow_folder":
                 persisted, value = self.allow_folder(cwd)
                 kind = "folder"
-            else:
+            elif decision == "allow_command":
                 persisted, value = self.allow_command(policy_command, cwd)
                 kind = "command"
+            elif decision == "allow_tool":
+                persisted, value = self.allow_tool(tool_name)
+                kind = "tool"
+            else:
+                persisted = self.session_allowances.allow(session_id, tool_name)
+                value = tool_name
+                kind = "tool_session"
 
             return self.pending.finish_permission_persistence(
                 request_id,
@@ -301,6 +349,9 @@ class RemoteRequestManager:
     def cancel_for_session(self, session_id: str) -> None:
         self.pending.cancel_for_session(session_id)
 
+    def clear_session_allowances(self, session_id: str) -> None:
+        self.session_allowances.clear(session_id)
+
     def register_permission(self, conn, msg: dict) -> None:
         if not self.remote_permissions():
             self._reply_and_close(conn, {"decision": None})
@@ -308,6 +359,13 @@ class RemoteRequestManager:
 
         request_id = str(msg.get("prompt_id") or "") or uuid.uuid4().hex
         session_id = msg.get("session_id", "unknown")
+
+        # "Allow this tool for the session" — answer without prompting anyone.
+        tool_name = str(msg.get("tool_name") or "")
+        if self.session_allowances.is_allowed(session_id, tool_name):
+            self._reply_and_close(conn, {"decision": "allow"})
+            self.log(f"[perm] {tool_name} → allow (session allowance)")
+            return
         entry = {
             "conn":       conn,
             "id":         request_id,

@@ -29,6 +29,7 @@ from codelight_core import hook_commands
 from codelight_core import hook_io
 from codelight_core import hook_runtime
 from codelight_core import lifecycle
+from codelight_core import policy as policy_core
 from codelight_core import remote_control
 from codelight_core import remote_payloads
 from codelight_core import service as service_core
@@ -324,6 +325,33 @@ class CopilotUsageTests(unittest.TestCase):
 
 
 class PermissionPolicyTests(unittest.TestCase):
+    def test_allow_tool_roundtrip_with_timestamps(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            policy_path = os.path.join(tmp, "policy.json")
+            lock = threading.Lock()
+
+            self.assertFalse(policy_core.is_allowed_tool(policy_path, "WebFetch"))
+            persisted, value = policy_core.allow_tool(policy_path, lock, "WebFetch")
+            self.assertTrue(persisted)
+            self.assertEqual(value, "WebFetch")
+            self.assertTrue(policy_core.is_allowed_tool(policy_path, "WebFetch"))
+            self.assertFalse(policy_core.is_allowed_tool(policy_path, "Bash"))
+            self.assertFalse(policy_core.is_allowed_tool(policy_path, "?"))
+
+            entry = policy_core.load_policy(policy_path)["allowed_tools"][0]
+            self.assertGreater(entry["added_at"], 0)
+            self.assertEqual(entry["added_at"], entry["last_used"])
+
+            # touch: a stale last_used is refreshed, a fresh one is left alone
+            # (no rewrite churn on every hook invocation).
+            stale = entry["added_at"] - policy_core.TOUCH_INTERVAL_SECS - 1
+            policy = policy_core.load_policy(policy_path)
+            policy["allowed_tools"][0]["last_used"] = stale
+            policy_core.write_policy(policy_path, policy)
+            policy_core.touch_allowed_tool(policy_path, lock, "WebFetch")
+            refreshed = policy_core.load_policy(policy_path)["allowed_tools"][0]
+            self.assertGreater(refreshed["last_used"], stale)
+
     def test_trusted_auto_allow_tools_are_agent_scoped(self):
         registry = codelight._new_agent_registry()
         self.assertIn("read_file", registry.trusted_auto_allow_tools("copilot"))
@@ -1220,6 +1248,123 @@ class RemotePayloadTests(unittest.TestCase):
 
 
 class RemoteControlTests(unittest.TestCase):
+    @staticmethod
+    def make_manager(pending, allow_tool_calls):
+        def allow_tool(tool):
+            allow_tool_calls.append(tool)
+            return True, tool
+
+        return remote_control.RemoteRequestManager(
+            pending=pending,
+            permission_timeout=lambda: 60,
+            remote_permissions=lambda: True,
+            remote_questions=lambda: True,
+            normalize_agent_id=lambda a: a or "claude",
+            permission_payload=lambda e: {},
+            question_payload=lambda e: {},
+            permission_resolved_payload=lambda e, o, b, p: {},
+            question_resolved_payload=lambda e, b: {},
+            broadcast_remote=lambda p, s: None,
+            update_session=lambda s, st, a: None,
+            push_status=lambda: None,
+            log=lambda m: None,
+            allow_folder=lambda cwd: (True, cwd),
+            allow_command=lambda c, cwd: (True, c),
+            allow_tool=allow_tool,
+            can_answer_questions=lambda: True,
+            last_question_client_gone=lambda: 0.0,
+            no_client_grace=6,
+            reconnect_window=30,
+        )
+
+    @staticmethod
+    def make_permission_entry(request_id, session_id="s1", tool_name="WebFetch"):
+        return {
+            "conn": None,
+            "id": request_id,
+            "session_id": session_id,
+            "agent_id": "claude",
+            "tool_name": tool_name,
+            "summary": tool_name,
+            "tool_input": {},
+            "policy_command": "",
+            "cwd": "/tmp",
+            "event": threading.Event(),
+            "decision": None,
+            "by": None,
+            "expires": 10 ** 12,
+        }
+
+    def test_session_tool_allowances_scope_and_cleanup(self):
+        allowances = remote_control.SessionToolAllowances()
+
+        self.assertTrue(allowances.allow("s1", "WebFetch"))
+        self.assertTrue(allowances.is_allowed("s1", "WebFetch"))
+        self.assertFalse(allowances.is_allowed("s1", "Bash"))
+        self.assertFalse(allowances.is_allowed("s2", "WebFetch"))
+        self.assertFalse(allowances.allow("unknown", "WebFetch"))
+        self.assertFalse(allowances.allow("s1", "?"))
+
+        allowances.clear("s1")
+        self.assertFalse(allowances.is_allowed("s1", "WebFetch"))
+
+        # Bounded: sessions beyond the cap evict the oldest entry.
+        for index in range(remote_control.SessionToolAllowances.MAX_SESSIONS + 1):
+            allowances.allow(f"session-{index}", "WebFetch")
+        self.assertFalse(allowances.is_allowed("session-0", "WebFetch"))
+
+    def test_allow_tool_session_resolves_and_auto_answers_next_request(self):
+        pending = remote_control.PendingRequests()
+        allow_tool_calls: list[str] = []
+        manager = self.make_manager(pending, allow_tool_calls)
+
+        entry = self.make_permission_entry("req1")
+        pending.add_permission("req1", entry)
+        self.assertTrue(
+            manager.resolve_permission("req1", "allow_tool_session", "test"))
+        self.assertEqual(entry["decision"], "allow")
+        self.assertEqual(entry["persistence"]["kind"], "tool_session")
+        self.assertTrue(manager.session_allowances.is_allowed("s1", "WebFetch"))
+        self.assertEqual(allow_tool_calls, [])
+
+        # The next request for the same session+tool is answered instantly,
+        # without broadcasting to clients.
+        class FakeConn:
+            def __init__(self):
+                self.sent = b""
+
+            def sendall(self, data):
+                self.sent += data
+
+            def close(self):
+                pass
+
+        conn = FakeConn()
+        manager.register_permission(conn, {
+            "prompt_id": "req2",
+            "session_id": "s1",
+            "tool_name": "WebFetch",
+            "tool_input": {},
+        })
+        self.assertEqual(json.loads(conn.sent.decode()), {"decision": "allow"})
+        self.assertIsNone(pending.pop_permission("req2"))
+
+        # SessionEnd clears the allowance.
+        manager.clear_session_allowances("s1")
+        self.assertFalse(manager.session_allowances.is_allowed("s1", "WebFetch"))
+
+    def test_allow_tool_forever_persists_via_callback(self):
+        pending = remote_control.PendingRequests()
+        allow_tool_calls: list[str] = []
+        manager = self.make_manager(pending, allow_tool_calls)
+
+        entry = self.make_permission_entry("req1", tool_name="WebSearch")
+        pending.add_permission("req1", entry)
+        self.assertTrue(manager.resolve_permission("req1", "allow_tool", "test"))
+        self.assertEqual(entry["decision"], "allow")
+        self.assertEqual(entry["persistence"]["kind"], "tool")
+        self.assertEqual(allow_tool_calls, ["WebSearch"])
+
     def test_completion_event_policy_matches_pending_prompt_lifecycle(self):
         self.assertFalse(remote_control.should_cancel_pending_for_hook(
             "working", "PostToolUse"))

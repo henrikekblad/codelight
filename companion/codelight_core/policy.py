@@ -4,6 +4,7 @@ import json
 import os
 import sys
 import threading
+import time
 
 
 def norm_path(path: str) -> str:
@@ -24,7 +25,8 @@ def load_policy(policy_path: str) -> dict:
     except Exception as e:
         print(f"[policy] could not read {policy_path}: {e}",
               file=sys.stderr, flush=True)
-    return {"version": 1, "trusted_folders": [], "allowed_commands": []}
+    return {"version": 1, "trusted_folders": [], "allowed_commands": [],
+            "allowed_tools": []}
 
 
 def write_policy(policy_path: str, policy: dict) -> bool:
@@ -160,6 +162,70 @@ def allow_command(policy_path: str, lock: threading.Lock,
         policy["allowed_commands"] = allowed
         policy.setdefault("trusted_folders", [])
         return write_policy(policy_path, policy), command
+
+
+def is_allowed_tool(policy_path: str, tool_name: str) -> bool:
+    """Whether the user has always-allowed this tool ("allow forever")."""
+    tool = str(tool_name or "").strip()
+    if not tool or tool == "?":
+        return False
+    raw = load_policy(policy_path).get("allowed_tools", [])
+    if not isinstance(raw, list):
+        return False
+    return any(isinstance(item, dict) and item.get("tool") == tool
+               for item in raw)
+
+
+def allow_tool(policy_path: str, lock: threading.Lock,
+               tool_name: str) -> tuple[bool, str]:
+    """Always-allow a tool by name, recording added_at/last_used for later
+    review and cleanup."""
+    tool = str(tool_name or "").strip()
+    if not tool or tool == "?" or len(tool) > 200:
+        return False, ""
+    now = int(time.time())
+    with lock:
+        policy = load_policy(policy_path)
+        raw = policy.get("allowed_tools", [])
+        allowed = [x for x in raw if isinstance(x, dict)] \
+            if isinstance(raw, list) else []
+        for item in allowed:
+            if item.get("tool") == tool:
+                item["last_used"] = now
+                policy["allowed_tools"] = allowed
+                return write_policy(policy_path, policy), tool
+        allowed.append({"tool": tool, "added_at": now, "last_used": now})
+        policy["allowed_tools"] = allowed
+        policy.setdefault("trusted_folders", [])
+        policy.setdefault("allowed_commands", [])
+        return write_policy(policy_path, policy), tool
+
+
+# Refresh last_used at most this often — the timestamp is for "is this rule
+# still earning its keep" review, not an audit log; no point rewriting the
+# policy file on every hook invocation.
+TOUCH_INTERVAL_SECS = 3600
+
+
+def touch_allowed_tool(policy_path: str, lock: threading.Lock,
+                       tool_name: str) -> None:
+    tool = str(tool_name or "").strip()
+    if not tool:
+        return
+    now = int(time.time())
+    with lock:
+        policy = load_policy(policy_path)
+        raw = policy.get("allowed_tools", [])
+        if not isinstance(raw, list):
+            return
+        for item in raw:
+            if isinstance(item, dict) and item.get("tool") == tool:
+                last = item.get("last_used")
+                if isinstance(last, int) and now - last < TOUCH_INTERVAL_SECS:
+                    return
+                item["last_used"] = now
+                write_policy(policy_path, policy)
+                return
 
 
 def truncate_tool_input(tool_input, max_str: int = 500, max_total: int = 3000):

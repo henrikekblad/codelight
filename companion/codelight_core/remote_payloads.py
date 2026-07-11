@@ -12,6 +12,7 @@ def permission_request_payload(
     agent_display_name: AgentName,
     allow_folder_available: bool,
     allow_command_available: bool,
+    allow_tool_available: bool = False,
 ) -> dict:
     cwd = str(entry.get("cwd") or "")
     agent_id = str(entry.get("agent_id") or "")
@@ -27,6 +28,7 @@ def permission_request_payload(
         "cwd": cwd,
         "allow_folder_available": allow_folder_available,
         "allow_command_available": allow_command_available,
+        "allow_tool_available": allow_tool_available,
         "expires_at": int(entry["expires"]),
     }
 

@@ -286,13 +286,16 @@ def _broadcast_rc(payload: dict, dbus_signal: str) -> None:
 
 def _perm_request_payload(entry: dict) -> dict:
     cwd = str(entry.get("cwd") or "")
+    tool_name = str(entry.get("tool_name") or "")
     can_allow_folder = bool(cwd) and (not _is_trusted_repo_cwd(cwd))
     can_allow_command = bool(cwd) and bool(entry.get("policy_command"))
+    can_allow_tool = bool(tool_name) and tool_name != "?"
     return remote_payloads.permission_request_payload(
         {**entry, "agent_id": _normalize_agent_id(entry.get("agent_id"))},
         agent_display_name=_agent_display_name,
         allow_folder_available=can_allow_folder,
         allow_command_available=can_allow_command,
+        allow_tool_available=can_allow_tool,
     )
 
 
@@ -419,6 +422,7 @@ def _remote_request_manager() -> remote_control.RemoteRequestManager:
             log=_log,
             allow_folder=_allow_folder,
             allow_command=_allow_command,
+            allow_tool=_allow_tool,
             can_answer_questions=_can_answer_questions,
             last_question_client_gone=lambda: _last_qclient_gone,
             no_client_grace=NO_CLIENT_GRACE,
@@ -494,6 +498,10 @@ def _is_allowed_command(tool_name: str, tool_input, cwd: str) -> bool:
 
 def _allow_command(command: str, cwd: str) -> tuple[bool, str]:
     return policy_core.allow_command(POLICY_PATH, _policy_lock, command, cwd)
+
+
+def _allow_tool(tool_name: str) -> tuple[bool, str]:
+    return policy_core.allow_tool(POLICY_PATH, _policy_lock, tool_name)
 
 
 def _tool_summary(tool_name: str, tool_input: dict) -> str:
@@ -676,8 +684,12 @@ def _handle_socket_message(conn, msg: dict) -> bool:
                         agent_id=msg.get("agent_id", DEFAULT_AGENT_ID))
         # PreToolUse status and question hooks may run concurrently.
         # Only completion events prove a local prompt is finished.
-        _cancel_pending_for_hook(
-            sid, state, str(msg.get("hook_event") or ""))
+        hook_event = str(msg.get("hook_event") or "")
+        _cancel_pending_for_hook(sid, state, hook_event)
+        # Session-scoped tool allowances die with the session — not on Stop,
+        # which fires at every turn end.
+        if hook_event == "SessionEnd":
+            _remote_request_manager().clear_session_allowances(sid)
         vprint(f"[socket] {sid[:8]}… → {state}")
         _push()
         # The transcript just grew — refresh the conversation feed.

@@ -114,6 +114,14 @@ def run_permission_hook(
             reason="Exact command allowed by codelight policy")
         return
 
+    if policy_core.is_allowed_tool(policy_path, tool_name):
+        policy_core.touch_allowed_tool(policy_path, policy_lock, tool_name)
+        emit_permission_decision(
+            "allow",
+            envelope=mode.envelope,
+            reason="Tool always allowed by codelight policy")
+        return
+
     if policy_core.is_safe_trusted_apply_patch(
         policy_path, tool_name, tool_input, cwd):
         emit_permission_decision(

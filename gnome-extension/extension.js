@@ -659,6 +659,31 @@ export default class CodelightExtension extends Extension {
             box.add_child(commandRow);
         }
 
+        if (req?.allow_tool_available === true) {
+            box.add_child(wrapLabel(
+                `Skip further prompts for the '${tool}' tool — for this session, or always and for every agent.`,
+                'font-size: 11px; color: #ffb74d;'
+            ));
+            const toolRow = new St.BoxLayout({ x_expand: true, vertical: true, style: 'padding-top: 2px; spacing: 4px;' });
+            const allowToolSession = new St.Button({
+                x_expand: true,
+                style: 'padding: 6px; border-radius: 6px; background-color: #2f6f9f; color: #fff;',
+                child: new St.Label({ text: `Allow + Allow '${tool}' This Session` }),
+            });
+            allowToolSession.connect('clicked',
+                () => this._finishRequest({ decision: 'allow_tool_session' }));
+            const allowTool = new St.Button({
+                x_expand: true,
+                style: 'padding: 6px; border-radius: 6px; background-color: #2f6f9f; color: #fff;',
+                child: new St.Label({ text: `Allow + Always Allow '${tool}'` }),
+            });
+            allowTool.connect('clicked',
+                () => this._finishRequest({ decision: 'allow_tool' }));
+            toolRow.add_child(allowToolSession);
+            toolRow.add_child(allowTool);
+            box.add_child(toolRow);
+        }
+
         item.add_child(box);
         this._qSection.addMenuItem(item);
     }

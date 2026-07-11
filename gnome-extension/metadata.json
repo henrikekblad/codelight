@@ -2,7 +2,7 @@
     "uuid": "codelight@sensnology.se",
     "name": "Codelight",
     "description": "Coding-agent status (Claude, Copilot, Codex, …) in the top bar",
-    "version": 9,
+    "version": 10,
     "shell-version": ["45", "46", "47", "48", "49", "50"],
     "url": "https://github.com/henrikekblad/codelight",
     "settings-schema": "org.gnome.shell.extensions.codelight"

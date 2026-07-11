@@ -185,6 +185,14 @@ function showRequest(req: any): void {
             client?.respondPermission(req.id, 'allow_command');
             clearPending();
             disposePanel();
+        } else if (msg?.type === 'allow_tool' && req?.type === 'permission_request') {
+            client?.respondPermission(req.id, 'allow_tool');
+            clearPending();
+            disposePanel();
+        } else if (msg?.type === 'allow_tool_session' && req?.type === 'permission_request') {
+            client?.respondPermission(req.id, 'allow_tool_session');
+            clearPending();
+            disposePanel();
         } else if (msg?.type === 'deny' && req?.type === 'permission_request') {
             client?.respondPermission(req.id, 'deny');
             clearPending();
@@ -398,6 +406,7 @@ function renderPermissionHtml(webview: vscode.Webview, req: any): string {
     const toolName = esc(req?.tool_name ?? '?');
     const canAllowFolder = req?.allow_folder_available !== false;
     const canAllowCommand = req?.allow_command_available === true;
+    const canAllowTool = req?.allow_tool_available === true;
     const cwd = req?.cwd ? `<div class="meta"><strong>cwd:</strong> ${esc(req.cwd)}</div>` : '';
     const inputObj = (req?.tool_input && typeof req.tool_input === 'object') ? req.tool_input : {};
     const command = typeof inputObj.command === 'string' ? inputObj.command :
@@ -474,6 +483,15 @@ ${LOGO_CSS}
         <button id="allow-command" class="info">Allow + Always Allow Exact Command Here</button>
     </div>
     ` : ''}
+    ${canAllowTool ? `
+    <div class="danger-note">Skip further prompts for the '${toolName}' tool — for this session, or always and for every agent.</div>
+    <div class="trust-row">
+        <button id="allow-tool-session" class="info">Allow + Allow '${toolName}' This Session</button>
+    </div>
+    <div class="trust-row">
+        <button id="allow-tool" class="info">Allow + Always Allow '${toolName}'</button>
+    </div>
+    ` : ''}
 <script nonce="${nonce}">
     const vscode = acquireVsCodeApi();
     document.getElementById('allow').addEventListener('click', () => vscode.postMessage({ type: 'allow' }));
@@ -484,6 +502,14 @@ ${LOGO_CSS}
     const allowCommand = document.getElementById('allow-command');
     if (allowCommand) {
         allowCommand.addEventListener('click', () => vscode.postMessage({ type: 'allow_command' }));
+    }
+    const allowToolSession = document.getElementById('allow-tool-session');
+    if (allowToolSession) {
+        allowToolSession.addEventListener('click', () => vscode.postMessage({ type: 'allow_tool_session' }));
+    }
+    const allowTool = document.getElementById('allow-tool');
+    if (allowTool) {
+        allowTool.addEventListener('click', () => vscode.postMessage({ type: 'allow_tool' }));
     }
     document.getElementById('deny').addEventListener('click', () => vscode.postMessage({ type: 'deny' }));
     document.getElementById('fallback').addEventListener('click', () => vscode.postMessage({ type: 'fallback' }));
