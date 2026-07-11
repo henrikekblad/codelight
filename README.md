@@ -12,11 +12,22 @@ them. Pick and choose whatever suits your needs:
 |---|---|---|---|---|
 | Claude Code | ✅ | ✅ | Permissions + questions | ✅ |
 | Codex CLI / IDE extension | ✅ | ✅ | Permissions + questions | ✅ |
-| GitHub Copilot / Copilot Chat | ✅ | Optional org monthly pool | Permissions; questions where exposed by the IDE hook path | ✅ |
+| GitHub Copilot / Copilot Chat | ✅ | ✅ <sup>1</sup> | Permissions + questions <sup>2</sup> | ✅ |
+| Cursor (IDE / `cursor-agent` CLI) | ✅ | ✅ <sup>3</sup> | Permissions <sup>4</sup> | ✅ |
+| Grok (xAI) | ✅ | — <sup>5</sup> | — <sup>5</sup> | — <sup>5</sup> |
+
+<sub>
+1. Copilot usage is the organization's pooled monthly AI-credit meter — needs `agents.copilot.github_org` and a token.<br>
+2. Copilot answers questions only where the IDE hook path exposes them.<br>
+3. Cursor shows a monthly included-usage meter read from the local Cursor auth token (no setup); it hides if you are not signed in to the IDE.<br>
+4. Cursor remote-allow bypasses the prompt in the IDE; the `cursor-agent` CLI is deny-only (its own command allowlist still prompts).<br>
+5. Grok is status-only — its single blocking hook cannot approve remotely, and it exposes no machine-readable usage.
+</sub>
 
 Agent-specific setup, caveats, and config keys live in
-[companion/AGENTS.md](companion/AGENTS.md). New integrations are discovered from
-the companion's agent modules and clients render the metadata they receive.
+[companion/AGENTS.md](companion/AGENTS.md). New integrations are discovered
+from the companion's agent modules and clients render the metadata they
+receive.
 
 | Component | Description | Example
 |---|---|---|
