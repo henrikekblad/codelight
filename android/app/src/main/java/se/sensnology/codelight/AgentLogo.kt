@@ -19,6 +19,7 @@ internal class AgentBranding(
     val color: Color?,
     val viewBox: FloatArray,   // x, y, w, h
     val paths: List<Path>,
+    val conversation: Boolean, // agent can produce a conversation feed
 )
 
 /**
@@ -69,6 +70,7 @@ internal object AgentBrandings {
                     color = color,
                     viewBox = viewBox ?: floatArrayOf(0f, 0f, 1f, 1f),
                     paths = paths,
+                    conversation = meta.optBoolean("conversation", false),
                 ))
             }
         }

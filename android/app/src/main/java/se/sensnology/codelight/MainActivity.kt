@@ -104,6 +104,9 @@ private fun MainScreen(initialTab: String?) {
         )
     }
 
+    // Agent to preselect when opening the Conversation tab from a Status arrow.
+    var convAgent by remember { mutableStateOf<String?>(null) }
+
     // Jump to the Request tab when a request arrives while remote-control is on.
     LaunchedEffect(hasRequest, remoteControl) {
         if (remoteControl && hasRequest) current = Tab.REQUEST
@@ -155,8 +158,14 @@ private fun MainScreen(initialTab: String?) {
     ) { inner ->
         Box(Modifier.fillMaxSize().padding(inner).background(Palette.bg)) {
             when (current) {
-                Tab.STATUS       -> StatusScreen()
-                Tab.CONVERSATION -> ConversationScreen()
+                Tab.STATUS       -> StatusScreen(onOpenConversation = { agentId ->
+                    convAgent = agentId
+                    current = Tab.CONVERSATION
+                })
+                Tab.CONVERSATION -> ConversationScreen(
+                    requestedAgent = convAgent,
+                    onRequestedAgentConsumed = { convAgent = null },
+                )
                 Tab.REQUEST      -> RequestScreen(null) { /* stay in the tab after answering */ }
                 Tab.SETTINGS     -> SettingsScreen(onClose = null)
             }

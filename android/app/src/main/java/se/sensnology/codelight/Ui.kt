@@ -45,7 +45,7 @@ object Palette {
 }
 
 @Composable
-fun StatusScreen() {
+fun StatusScreen(onOpenConversation: (String) -> Unit = {}) {
     val context = LocalContext.current
     val state = context.getSharedPreferences(CodelightService.STATE_PREFS, 0)
     var revision by remember { mutableIntStateOf(0) }
@@ -118,15 +118,19 @@ fun StatusScreen() {
         verticalArrangement = Arrangement.spacedBy(12.dp),
     ) {
         agents.forEach { agent ->
+            val branding = brandings[agent.id]
+            val canOpen = branding?.conversation == true
             Column(
                 Modifier.fillMaxWidth()
                     .background(Palette.card, RoundedCornerShape(10.dp))
+                    // Tap anywhere on a conversation-capable card to open its
+                    // feed; the reset Button below consumes its own taps.
+                    .clickable(enabled = canOpen) { onOpenConversation(agent.id) }
                     .padding(14.dp),
                 verticalArrangement = Arrangement.spacedBy(8.dp),
             ) {
                 Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically,
                     horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                    val branding = brandings[agent.id]
                     AgentLogo(branding, tint = branding?.color ?: Palette.text, size = 18.dp)
                     Text(agent.display, color = Palette.text, fontWeight = FontWeight.Bold,
                         modifier = Modifier.weight(1f))
@@ -494,52 +498,100 @@ internal fun fieldColors(accent: Color, muted: Color, text: Color) =
  * no send box.
  */
 @Composable
-fun ConversationScreen() {
+fun ConversationScreen(
+    requestedAgent: String? = null,
+    onRequestedAgentConsumed: () -> Unit = {},
+) {
     val context  = LocalContext.current
     val state    = context.getSharedPreferences(CodelightService.STATE_PREFS, 0)
     val settings = context.getSharedPreferences(CodelightService.SETTINGS_PREFS, 0)
     val agentDisplay = currentAgentDisplayName(context, state)
     val maxLines = settings.getInt(CodelightService.KEY_CONV_LINES, 50)
 
-    var lines by remember { mutableStateOf(loadConversation(state)) }
-    var metaRevision by remember { mutableIntStateOf(0) }
+    // Recompose whenever any conversation cache, the active-agent pointer, or
+    // the branding metadata changes.
+    var revision by remember { mutableIntStateOf(0) }
     DisposableEffect(Unit) {
-        val listener = SharedPreferences.OnSharedPreferenceChangeListener { p, k ->
-            if (k == CodelightService.KEY_CONVERSATION) lines = loadConversation(p)
-            if (k == CodelightService.KEY_AGENTS_META) metaRevision++
+        val listener = SharedPreferences.OnSharedPreferenceChangeListener { _, k ->
+            if (k == CodelightService.KEY_AGENTS_META ||
+                k == CodelightService.KEY_CONVERSATION_AGENT ||
+                (k?.startsWith(CodelightService.KEY_CONVERSATION_PREFIX) == true)
+            ) revision++
         }
         state.registerOnSharedPreferenceChangeListener(listener)
         onDispose { state.unregisterOnSharedPreferenceChangeListener(listener) }
     }
-    @Suppress("UNUSED_EXPRESSION")
-    metaRevision
+
+    val brandings = AgentBrandings.fromPrefs(state)
+    // Preserve the daemon's order; only conversation-capable agents.
+    val convAgents = brandings.filter { it.value.conversation }.keys.toList()
+    val activeAgent = state.getString(CodelightService.KEY_CONVERSATION_AGENT, "") ?: ""
+
+    // Initial selection (once per entry): the agent tapped in Status, else the
+    // active agent, else the first conversation-capable one.
+    var selected by remember {
+        mutableStateOf(
+            requestedAgent?.takeIf { it.isNotBlank() }
+                ?: activeAgent.ifBlank { convAgents.firstOrNull() ?: "" }
+        )
+    }
+    // Fetch the tapped agent's feed if we have nothing cached, then clear the
+    // one-shot request so it doesn't re-fire on later recompositions.
+    LaunchedEffect(requestedAgent) {
+        val want = requestedAgent
+        if (!want.isNullOrBlank()) {
+            selected = want
+            if (loadConversationFor(state, want).isEmpty()) requestConversation(context, want)
+            onRequestedAgentConsumed()
+        }
+    }
+    // Auto-switch to the active agent only when it genuinely CHANGES after
+    // entry — not on first composition (which would clobber the tapped agent).
+    var seenActive by remember { mutableStateOf(activeAgent) }
+    LaunchedEffect(activeAgent) {
+        if (activeAgent.isNotBlank() && activeAgent != seenActive) {
+            selected = activeAgent
+        }
+        seenActive = activeAgent
+    }
 
     val text  = Palette.text
     val muted = Palette.muted
+    @Suppress("UNUSED_EXPRESSION") revision
+    val lines = loadConversationFor(state, selected)
     val shown = lines.takeLast(maxLines)
     val scroll = rememberScrollState()
 
-    // Keep the newest content in view as the feed grows. Drive off maxValue
-    // (which updates after the new content is laid out) rather than the message
-    // count — otherwise we'd scroll to the previous bottom before the new tool
-    // output has been measured and stop short of it.
     LaunchedEffect(Unit) {
         snapshotFlow { scroll.maxValue }.collect { scroll.scrollTo(it) }
     }
 
-    if (shown.isEmpty()) {
-        Box(Modifier.fillMaxSize().padding(24.dp), contentAlignment = Alignment.Center) {
-              Text("No conversation yet. It appears here once $agentDisplay is active on the companion.",
-                 style = TextStyle(color = muted, fontSize = 13.sp))
+    Column(Modifier.fillMaxSize()) {
+        if (convAgents.size > 1) {
+            ConversationAgentPicker(
+                agents = convAgents,
+                selected = selected,
+                brandings = brandings,
+                onSelect = { agentId ->
+                    selected = agentId
+                    if (loadConversationFor(state, agentId).isEmpty())
+                        requestConversation(context, agentId)
+                },
+            )
         }
-        return
-    }
+
+        if (shown.isEmpty()) {
+            Box(Modifier.fillMaxSize().padding(24.dp), contentAlignment = Alignment.Center) {
+                Text("No conversation yet. It appears here once an agent is active on the companion.",
+                    style = TextStyle(color = muted, fontSize = 13.sp))
+            }
+            return@Column
+        }
 
     Column(
         Modifier.fillMaxSize().verticalScroll(scroll).padding(horizontal = 16.dp, vertical = 12.dp),
         verticalArrangement = Arrangement.spacedBy(10.dp),
     ) {
-        val brandings = AgentBrandings.fromPrefs(state)
         shown.forEach { line ->
             val role = line.role
             val body = line.text
@@ -584,6 +636,56 @@ fun ConversationScreen() {
             }
         }
     }
+    }
+}
+
+/** Dropdown to switch which conversation-capable agent's feed is shown. */
+@Composable
+private fun ConversationAgentPicker(
+    agents: List<String>,
+    selected: String,
+    brandings: Map<String, AgentBranding>,
+    onSelect: (String) -> Unit,
+) {
+    var expanded by remember { mutableStateOf(false) }
+    val current = brandings[selected]
+    Box(Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 8.dp)) {
+        Row(
+            Modifier.fillMaxWidth()
+                .background(Palette.card, RoundedCornerShape(8.dp))
+                .clickable { expanded = true }
+                .padding(horizontal = 12.dp, vertical = 10.dp),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(8.dp),
+        ) {
+            AgentLogo(current, tint = current?.color ?: Palette.text, size = 16.dp)
+            Text(current?.display ?: selected.replaceFirstChar { it.uppercase() },
+                color = Palette.text, fontWeight = FontWeight.Bold,
+                modifier = Modifier.weight(1f))
+            Text("▾", color = Palette.muted, fontSize = 14.sp)
+        }
+        DropdownMenu(expanded = expanded, onDismissRequest = { expanded = false }) {
+            agents.forEach { agentId ->
+                val b = brandings[agentId]
+                DropdownMenuItem(
+                    text = {
+                        Row(verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                            AgentLogo(b, tint = b?.color ?: Palette.text, size = 16.dp)
+                            Text(b?.display ?: agentId.replaceFirstChar { it.uppercase() })
+                        }
+                    },
+                    onClick = { expanded = false; onSelect(agentId) },
+                )
+            }
+        }
+    }
+}
+
+private fun requestConversation(ctx: Context, agentId: String) {
+    ctx.startService(Intent(ctx, CodelightService::class.java)
+        .setAction(CodelightService.ACTION_GET_CONVERSATION)
+        .putExtra(CodelightService.EXTRA_AGENT_ID, agentId))
 }
 
 /**
@@ -697,15 +799,22 @@ private fun AnnotatedString.Builder.appendInline(s: String, accent: Color) {
 
 private data class ConvLine(val role: String, val text: String, val agentId: String)
 
-private fun loadConversation(prefs: SharedPreferences): List<ConvLine> {
+private fun parseConversation(json: String?): List<ConvLine> {
     return try {
-        val arr = JSONArray(prefs.getString(CodelightService.KEY_CONVERSATION, "[]") ?: "[]")
+        val arr = JSONArray(json ?: "[]")
         (0 until arr.length()).mapNotNull {
             val o = arr.optJSONObject(it) ?: return@mapNotNull null
             ConvLine(o.optString("role", "assistant"), o.optString("text", ""),
                      o.optString("agent_id", ""))
         }.filter { it.text.isNotBlank() }
     } catch (_: Exception) { emptyList() }
+}
+
+/** Cached conversation lines for a specific agent (empty if none seen yet). */
+private fun loadConversationFor(prefs: SharedPreferences, agentId: String): List<ConvLine> {
+    if (agentId.isBlank()) return emptyList()
+    return parseConversation(
+        prefs.getString(CodelightService.KEY_CONVERSATION_PREFIX + agentId, "[]"))
 }
 
 // ── Request (permission / question) ────────────────────────────────────────────

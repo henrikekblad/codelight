@@ -73,7 +73,10 @@ class CodelightService : LifecycleService() {
         const val KEY_PENDING_REQUESTS   = "pending_requests"   // JSON {id → request}
         const val KEY_CONV_LINES         = "conv_lines"         // how many lines to show
         const val KEY_REMOTE_CONTROL     = "remote_control"     // companion arms tabs
-        const val KEY_CONVERSATION       = "conversation"       // JSON [{role,text}]
+        const val KEY_CONVERSATION       = "conversation"       // JSON [{role,text}] — active feed
+        const val KEY_CONVERSATION_AGENT = "conversation_agent" // agent_id of the active feed
+        // Per-agent conversation cache: KEY_CONVERSATION_PREFIX + agentId → JSON lines.
+        const val KEY_CONVERSATION_PREFIX = "conversation_"
         const val KEY_SESSION_RESET_RESULT = "session_reset_result"
 
         private const val ALERT_NOTIF_ID    = 2
@@ -88,6 +91,7 @@ class CodelightService : LifecycleService() {
         const val ACTION_QUESTION_RESPONSE   = "se.sensnology.codelight.QUESTION_RESPONSE"
         const val ACTION_EXTEND              = "se.sensnology.codelight.EXTEND"
         const val ACTION_SESSION_RESET       = "se.sensnology.codelight.SESSION_RESET"
+        const val ACTION_GET_CONVERSATION    = "se.sensnology.codelight.GET_CONVERSATION"
         const val EXTRA_REQUEST_ID = "request_id"
         const val EXTRA_DECISION   = "decision"
         const val EXTRA_ANSWERS    = "answers"   // JSON {question → answer}
@@ -187,6 +191,11 @@ class CodelightService : LifecycleService() {
             ACTION_SESSION_RESET -> {
                 val agentId = intent.getStringExtra(EXTRA_AGENT_ID)
                 if (!agentId.isNullOrBlank()) sendSessionResetRequest(agentId)
+            }
+            ACTION_GET_CONVERSATION -> {
+                val agentId = intent.getStringExtra(EXTRA_AGENT_ID)
+                if (!agentId.isNullOrBlank())
+                    webSocket?.send("""{"type":"get_conversation","agent_id":"$agentId"}""")
             }
         }
         return START_STICKY
@@ -528,14 +537,22 @@ class CodelightService : LifecycleService() {
 
     private fun storeConversation(obj: JSONObject) {
         // Mirror the companion's conversation feed to STATE_PREFS for the tab.
+        // Every payload is cached per agent so the Conversation tab can switch
+        // between agents; an unsolicited (active-feed) payload also updates the
+        // "active agent" pointer that drives auto-switch.
         val lines = obj.optJSONArray("lines") ?: JSONArray()
+        val agentId = obj.optString("agent_id", "")
+        val requested = obj.optBoolean("requested", false)
         val edit = getSharedPreferences(STATE_PREFS, MODE_PRIVATE).edit()
-            .putString(KEY_CONVERSATION, lines.toString())
-        if (obj.has("agent_id")) {
-            edit.putString(KEY_AGENT_ID, obj.optString("agent_id", ""))
+        if (agentId.isNotBlank()) {
+            edit.putString(KEY_CONVERSATION_PREFIX + agentId, lines.toString())
         }
-        if (obj.has("agent_display")) {
-            edit.putString(KEY_AGENT_DISPLAY, obj.optString("agent_display", "Agent"))
+        if (!requested) {
+            edit.putString(KEY_CONVERSATION, lines.toString())
+            if (agentId.isNotBlank()) edit.putString(KEY_CONVERSATION_AGENT, agentId)
+            if (obj.has("agent_id")) edit.putString(KEY_AGENT_ID, agentId)
+            if (obj.has("agent_display"))
+                edit.putString(KEY_AGENT_DISPLAY, obj.optString("agent_display", "Agent"))
         }
         edit.apply()
     }
