@@ -41,6 +41,7 @@ class CodelightWebsocketHub:
         overall_status: OverallStatusCallback,
         pending_payloads: PendingPayloadsCallback,
         conversation_payload: ConversationPayloadCallback,
+        conversation_payload_for: Callable[[str], JsonDict | None],
         notify_conversation_changed: SimpleCallback,
         note_question_client_gone: SimpleCallback,
         respond_permission: PermissionResponseCallback,
@@ -60,6 +61,7 @@ class CodelightWebsocketHub:
         self._overall_status = overall_status
         self._pending_payloads = pending_payloads
         self._conversation_payload = conversation_payload
+        self._conversation_payload_for = conversation_payload_for
         self._notify_conversation_changed = notify_conversation_changed
         self._note_question_client_gone = note_question_client_gone
         self._respond_permission = respond_permission
@@ -280,10 +282,25 @@ class CodelightWebsocketHub:
             await ws.send(json.dumps(result))
             return client_name
 
+        if message_type == "get_conversation":
+            # A client asks for a specific agent's latest conversation (e.g.
+            # tapping an agent that isn't the active one). Reply only to them.
+            if "conversation" in self.conversation_clients_features(ws):
+                payload = self._conversation_payload_for(
+                    str(message.get("agent_id") or ""))
+                if payload is not None:
+                    # Mark as a reply to an explicit request so the client
+                    # caches it without treating that agent as newly active.
+                    await ws.send(json.dumps({**payload, "requested": True}))
+            return client_name
+
         if message_type == "extend":
             self._extend_request(str(message.get("id", "")))
 
         return client_name
+
+    def conversation_clients_features(self, ws) -> set:
+        return {"conversation"} if ws in self.conversation_clients else set()
 
     def _config_message(self, client: str) -> JsonDict:
         utc_offset = int(datetime.now().astimezone().utcoffset().total_seconds())

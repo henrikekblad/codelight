@@ -20,6 +20,7 @@ DEFAULT_USAGE: dict[str, Any] = {
 class ActiveTranscript:
     session_id: str
     path: str
+    agent_id: str = ""
 
 
 class CodelightState:
@@ -49,7 +50,19 @@ class CodelightState:
             self._default_agent_id: dict(DEFAULT_USAGE),
         }
         self._last_transcript: dict[str, str] = {"sid": "", "path": ""}
+        # agent_id → {"sid", "path"}: newest transcript seen per agent, so a
+        # client can request any conversation-capable agent's latest feed.
+        self._transcripts_by_agent: dict[str, dict[str, str]] = {}
         self._last_active_agent: str = default_agent_id
+        # Configured agents shown as idle even without a usage meter or an
+        # active session, so hook-only agents (no readable quota) stay visible.
+        self._enabled_agents: set[str] = set()
+
+    def set_enabled_agents(self, agent_ids) -> None:
+        with self._lock:
+            self._enabled_agents = {
+                self.normalize_agent_id(a) for a in (agent_ids or set())
+            }
 
     def normalize_agent_id(self, agent_id: str | None) -> str:
         aid = str(agent_id or "").strip().lower()
@@ -86,6 +99,10 @@ class CodelightState:
                     "path": transcript,
                     "agent_id": normalized_agent,
                 }
+                self._transcripts_by_agent[normalized_agent] = {
+                    "sid": session_id,
+                    "path": transcript,
+                }
             if state == "ended":
                 self._sessions.pop(session_id, None)
             else:
@@ -103,26 +120,44 @@ class CodelightState:
 
     def active_transcript(self) -> ActiveTranscript:
         with self._lock:
+            best: tuple[str, float, str, str] | None = None
+            for sid, info in self._sessions.items():
+                transcript = str(info.get("transcript") or "")
+                if transcript and (best is None or float(info["time"]) > best[1]):
+                    best = (sid, float(info["time"]), transcript,
+                            self.normalize_agent_id(info.get("agent_id")))
+            if best:
+                # Agent travels with the transcript so the conversation label
+                # can never diverge from the content being shown.
+                return ActiveTranscript(best[0], best[2], best[3])
+            path = self._last_transcript.get("path", "")
+            if path:
+                return ActiveTranscript(
+                    self._last_transcript.get("sid", ""),
+                    path,
+                    self.normalize_agent_id(
+                        self._last_transcript.get("agent_id")),
+                )
+        return ActiveTranscript("", "")
+
+    def transcript_for_agent(self, agent_id: str) -> ActiveTranscript:
+        """Latest known transcript for a specific agent: an active session's
+        first, else the newest transcript that agent ever reported this run."""
+        aid = self.normalize_agent_id(agent_id)
+        with self._lock:
             best: tuple[str, float, str] | None = None
             for sid, info in self._sessions.items():
+                if self.normalize_agent_id(info.get("agent_id")) != aid:
+                    continue
                 transcript = str(info.get("transcript") or "")
                 if transcript and (best is None or float(info["time"]) > best[1]):
                     best = (sid, float(info["time"]), transcript)
             if best:
-                return ActiveTranscript(best[0], best[2])
-            path = self._last_transcript.get("path", "")
-            if path:
-                return ActiveTranscript(self._last_transcript.get("sid", ""), path)
-        return ActiveTranscript("", "")
-
-    def conversation_agent(self, session_id: str) -> str:
-        with self._lock:
-            info = self._sessions.get(session_id, {})
-            return self.normalize_agent_id(
-                info.get("agent_id")
-                or self._last_transcript.get("agent_id")
-                or self._last_active_agent
-            )
+                return ActiveTranscript(best[0], best[2], aid)
+            rec = self._transcripts_by_agent.get(aid)
+            if rec and rec.get("path"):
+                return ActiveTranscript(rec.get("sid", ""), rec["path"], aid)
+        return ActiveTranscript("", "", aid)
 
     @staticmethod
     def _status_rank(status: str) -> int:
@@ -158,6 +193,10 @@ class CodelightState:
                     overall = "working"
                 elif state == "waiting" and overall != "working":
                     overall = "waiting"
+            # Every configured agent stays visible (idle) even with no active
+            # session — agents without a usage meter would otherwise vanish.
+            for agent_id in self._enabled_agents:
+                per_agent.setdefault(agent_id, "idle")
             if not per_agent:
                 per_agent[last_agent] = "idle"
             return active, overall, per_agent, last_agent

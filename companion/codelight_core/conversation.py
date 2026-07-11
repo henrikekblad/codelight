@@ -10,23 +10,25 @@ ActivePath = Callable[[], str]
 HasClients = Callable[[], bool]
 Broadcast = Callable[[], None]
 ParseTranscript = Callable[[str], list[dict]]
-ConversationAgent = Callable[[str], str]
 AgentDisplay = Callable[[str | None], str]
 FileSignature = tuple[int, int]
 
 
 def build_payload(
     *,
-    active_transcript: Callable[[], tuple[str, str]],
+    active_transcript: Callable[[], tuple[str, str, str]],
     parse_transcript: ParseTranscript,
-    conversation_agent: ConversationAgent,
+    normalize_agent_id: Callable[[str | None], str],
     agent_display_name: AgentDisplay,
 ) -> dict | None:
-    """Build the conversation feed payload for the active transcript."""
-    session_id, path = active_transcript()
+    """Build the conversation feed payload for the active transcript.
+
+    The agent id travels with the transcript (same source as the path), so the
+    feed's label can never diverge from the content being shown."""
+    session_id, path, agent_id = active_transcript()
     if not path:
         return None
-    agent_id = conversation_agent(session_id)
+    agent_id = normalize_agent_id(agent_id)
     lines = parse_transcript(path)
     for line in lines:
         if isinstance(line, dict):

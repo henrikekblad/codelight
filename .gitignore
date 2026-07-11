@@ -20,6 +20,10 @@ android/local.properties
 # Editor-local tasks and approval settings
 .vscode/
 
+# Project-level agent config created by the agents themselves during testing
+.grok/
+.cursor/
+
 # OS
 .DS_Store
 Thumbs.db

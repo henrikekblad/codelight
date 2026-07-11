@@ -41,7 +41,9 @@ def run_status_hook(
             "session_id": session_id,
             "agent_id": normalized_agent,
             "transcript_path": transcript_path,
-            "cwd": data.get("cwd", ""),
+            # Cursor sends workspace_roots instead of a top-level cwd.
+            "cwd": str(data.get("cwd")
+                       or (data.get("workspace_roots") or [""])[0] or ""),
             "hook_event": hook_event,
         },
         timeout=0.5,
@@ -93,6 +95,17 @@ def run_permission_hook(
     tool_name = hook_runtime.tool_name(data)
     tool_input = hook_runtime.tool_input(data)
     cwd = str(data.get("cwd") or "")
+
+    # Cursor payload shapes: beforeShellExecution carries the command at the
+    # top level (no tool_name), and beforeMCPExecution serializes tool_input
+    # as a JSON string.
+    if tool_name == "?" and isinstance(data.get("command"), str):
+        tool_name = "Bash"
+        tool_input = {"command": data["command"]}
+    if not tool_input and isinstance(data.get("tool_input"), str):
+        parsed = hook_runtime.parse_json_object(data["tool_input"])
+        if parsed:
+            tool_input = parsed
 
     if mode.requires_tool_use_id and not data.get("tool_use_id"):
         return
@@ -159,6 +172,7 @@ def run_permission_hook(
         "cwd":        cwd,
     }
 
+    decision = None
     try:
         response = hook_io.request_json(
             socket_path,
@@ -168,24 +182,26 @@ def run_permission_hook(
             max_bytes=4096,
         )
         decision = response.get("decision") if response else None
-        if decision in ("allow", "deny"):
-            emit_permission_decision(
-                decision,
-                envelope=mode.envelope,
-                reason="Denied by remote codelight approval" if decision == "deny" else "")
-        return
     except Exception:
-        pass
+        try:
+            hook_io.write_monitor_state(
+                monitor_state_dir,
+                session_id=session_id,
+                state="waiting",
+                agent_id=normalized_agent,
+            )
+        except Exception:
+            pass
 
-    try:
-        hook_io.write_monitor_state(
-            monitor_state_dir,
-            session_id=session_id,
-            state="waiting",
-            agent_id=normalized_agent,
-        )
-    except Exception:
-        pass
+    if decision in ("allow", "deny"):
+        emit_permission_decision(
+            decision,
+            envelope=mode.envelope,
+            reason="Denied by remote codelight approval" if decision == "deny" else "")
+    elif mode.fallback_decision:
+        # No remote decision — hand back to the agent's own prompt explicitly
+        # (e.g. Cursor's {"permission": "ask"}).
+        emit_permission_decision(mode.fallback_decision, envelope=mode.envelope)
 
 
 def run_question_hook(

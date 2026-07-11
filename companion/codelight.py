@@ -185,17 +185,19 @@ def _update_session(session_id: str, state: str,
     )
 
 
-def _active_transcript() -> tuple[str, str]:
-    """(session_id, transcript_path) of the most-recently-active session that
-    has a known transcript. Falls back to the last transcript we ever saw so
-    the trailing message survives the session being popped on Stop."""
+def _active_transcript() -> tuple[str, str, str]:
+    """(session_id, transcript_path, agent_id) of the most-recently-active
+    session that has a known transcript. Falls back to the last transcript we
+    ever saw so the trailing message survives the session being popped on Stop.
+    The agent id is carried alongside the path so the conversation label always
+    matches the content shown."""
     active = _state.active_transcript()
     if active.path:
-        return (active.session_id, active.path)
+        return (active.session_id, active.path, active.agent_id)
     for agent_id, path in _agents.latest_transcript_fallbacks():
         if path:
-            return (agent_id, path)
-    return ("", "")
+            return (agent_id, path, agent_id)
+    return ("", "", "")
 
 
 def _client_config(client: str = "") -> dict:
@@ -221,7 +223,27 @@ def _conversation_payload() -> dict | None:
     return conversation_core.build_payload(
         active_transcript=_active_transcript,
         parse_transcript=_parse_transcript,
-        conversation_agent=_state.conversation_agent,
+        normalize_agent_id=_normalize_agent_id,
+        agent_display_name=_agent_display_name,
+    )
+
+
+def _conversation_payload_for(agent_id: str) -> dict | None:
+    """Build the conversation feed for a specific agent on client request —
+    its active session's transcript, its newest one this run, or (cold start)
+    the newest one on disk."""
+    aid = _normalize_agent_id(agent_id)
+
+    def resolve() -> tuple[str, str, str]:
+        active = _state.transcript_for_agent(aid)
+        if active.path:
+            return (active.session_id, active.path, aid)
+        return ("", _agents.latest_transcript_for(aid), aid)
+
+    return conversation_core.build_payload(
+        active_transcript=resolve,
+        parse_transcript=_parse_transcript,
+        normalize_agent_id=_normalize_agent_id,
         agent_display_name=_agent_display_name,
     )
 
@@ -631,6 +653,7 @@ def _ws_thread(port: int, secret: str) -> None:
         overall_status=_overall_status,
         pending_payloads=_pending_remote_payloads,
         conversation_payload=_conversation_payload,
+        conversation_payload_for=_conversation_payload_for,
         notify_conversation_changed=_notify_conversation_changed,
         note_question_client_gone=_note_qclient_gone,
         respond_permission=_resolve_permission,
@@ -840,6 +863,10 @@ def main():
                       else lifecycle.detect_installed_agents(_new_agent_registry()))
     print("[agents] enabled: " + (", ".join(sorted(enabled_agents)) or "none"),
           flush=True)
+    # Keep configured agents visible (idle) even when they have no usage meter
+    # and no active session — otherwise hook-only agents like Cursor/Grok only
+    # appear while actively working.
+    _state.set_enabled_agents(enabled_agents)
 
     lifecycle.install_agent_hooks(
         agent_registry=_new_agent_registry(log=vprint),

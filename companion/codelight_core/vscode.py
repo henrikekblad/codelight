@@ -15,6 +15,7 @@ VSCODE_FLAVORS = [
     ("code", "~/.config/Code/User/settings.json"),
     ("code-insiders", "~/.config/Code - Insiders/User/settings.json"),
     ("codium", "~/.config/VSCodium/User/settings.json"),
+    ("cursor", "~/.config/Cursor/User/settings.json"),
 ]
 VSCODE_EXT_ID = "sensnology.codelight"
 

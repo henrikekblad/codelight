@@ -195,6 +195,108 @@ Example:
 }
 ```
 
+## Grok (`agents.grok`)
+
+Keys:
+
+- `home` (string): Grok home directory.
+  - Default: `~/.grok` (or `GROK_HOME`)
+
+Behavior and quirks:
+
+- Status-only integration: codelight writes its own hook file
+  `~/.grok/hooks/codelight.json` (Grok reads every `*.json` in that
+  directory) mapping SessionStart/UserPromptSubmit/PreToolUse/PostToolUse/
+  PostToolUseFailure/PermissionDenied/Subagent* → working,
+  Notification → waiting, Stop/SessionEnd → ended.
+- **No remote permission approval**: Grok's only blocking hook
+  (`PreToolUse`) can deny but cannot approve past Grok's own interactive
+  prompt, and it fires for every tool call before Grok's permission
+  pipeline — forwarding it would spam clients with requests Grok
+  auto-approves. Revisit if xAI adds an allow/bypass decision.
+- No usage meters yet: no machine-readable quota surface has been found for
+  the CLI. Clients hide the bars (empty meter titles).
+- Session transcripts: layout under `~/.grok/sessions` is undocumented;
+  codelight looks up session files by id in the filename, best-effort.
+- Auth for the CLI itself: browser login (SuperGrok / X Premium+) or
+  `XAI_API_KEY` — irrelevant to codelight's hooks either way.
+
+Example:
+
+```json
+{
+  "agents": {
+    "grok": {
+      "home": "~/.grok"
+    }
+  }
+}
+```
+
+## Cursor (`agents.cursor`)
+
+Keys:
+
+- `home` (string): Cursor home directory.
+  - Default: `~/.cursor` (or `CURSOR_HOME`)
+- `state_db` (string): Cursor IDE's SQLite state store, used to read the
+  auth token for the usage meter.
+  - Default: `~/.config/Cursor/User/globalStorage/state.vscdb` (Linux; set
+    this on macOS/Windows).
+- `usage` (boolean): show the monthly usage meter. Default: `true`.
+
+Behavior and quirks:
+
+- Usage meter: reads Cursor's session JWT from `state_db` (no cookie paste),
+  then calls Cursor's own `cursor.com/api/usage-summary` and shows
+  `totalPercentUsed` as a monthly bar resetting at the billing-cycle end.
+  Undocumented endpoint — if it changes or you're not signed in, the meter
+  simply hides (returns nothing). Set `usage: false` to disable the call.
+
+- Hooks are **merged into the user's own `~/.cursor/hooks.json`** (flat
+  entry format, `{"version": 1, "hooks": {...}}`): codelight entries are
+  identified by command and stripped/replaced on reinstall/uninstall; the
+  user's own hooks are never touched.
+- Status: sessionStart/beforeSubmitPrompt/postToolUse(+Failure) → working,
+  stop/sessionEnd → ended. Cursor's session key is `conversation_id` and
+  every hook payload carries `transcript_path`, which feeds the
+  conversation feature automatically.
+- **Full remote permission support** via `beforeShellExecution` and
+  `beforeMCPExecution` (`permission-cursor` hook mode): allow bypasses
+  Cursor's own prompt, deny blocks, and when no remote decision arrives
+  codelight answers `{"permission": "ask"}` so Cursor falls back to its
+  local prompt. `preToolUse` is deliberately not used for permissions
+  (allow/deny only — no safe fallback).
+- No question interception (Cursor has no AskUserQuestion-style hook).
+- No usage meters: Cursor has no official individual usage API (the
+  dashboard API requires a browser session cookie — see PLAN.md).
+- **Remote approval works in the Cursor IDE** (verified 2026-07-11): a
+  `beforeShellExecution` `allow` bypasses the IDE's command prompt, so a
+  remote Allow runs the command with no local prompt.
+- **The Cursor CLI (`cursor-agent`) is weaker — deny-only in practice.** Its
+  hook set is a subset, and a hook `allow` does NOT bypass the CLI's own
+  command allowlist ("Not in allowlist: …"), so you get a double prompt
+  (phone + TUI) and the command still waits for local approval. In headless
+  `-p` there's no prompt at all: commands need `--force`/`--yolo`, and a hook
+  `allow` won't auto-run them (Cursor retries to its loop limit, then gives
+  up). Remote *deny* does work everywhere (hooks can always block). Net: use
+  the IDE for the full remote-approval experience; on the CLI, codelight is
+  effectively status + remote-deny.
+- Detection: `cursor` (IDE) or `cursor-agent` (CLI) on PATH. The generic
+  `agent` alias is deliberately not probed.
+
+Example:
+
+```json
+{
+  "agents": {
+    "cursor": {
+      "home": "~/.cursor"
+    }
+  }
+}
+```
+
 ## Combined example
 
 ```json

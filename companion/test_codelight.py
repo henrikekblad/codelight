@@ -19,10 +19,13 @@ import codelight
 from codelight_core.agents import base as agents_base
 from codelight_core.agents import codex as codex_agent
 from codelight_core.agents import copilot as copilot_agent
+from codelight_core.agents import cursor as cursor_agent
+from codelight_core.agents import grok as grok_agent
 from codelight_core.state import CodelightState
 from codelight_core import auth as auth_core
 from codelight_core import dashboard_client
 from codelight_core import hooks as hooks_core
+from codelight_core import conversation as conversation_core
 from codelight_core.conversation import ConversationRefresher
 from codelight_core import discovery as discovery_core
 from codelight_core import hook_commands
@@ -30,6 +33,7 @@ from codelight_core import hook_io
 from codelight_core import hook_runtime
 from codelight_core import lifecycle
 from codelight_core import policy as policy_core
+from codelight_core import transcript as transcript_core
 from codelight_core import remote_control
 from codelight_core import remote_payloads
 from codelight_core import service as service_core
@@ -438,6 +442,7 @@ class AuthenticationTests(unittest.TestCase):
             overall_status=lambda: (0, "idle", {}, ""),
             pending_payloads=lambda: [],
             conversation_payload=lambda: None,
+            conversation_payload_for=lambda agent_id: None,
             notify_conversation_changed=lambda: None,
             note_question_client_gone=lambda: None,
             respond_permission=lambda request_id, decision, by: False,
@@ -527,6 +532,14 @@ class AgentDetectionTests(unittest.TestCase):
 
 
 class ClientConfigTests(unittest.TestCase):
+    def test_conversation_capability_flag_in_client_metadata(self):
+        meta = codelight._new_agent_registry().client_metadata("vscode")
+        # Agents with a transcript extractor advertise conversation support.
+        self.assertTrue(meta["cursor"]["conversation"])
+        self.assertTrue(meta["claude"]["conversation"])
+        # Grok has no extractor (undocumented format) → no conversation.
+        self.assertFalse(meta["grok"]["conversation"])
+
     def test_load_config_reads_agents_section(self):
         with tempfile.TemporaryDirectory() as tmp:
             with open(os.path.join(tmp, "config.json"), "w") as stream:
@@ -751,6 +764,61 @@ class StateSnapshotTests(unittest.TestCase):
             idle_window_waiting=30,
         )
 
+    def test_active_transcript_carries_its_agent(self):
+        state = self.make_state()
+        # Cursor is the most-recently-active session with a transcript; a more
+        # recent claude "working" WITHOUT a transcript must not steal the label.
+        state.update_session("cur-1", "working",
+                             transcript="/tmp/cursor.jsonl", agent_id="cursor")
+        state.update_session("cla-1", "working", agent_id="claude")
+
+        active = state.active_transcript()
+        self.assertEqual(active.path, "/tmp/cursor.jsonl")
+        self.assertEqual(active.agent_id, "cursor")
+
+    def test_transcript_for_agent_returns_that_agents_latest(self):
+        state = self.make_state()
+        state.update_session("cur-1", "working",
+                             transcript="/tmp/cursor.jsonl", agent_id="cursor")
+        state.update_session("cla-1", "working",
+                             transcript="/tmp/claude.jsonl", agent_id="claude")
+
+        cur = state.transcript_for_agent("cursor")
+        self.assertEqual(cur.path, "/tmp/cursor.jsonl")
+        self.assertEqual(cur.agent_id, "cursor")
+        # Ended session still resolves via the per-agent record.
+        state.update_session("cur-1", "ended", agent_id="cursor")
+        self.assertEqual(state.transcript_for_agent("cursor").path,
+                         "/tmp/cursor.jsonl")
+        self.assertEqual(state.transcript_for_agent("grok").path, "")
+
+    def test_conversation_payload_label_matches_transcript_source(self):
+        payload = conversation_core.build_payload(
+            active_transcript=lambda: ("s1", "/tmp/x.jsonl", "cursor"),
+            parse_transcript=lambda path: [{"role": "user", "text": "hi"}],
+            normalize_agent_id=lambda a: a or "claude",
+            agent_display_name=lambda a: {"cursor": "Cursor"}.get(a, "?"),
+        )
+        self.assertEqual(payload["agent_id"], "cursor")
+        self.assertEqual(payload["agent_display"], "Cursor")
+        self.assertEqual(payload["lines"][0]["agent_id"], "cursor")
+
+    def test_enabled_agents_stay_visible_when_idle(self):
+        state = self.make_state()
+        state.set_enabled_agents({"claude", "cursor", "grok"})
+
+        # No active sessions, no usage for cursor/grok — they must still appear.
+        snapshot = state.status_snapshot()
+        per_agent_status = snapshot["per_agent_status"]
+        self.assertEqual(per_agent_status.get("cursor"), "idle")
+        self.assertEqual(per_agent_status.get("grok"), "idle")
+
+        # An active session overrides idle for that agent only.
+        state.update_session("s1", "working", agent_id="cursor")
+        per_agent_status = state.status_snapshot()["per_agent_status"]
+        self.assertEqual(per_agent_status["cursor"], "working")
+        self.assertEqual(per_agent_status["grok"], "idle")
+
     def test_status_snapshot_uses_last_active_agent_usage(self):
         state = self.make_state()
         state.update_usage(usages={
@@ -896,7 +964,8 @@ class UsagePollerTests(unittest.TestCase):
             )
 
             self.assertEqual(copilot.token(), "token")
-            self.assertEqual(set(registry.usage_fetchers()), {"claude", "codex", "copilot"})
+            self.assertEqual(set(registry.usage_fetchers()),
+                             {"claude", "codex", "copilot", "cursor"})
             self.assertIsNotNone(usage)
             self.assertEqual(usage["used_credits"], 100)
 
@@ -1127,6 +1196,7 @@ class HookRuntimeTests(unittest.TestCase):
             set(codelight._new_agent_registry().hook_modes()),
             {
                 "permission", "permission-copilot", "permission-vscode",
+                "permission-cursor",
                 "question", "question-vscode", "question-codex",
             },
         )
@@ -1411,6 +1481,306 @@ class RemoteControlTests(unittest.TestCase):
             ),
             10.0,
         )
+
+
+class GrokIntegrationTests(unittest.TestCase):
+    def test_install_hooks_writes_status_only_document(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            hooks_file = os.path.join(tmp, "hooks", "codelight.json")
+            grok_agent.install_hooks(
+                hooks_file, "/opt/codelight.py",
+                hook_wait_ceiling=590,
+                remote_permissions=True,   # ignored: Grok hooks are deny-only
+            )
+            with open(hooks_file) as stream:
+                doc = json.load(stream)
+
+        hooks = doc["hooks"]
+        def state_of(event):
+            return hooks[event][0]["command"].rsplit(" ", 1)[-1]
+
+        self.assertEqual(state_of("SessionStart"), "working")
+        self.assertEqual(state_of("Notification"), "waiting")
+        self.assertEqual(state_of("Stop"), "ended")
+        self.assertEqual(state_of("SessionEnd"), "ended")
+        self.assertIn("--agent grok", hooks["Stop"][0]["command"])
+        # No permission/question forwarding — Grok's PreToolUse cannot approve.
+        self.assertNotIn("permission", json.dumps(doc))
+        self.assertNotIn("question", json.dumps(doc))
+
+    def test_registry_exposes_grok_without_usage_or_hook_modes(self):
+        registry = codelight._new_agent_registry()
+        self.assertIn("grok", registry.supported_agent_ids())
+        self.assertEqual(registry.executables_by_agent()["grok"], ("grok",))
+        self.assertNotIn("grok", registry.usage_fetchers())
+        self.assertNotIn("grok", registry.vscode_extensions_by_agent())
+
+    def test_session_lookup_matches_newest_file_containing_id(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            sessions = os.path.join(tmp, "sessions", "proj")
+            os.makedirs(sessions)
+            old = os.path.join(sessions, "2026-07-10-abc123.json")
+            new = os.path.join(sessions, "2026-07-11-abc123.json")
+            for path in (old, new):
+                with open(path, "w") as stream:
+                    stream.write("{}")
+            os.utime(old, (1, 1))
+
+            self.assertEqual(
+                grok_agent.sessions_path_for_session(tmp, "abc123"),
+                os.path.realpath(new))
+            self.assertEqual(
+                grok_agent.sessions_path_for_session(tmp, "missing"), "")
+            self.assertEqual(
+                grok_agent.sessions_path_for_session(tmp, "unknown"), "")
+
+
+class CursorIntegrationTests(unittest.TestCase):
+    def test_install_merges_with_user_hooks_and_is_idempotent(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            hooks_file = os.path.join(tmp, "hooks.json")
+            with open(hooks_file, "w") as stream:
+                json.dump({
+                    "version": 1,
+                    "hooks": {
+                        "beforeShellExecution": [
+                            {"command": "/home/user/my-own-hook.sh"},
+                            {"command": "python3 /old/codelight.py --agent cursor --hook permission-cursor"},
+                        ],
+                        "afterFileEdit": [{"command": "my-formatter --fix"}],
+                    },
+                }, stream)
+
+            cursor_agent.install_hooks(
+                hooks_file, "/opt/codelight.py",
+                hook_wait_ceiling=590,
+                remote_permissions=True,
+                permission_timeout=60,
+            )
+            with open(hooks_file) as stream:
+                doc = json.load(stream)
+
+            self.assertEqual(doc["version"], 1)
+            hooks = doc["hooks"]
+            # The user's own hooks survive; the stale codelight entry is gone.
+            shell_cmds = [e["command"] for e in hooks["beforeShellExecution"]]
+            self.assertIn("/home/user/my-own-hook.sh", shell_cmds)
+            self.assertNotIn(
+                "python3 /old/codelight.py --agent cursor --hook permission-cursor",
+                shell_cmds)
+            self.assertTrue(any("permission-cursor" in cmd for cmd in shell_cmds))
+            self.assertEqual(hooks["afterFileEdit"],
+                             [{"command": "my-formatter --fix"}])
+            self.assertTrue(any("--hook ended" in e["command"]
+                                for e in hooks["stop"]))
+            self.assertEqual(hooks["beforeShellExecution"][-1]["timeout"], 605)
+
+            # Second install: no changes.
+            before = json.dumps(doc, sort_keys=True)
+            cursor_agent.install_hooks(
+                hooks_file, "/opt/codelight.py",
+                hook_wait_ceiling=590,
+                remote_permissions=True,
+                permission_timeout=60,
+            )
+            with open(hooks_file) as stream:
+                self.assertEqual(json.dumps(json.load(stream), sort_keys=True),
+                                 before)
+
+    def test_uninstall_strips_flat_codelight_entries_only(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            hooks_file = os.path.join(tmp, "hooks.json")
+            cursor_agent.install_hooks(
+                hooks_file, "/opt/codelight.py",
+                hook_wait_ceiling=590,
+                remote_permissions=True,
+                permission_timeout=60,
+            )
+            with open(hooks_file) as stream:
+                doc = json.load(stream)
+            doc["hooks"]["afterFileEdit"] = [{"command": "my-formatter --fix"}]
+            with open(hooks_file, "w") as stream:
+                json.dump(doc, stream)
+
+            hooks_core.remove_matcher_group_hooks(hooks_file)
+            with open(hooks_file) as stream:
+                cleaned = json.load(stream)
+
+            self.assertEqual(cleaned["hooks"],
+                             {"afterFileEdit": [{"command": "my-formatter --fix"}]})
+
+    def test_permission_cursor_envelope_and_ask_fallback(self):
+        mode = codelight._new_agent_registry().hook_modes()["permission-cursor"]
+        self.assertEqual(mode.envelope, agents_base.CURSOR_PERMISSION)
+        self.assertEqual(mode.fallback_decision, "ask")
+
+        self.assertEqual(
+            hook_runtime.permission_decision_output(
+                "deny", envelope=agents_base.CURSOR_PERMISSION, reason="nope"),
+            {"permission": "deny", "agent_message": "nope"},
+        )
+        self.assertEqual(
+            hook_runtime.permission_decision_output(
+                "ask", envelope=agents_base.CURSOR_PERMISSION),
+            {"permission": "ask"},
+        )
+
+        # Shell payload shim + daemon-unreachable → explicit ask fallback.
+        stdout = io.StringIO()
+        with tempfile.TemporaryDirectory() as tmp, \
+                contextlib.redirect_stdout(stdout):
+            hook_commands.run_permission_hook(
+                mode=mode,
+                agent_id="cursor",
+                socket_path=os.path.join(tmp, "no-daemon.sock"),
+                monitor_state_dir=os.path.join(tmp, "monitor"),
+                policy_path=os.path.join(tmp, "policy.json"),
+                policy_lock=threading.Lock(),
+                hook_wait_ceiling=1,
+                normalize_agent_id=lambda a: a or "cursor",
+                agent_display_name=lambda a: "Cursor",
+                input_text=json.dumps({
+                    "conversation_id": "conv-1",
+                    "hook_event_name": "beforeShellExecution",
+                    "command": "rm -rf /tmp/x",
+                    "cwd": "/tmp",
+                }),
+            )
+        self.assertEqual(json.loads(stdout.getvalue()), {"permission": "ask"})
+
+    def test_transcript_extractor_parses_role_message_shape(self):
+        fd, path = tempfile.mkstemp(suffix=".jsonl")
+        try:
+            with os.fdopen(fd, "w") as stream:
+                for record in [
+                    {"role": "user",
+                     "message": {"content": [{"type": "text", "text": "Fix it"}]}},
+                    {"role": "assistant",
+                     "message": {"content": [
+                         {"type": "text", "text": "On it."},
+                         {"type": "tool_use", "name": "Shell",
+                          "input": {"command": "echo hi"}},
+                     ]}},
+                    {"role": None, "message": None},
+                ]:
+                    stream.write(json.dumps(record) + "\n")
+            lines = transcript_core.parse_transcript(
+                path,
+                tool_summary=lambda name, inp: f"{name}: {inp.get('command','')}",
+                extractors=(cursor_agent.transcript_extractor,),
+            )
+        finally:
+            os.unlink(path)
+
+        self.assertEqual([l["role"] for l in lines],
+                         ["user", "assistant", "tool"])
+        self.assertEqual(lines[0]["text"], "Fix it")
+        self.assertEqual(lines[2]["text"], "Shell: echo hi")
+
+    def test_transcript_extractor_strips_cursor_wrappers_and_redacted(self):
+        record = {"role": "user", "message": {"content": [
+            {"type": "text",
+             "text": "<timestamp>Sun, Jul 12</timestamp>\n"
+                     "<user_query>\nfix the bug\n</user_query>"},
+        ]}}
+        _, content = cursor_agent.transcript_extractor(record, lambda n, i: "")
+        self.assertEqual(content, [{"type": "text", "text": "fix the bug"}])
+
+        # A trailing [REDACTED] reasoning marker is dropped; a standalone one
+        # removes the block entirely.
+        record = {"role": "assistant", "message": {"content": [
+            {"type": "text", "text": "Done:\n\n```\nok\n```\n\n[REDACTED]"},
+            {"type": "text", "text": "[REDACTED]"},
+            {"type": "tool_use", "name": "Shell", "input": {"command": "ls"}},
+        ]}}
+        _, content = cursor_agent.transcript_extractor(record, lambda n, i: "")
+        self.assertEqual(content, [
+            {"type": "text", "text": "Done:\n\n```\nok\n```"},
+            {"type": "tool_use", "name": "Shell", "input": {"command": "ls"}},
+        ])
+
+    def test_shell_tool_summarizes_to_command(self):
+        self.assertEqual(
+            policy_core.tool_summary("Shell", {"command": "echo test",
+                                               "description": "run it"}),
+            "Shell: echo test")
+        self.assertEqual(
+            policy_core.command_from_tool("Shell", {"command": "echo test"}),
+            "echo test")
+
+    def test_transcript_path_for_session_finds_by_id(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            sid = "conv-abc"
+            d = os.path.join(tmp, "projects", "proj", "agent-transcripts", sid)
+            os.makedirs(d)
+            path = os.path.join(d, f"{sid}.jsonl")
+            with open(path, "w") as stream:
+                stream.write("{}")
+
+            self.assertEqual(
+                cursor_agent.transcript_path_for_session(tmp, sid),
+                os.path.realpath(path))
+            self.assertEqual(
+                cursor_agent.transcript_path_for_session(tmp, "missing"), "")
+
+    def test_usage_reads_local_token_and_parses_monthly_percent(self):
+        import base64 as _b64
+        import sqlite3 as _sqlite
+        with tempfile.TemporaryDirectory() as tmp:
+            db = os.path.join(tmp, "state.vscdb")
+            con = _sqlite.connect(db)
+            con.execute("CREATE TABLE ItemTable (key TEXT PRIMARY KEY, value TEXT)")
+            payload = _b64.urlsafe_b64encode(
+                json.dumps({"sub": "google-oauth2|user_ABC"}).encode()
+            ).rstrip(b"=").decode()
+            con.execute("INSERT INTO ItemTable VALUES (?, ?)",
+                        ("cursorAuth/accessToken", f"header.{payload}.sig"))
+            con.commit()
+            con.close()
+
+            captured = {}
+
+            class FakeResp:
+                def __enter__(self): return self
+                def __exit__(self, *a): return False
+                def read(self):
+                    return json.dumps({
+                        "membershipType": "free",
+                        "billingCycleEnd": "2026-08-11T21:20:46.144Z",
+                        "individualUsage": {"plan": {"totalPercentUsed": 10.5}},
+                    }).encode()
+
+            def fake_urlopen(req, timeout=0):
+                captured["cookie"] = req.headers.get("Cookie", "")
+                return FakeResp()
+
+            with mock.patch.object(cursor_agent.urllib.request, "urlopen",
+                                   side_effect=fake_urlopen):
+                usage = cursor_agent.get_usage(db)
+
+            self.assertIsNotNone(usage)
+            self.assertAlmostEqual(usage["monthly_pct"], 0.105, places=4)
+            from codelight_core import timefmt
+            self.assertEqual(usage["monthly_reset_at"],
+                             timefmt.epoch("2026-08-11T21:20:46.144Z"))
+            self.assertEqual(usage["limits"][0]["label"], "Monthly")
+            # Cookie carries the workos id from the JWT sub, not the raw prefix.
+            self.assertIn("user_ABC%3A%3A", captured["cookie"])
+
+        # No DB / no token → no meter, no crash.
+        self.assertIsNone(cursor_agent.get_usage(os.path.join(tmp, "gone.vscdb")))
+
+    def test_registry_exposes_cursor(self):
+        registry = codelight._new_agent_registry()
+        self.assertIn("cursor", registry.supported_agent_ids())
+        self.assertEqual(registry.executables_by_agent()["cursor"],
+                         ("cursor", "cursor-agent"))
+        # Cursor has a usage fetcher (web API via the local auth token).
+        self.assertIn("cursor", registry.usage_fetchers())
+
+    def test_session_id_accepts_cursor_conversation_id(self):
+        self.assertEqual(
+            hook_runtime.session_id({"conversation_id": "c1"}), "c1")
 
 
 class HookConfigTests(unittest.TestCase):

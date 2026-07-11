@@ -57,6 +57,34 @@
               "description": "Path to a token file used for GitHub API usage calls."
             }
           }
+        },
+        "grok": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "home": {
+              "type": "string",
+              "description": "Override Grok home directory."
+            }
+          }
+        },
+        "cursor": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "home": {
+              "type": "string",
+              "description": "Override Cursor home directory."
+            },
+            "state_db": {
+              "type": "string",
+              "description": "Path to Cursor's IDE state.vscdb (auth store for the usage meter)."
+            },
+            "usage": {
+              "type": "boolean",
+              "description": "Show Cursor's monthly included-usage meter via its web API (default true)."
+            }
+          }
         }
       }
     }

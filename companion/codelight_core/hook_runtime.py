@@ -23,6 +23,7 @@ def session_id(data: dict) -> str:
         data.get("session_id")
         or data.get("sessionId")
         or data.get("session")
+        or data.get("conversation_id")   # Cursor
         or "unknown"
     )
 
@@ -85,6 +86,11 @@ def permission_decision_output(
         output = {"behavior": decision}
         if reason and decision == "deny":
             output["message"] = reason
+        return output
+    if envelope == agents_base.CURSOR_PERMISSION:
+        output = {"permission": decision}
+        if reason and decision == "deny":
+            output["agent_message"] = reason
         return output
     return {
         "hookSpecificOutput": {

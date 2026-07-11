@@ -16,6 +16,7 @@ SessionResetConsumer = Callable[[], dict]
 PERMISSION_REQUEST = "permission_request"  # Claude/Codex PermissionRequest decision
 BEHAVIOR = "behavior"                      # Copilot {"behavior": ...}
 PRETOOL_DECISION = "pretool_decision"      # VSCode PreToolUse permissionDecision
+CURSOR_PERMISSION = "cursor_permission"    # Cursor {"permission": allow|deny|ask}
 
 # Question envelopes.
 UPDATED_INPUT = "updated_input"            # rewrite the question tool's input
@@ -36,6 +37,10 @@ class HookMode:
     envelope: str
     default_agent_id: str      # used only when --agent is missing/empty
     requires_tool_use_id: bool = False  # VSCode PreToolUse fires for non-tool events too
+    # Decision emitted when no remote decision arrives (daemon down/timeout).
+    # E.g. Cursor's "ask" explicitly falls back to its own local prompt;
+    # empty means emit nothing (the agent's default behavior applies).
+    fallback_decision: str = ""
 
 
 @dataclass(frozen=True)

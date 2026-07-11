@@ -149,11 +149,13 @@ class AgentRegistry:
                 for agent_id, spec in
                 list(self.specs.items())[:self.MAX_SCREEN_AGENTS]
             }
+        conversation = self.conversation_agents()
         return {
             agent_id: {
                 "display": spec.display,
                 "color": spec.color,
                 "logo_svg": spec.logo_svg,
+                "conversation": agent_id in conversation,
             }
             for agent_id, spec in self.specs.items()
         }
@@ -272,3 +274,19 @@ class AgentRegistry:
             for agent_id, integration in self._integrations.items()
             if integration.latest_transcript_fallback is not None
         ]
+
+    def conversation_agents(self) -> set[str]:
+        """Agents that can produce a conversation feed (have an extractor)."""
+        return {
+            agent_id
+            for agent_id, integration in self._integrations.items()
+            if integration.transcript_extractor is not None
+        }
+
+    def latest_transcript_for(self, agent_id: str) -> str:
+        """Newest on-disk transcript for an agent, for cold-start requests
+        (before any hook has been seen this run). Empty if unavailable."""
+        integration = self._integrations.get(agent_id)
+        if integration is None or integration.latest_transcript_fallback is None:
+            return ""
+        return integration.latest_transcript_fallback()

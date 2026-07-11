@@ -77,6 +77,13 @@ def merge_matcher_group_hooks(hooks: dict, desired: list[HookSpec]) -> bool:
             if not isinstance(entry, dict):
                 cleaned.append(entry)
                 continue
+            if "hooks" not in entry:
+                # Flat entry (Cursor-style hooks.json): the command sits
+                # directly on the entry. Drop it only if codelight owns it.
+                if is_codelight_hook_cmd(str(entry.get("command") or "")):
+                    continue
+                cleaned.append(entry)
+                continue
             entry_hooks = entry.get("hooks", [])
             if not isinstance(entry_hooks, list):
                 cleaned.append(entry)
@@ -121,6 +128,61 @@ def install_matcher_group_hooks(path: str, desired: list[HookSpec],
         return
 
     if not merge_matcher_group_hooks(hooks, desired):
+        if vprint:
+            vprint(f"[{label}] already up to date")
+        return
+
+    doc["hooks"] = hooks
+    write_json_object(path, doc)
+    print(f"[{label}] installed in {path}", flush=True)
+
+
+def merge_flat_hooks(hooks: dict, desired: dict[str, list[dict]]) -> bool:
+    """Flat hook arrays (Cursor-style): hooks.<event> = [{command, ...}].
+
+    Strips codelight-owned entries everywhere (so renamed/stale installs are
+    cleaned), preserves the user's own entries, then appends ``desired``.
+    """
+    before = json.dumps(hooks, sort_keys=True)
+
+    for event in list(hooks.keys()):
+        entries = hooks.get(event)
+        if not isinstance(entries, list):
+            continue
+        kept = [entry for entry in entries
+                if not (isinstance(entry, dict)
+                        and is_codelight_hook_cmd(str(entry.get("command") or "")))]
+        if kept:
+            hooks[event] = kept
+        else:
+            del hooks[event]
+
+    for event, new_entries in desired.items():
+        entries = hooks.get(event)
+        if not isinstance(entries, list):
+            entries = []
+            hooks[event] = entries
+        entries.extend(new_entries)
+
+    return json.dumps(hooks, sort_keys=True) != before
+
+
+def install_flat_hooks(path: str, desired: dict[str, list[dict]],
+                       label: str, *,
+                       defaults: dict | None = None,
+                       vprint: Callable[[str], None] | None = None) -> None:
+    doc = read_json_object(path, label)
+    if doc is None:
+        return
+    for key, value in (defaults or {}).items():
+        doc.setdefault(key, value)
+
+    hooks = doc.get("hooks", {})
+    if not isinstance(hooks, dict):
+        print(f"[{label}] warning: {path} has non-object hooks", file=sys.stderr)
+        return
+
+    if not merge_flat_hooks(hooks, desired):
         if vprint:
             vprint(f"[{label}] already up to date")
         return
