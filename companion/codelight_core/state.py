@@ -235,10 +235,6 @@ class CodelightState:
                 )
                 current.update(usage)
 
-    def usage_snapshot(self) -> dict[str, Any]:
-        with self._lock:
-            return dict(self._usage_caches.get(self._default_agent_id, DEFAULT_USAGE))
-
     def _meter_usage(self, agent_id: str,
                      usage: dict[str, Any]) -> tuple[dict[str, Any], str, str]:
         if "monthly_pct" in usage and "weekly_pct" not in usage:

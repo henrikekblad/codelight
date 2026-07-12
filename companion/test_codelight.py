@@ -398,15 +398,15 @@ class PermissionPolicyTests(unittest.TestCase):
             ("exec_command", {"cmd": command}),
             ("run_in_terminal", {"command": command}),
         ]:
-            self.assertTrue(codelight._is_allowed_command(
-                tool, tool_input, self.repo))
-        self.assertFalse(codelight._is_allowed_command(
-            "Bash", {"command": command + " --dangerous"}, self.repo))
+            self.assertTrue(policy_core.is_allowed_command(
+                self.policy, tool, tool_input, self.repo))
+        self.assertFalse(policy_core.is_allowed_command(
+            self.policy, "Bash", {"command": command + " --dangerous"}, self.repo))
 
         other = os.path.join(self.tmp.name, "other")
         os.makedirs(other)
-        self.assertFalse(codelight._is_allowed_command(
-            "Bash", {"command": command}, other))
+        self.assertFalse(policy_core.is_allowed_command(
+            self.policy, "Bash", {"command": command}, other))
 
     def test_trusted_patch_cannot_escape_through_symlink(self):
         self.assertTrue(codelight._allow_folder(self.repo)[0])
@@ -416,8 +416,8 @@ class PermissionPolicyTests(unittest.TestCase):
         patch = {
             "input": "*** Update File: linked/secret.txt\n@@\n-old\n+new\n",
         }
-        self.assertFalse(codelight._is_safe_trusted_apply_patch(
-            "apply_patch", patch, self.repo))
+        self.assertFalse(policy_core.is_safe_trusted_apply_patch(
+            self.policy, "apply_patch", patch, self.repo))
 
 
 class AuthenticationTests(unittest.TestCase):
@@ -426,11 +426,11 @@ class AuthenticationTests(unittest.TestCase):
         nonce = "abc123"
         digest = auth_core.auth_hmac(secret, nonce)
 
-        self.assertTrue(codelight._valid_auth_response(
+        self.assertTrue(auth_core.valid_auth_response(
             {"auth_hmac": digest}, secret, nonce))
-        self.assertFalse(codelight._valid_auth_response(
+        self.assertFalse(auth_core.valid_auth_response(
             {"auth": secret}, secret, nonce))
-        self.assertFalse(codelight._valid_auth_response(
+        self.assertFalse(auth_core.valid_auth_response(
             {"auth_hmac": "wrong"}, secret, nonce))
 
     def make_hub(self):

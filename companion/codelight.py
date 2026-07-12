@@ -19,7 +19,6 @@ import threading
 import time
 from datetime import datetime
 from codelight_core.agents.registry import AgentRegistry
-from codelight_core import auth as auth_core
 from codelight_core import conversation as conversation_core
 from codelight_core.conversation import ConversationRefresher
 from codelight_core import dashboard_client
@@ -150,16 +149,6 @@ def _normalize_agent_id(agent_id: str | None) -> str:
 
 def _agent_display_name(agent_id: str | None) -> str:
     return _state.agent_display_name(agent_id)
-
-
-def _agent_meter_titles(agent_id: str | None) -> tuple[str, str]:
-    return _state.agent_meter_titles(agent_id)
-
-
-def _valid_auth_response(data: dict, secret: str, nonce: str) -> bool:
-    if not isinstance(data, dict) or "auth_hmac" not in data:
-        return False
-    return auth_core.valid_auth_response(data, secret, nonce)
 
 
 def _broadcast(payload: dict) -> None:
@@ -327,13 +316,6 @@ def _resolve_permission(request_id: str, decision: str, by: str) -> bool:
     return _remote_request_manager().resolve_permission(request_id, decision, by)
 
 
-def _wait_with_extend(entry: dict) -> None:
-    """Block until the request is resolved (event set) or its deadline passes.
-    Re-reads entry['expires'] each loop so a client keepalive (_extend_request)
-    can push the deadline out while a human is still interacting."""
-    remote_control.wait_with_extend(entry)
-
-
 # Grace window for a question to reach an answering client before it falls
 # through to Claude's local dialog. Long enough to survive a client
 # reconnecting (e.g. VSCode restart) — the daemon replays pending requests on
@@ -342,22 +324,6 @@ NO_CLIENT_GRACE = 6
 
 
 RECONNECT_WINDOW = 30
-
-
-def _wait_question(entry: dict) -> None:
-    """Like _wait_with_extend, but if no client can answer questions the request
-    only lives for NO_CLIENT_GRACE seconds before falling through. A client that
-    was connected within RECONNECT_WINDOW seconds is treated as merely
-    reconnecting (e.g. VSCode restarting) — the normal extendable deadline
-    applies so the replayed prompt reaches it. Only a session that has had no
-    answering client present or recently gone falls through quickly."""
-    remote_control.wait_question(
-        entry,
-        can_answer_questions=_can_answer_questions,
-        last_client_gone=lambda: _last_qclient_gone,
-        no_client_grace=NO_CLIENT_GRACE,
-        reconnect_window=RECONNECT_WINDOW,
-    )
 
 
 def _extend_request(request_id: str) -> bool:
@@ -383,12 +349,6 @@ def _cancel_pending_for_hook(session_id: str, state: str,
         return False
     _cancel_permissions_for(session_id)
     return True
-
-
-def _permission_waiter(entry: dict) -> None:
-    """Per-request thread: wait for a decision (or timeout), reply to the
-    blocked hook on its held connection, and notify clients."""
-    _remote_request_manager()._permission_waiter(entry)
 
 
 def _register_permission(conn, msg: dict) -> None:
@@ -465,13 +425,6 @@ def _resolve_question(request_id: str, answers, by: str) -> bool:
     return _remote_request_manager().resolve_question(request_id, answers, by)
 
 
-def _question_waiter(entry: dict) -> None:
-    """Per-request thread: wait for answers (or timeout), reply to the blocked
-    hook, and notify clients. Reply {"answers": {...}} → hook emits updatedInput;
-    {"answers": null} → hook prints nothing → Claude's local dialog."""
-    _remote_request_manager()._question_waiter(entry)
-
-
 def _gnome_present(feature: str) -> bool:
     """True if a GNOME extension announced it can answer `feature` recently."""
     return (time.time() - _gnome_last_seen < GNOME_PRESENCE_TTL
@@ -515,10 +468,6 @@ def _allow_folder(cwd: str) -> tuple[bool, str]:
     return policy_core.allow_folder(POLICY_PATH, _policy_lock, cwd)
 
 
-def _is_allowed_command(tool_name: str, tool_input, cwd: str) -> bool:
-    return policy_core.is_allowed_command(POLICY_PATH, tool_name, tool_input, cwd)
-
-
 def _allow_command(command: str, cwd: str) -> tuple[bool, str]:
     return policy_core.allow_command(POLICY_PATH, _policy_lock, command, cwd)
 
@@ -529,11 +478,6 @@ def _allow_tool(tool_name: str) -> tuple[bool, str]:
 
 def _tool_summary(tool_name: str, tool_input: dict) -> str:
     return policy_core.tool_summary(tool_name, tool_input)
-
-
-def _is_safe_trusted_apply_patch(tool_name: str, tool_input, cwd: str) -> bool:
-    return policy_core.is_safe_trusted_apply_patch(
-        POLICY_PATH, tool_name, tool_input, cwd)
 
 
 # ── Hook mode ─────────────────────────────────────────────────────────────────
