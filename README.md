@@ -8,26 +8,26 @@ them. Pick and choose whatever suits your needs:
 
 ## Currently supported agents
 
-| Agent | Status | Usage | Remote control | Conversation |
-|---|---|---|---|---|
-| Claude Code | ✅ | ✅ | Permissions + questions | ✅ |
-| Codex CLI / IDE extension | ✅ | ✅ | Permissions + questions | ✅ |
-| GitHub Copilot / Copilot Chat | ✅ | ✅ <sup>1</sup> | Permissions + questions <sup>2</sup> | ✅ |
-| Cursor (IDE / `cursor-agent` CLI) | ✅ | ✅ <sup>3</sup> | Permissions <sup>4</sup> | ✅ |
-| Grok (xAI) | ✅ | — <sup>5</sup> | — <sup>5</sup> | — <sup>5</sup> |
+| Agent | Status | Usage | Permissions | Questions | Conversation |
+|---|---|---|---|---|---|
+| Claude Code | ✅ | ✅ | ✅ | ✅ | ✅ |
+| Codex CLI / IDE extension | ✅ | ✅ | ✅ | ✅ | ✅ |
+| GitHub Copilot / Copilot Chat | ✅ | ✅ <sup>1</sup> | ✅ | ✅ <sup>2</sup> | ✅ |
+| Cursor (IDE / `cursor-agent` CLI) | ✅ | ✅ <sup>3</sup> | ✅ <sup>4</sup> | — <sup>5</sup> | ✅ |
+| Grok (xAI) | ✅ | — <sup>6</sup> | — <sup>7</sup> | — <sup>7</sup> | ✅ |
 
 <sub>
 1. Copilot usage is the organization's pooled monthly AI-credit meter — needs `agents.copilot.github_org` and a token.<br>
 2. Copilot answers questions only where the IDE hook path exposes them.<br>
 3. Cursor shows a monthly included-usage meter read from the local Cursor auth token (no setup); it hides if you are not signed in to the IDE.<br>
 4. Cursor remote-allow bypasses the prompt in the IDE; the `cursor-agent` CLI is deny-only (its own command allowlist still prompts).<br>
-5. Grok is status-only — its single blocking hook cannot approve remotely, and it exposes no machine-readable usage.
+5. Cursor exposes no agent-asks-the-user hook to intercept.<br>
+6. No Grok usage meter: the CLI runs on the SuperGrok subscription, whose weekly rate limit is not machine-readable (cookie-gated web page, and the CLI's OAuth token is rejected by the rate-limit API). xAI's separate developer-API credit pool *is* readable (opt-in via a billing management key) but the subscription-based CLI never draws on it, so it would always read ~0%. See [companion/AGENTS.md](companion/AGENTS.md) for the two-wallets detail.<br>
+7. Grok's single blocking hook cannot approve remotely, and it has no agent-asks-the-user hook.
 </sub>
 
-Agent-specific setup, caveats, and config keys live in
-[companion/AGENTS.md](companion/AGENTS.md). New integrations are discovered
-from the companion's agent modules and clients render the metadata they
-receive.
+<br>Agent-specific setup, caveats, and config keys live in
+[companion/AGENTS.md](companion/AGENTS.md).
 
 | Component | Description | Example
 |---|---|---|
