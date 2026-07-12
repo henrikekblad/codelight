@@ -5,6 +5,7 @@ import io
 import importlib.util
 import json
 import os
+import shlex
 import sys
 import tempfile
 import threading
@@ -25,6 +26,7 @@ from codelight_core.state import CodelightState
 from codelight_core import auth as auth_core
 from codelight_core import dashboard_client
 from codelight_core import hooks as hooks_core
+from codelight_core import invocation as invocation_core
 from codelight_core import conversation as conversation_core
 from codelight_core.conversation import ConversationRefresher
 from codelight_core import discovery as discovery_core
@@ -1480,6 +1482,23 @@ class RemoteControlTests(unittest.TestCase):
             ),
             10.0,
         )
+
+
+class SelfInvocationTests(unittest.TestCase):
+    def test_resolves_interpreter_and_checkout_script(self):
+        interpreter, script = invocation_core.self_invocation()
+        self.assertTrue(interpreter)
+        self.assertTrue(script.endswith("codelight.py"))
+        self.assertTrue(os.path.isfile(script))
+
+    def test_hook_command_base_uses_self_invocation(self):
+        # Single source of truth: hook commands are prefixed with the same
+        # interpreter self_invocation() resolves (not a hard-coded "python3").
+        interpreter, _ = invocation_core.self_invocation()
+        base = hooks_core.hook_command_base("/x/codelight.py", "grok")
+        self.assertTrue(base.startswith(shlex.quote(interpreter)))
+        self.assertIn("/x/codelight.py", base)
+        self.assertIn("--agent grok --hook", base)
 
 
 class HookAgentResolutionTests(unittest.TestCase):

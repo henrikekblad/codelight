@@ -6,6 +6,8 @@ import shutil
 import subprocess
 import sys
 
+from codelight_core import invocation
+
 
 def build_args_line(
     *,
@@ -64,7 +66,7 @@ def install_service(
     run=subprocess.run,
 ) -> None:
     """Write ~/.config/systemd/user/codelight.service and enable it."""
-    python_path = shutil.which("python3") or "python3"
+    python_path, _ = invocation.self_invocation()
     args_line = build_args_line(
         name=name,
         secret=secret,

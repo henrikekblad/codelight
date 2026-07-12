@@ -6,12 +6,16 @@ import shlex
 import sys
 from typing import Callable
 
+from codelight_core import invocation
+
 
 HookSpec = tuple[str, str, dict]
 
 
 def hook_command_base(script_path: str, agent_id: str) -> str:
-    return f"python3 {shlex.quote(script_path)} --agent {shlex.quote(agent_id)} --hook"
+    interpreter, _ = invocation.self_invocation()
+    return (f"{shlex.quote(interpreter)} {shlex.quote(script_path)} "
+            f"--agent {shlex.quote(agent_id)} --hook")
 
 
 def command_hook(command: str, timeout_key: str = "timeout",

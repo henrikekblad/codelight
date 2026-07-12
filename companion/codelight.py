@@ -25,6 +25,7 @@ from codelight_core.conversation import ConversationRefresher
 from codelight_core import dashboard_client
 from codelight_core import discovery as discovery_core
 from codelight_core import hook_commands
+from codelight_core import invocation
 from codelight_core import lifecycle
 from codelight_core import policy as policy_core
 from codelight_core import remote_control
@@ -817,7 +818,7 @@ def main():
         print("[install] detected agents: "
               + (", ".join(sorted(detected_agents)) or "none"))
         lifecycle.install_service(
-            script_path=os.path.abspath(__file__),
+            script_path=invocation.self_invocation()[1],
             name=args.name,
             secret=args.secret,
             ws_port=args.ws_port,
@@ -828,7 +829,7 @@ def main():
         )
         if args.vscode:
             lifecycle.install_vscode_extension(
-                os.path.abspath(__file__), args.secret, args.ws_port)
+                invocation.self_invocation()[1], args.secret, args.ws_port)
         return
 
     if args.hook:
@@ -871,7 +872,7 @@ def main():
     lifecycle.install_agent_hooks(
         agent_registry=_new_agent_registry(log=vprint),
         enabled_agents=enabled_agents,
-        script_path=os.path.abspath(__file__),
+        script_path=invocation.self_invocation()[1],
         hook_wait_ceiling=HOOK_WAIT_CEILING,
         remote_permissions=_remote_permissions,
         remote_questions=_remote_questions,
