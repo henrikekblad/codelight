@@ -26,6 +26,7 @@ import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.buildAnnotatedString
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.withStyle
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.input.PasswordVisualTransformation
@@ -134,8 +135,7 @@ fun StatusScreen(onOpenConversation: (String) -> Unit = {}) {
                     AgentLogo(branding, tint = branding?.color ?: Palette.text, size = 18.dp)
                     Text(agent.display, color = Palette.text, fontWeight = FontWeight.Bold,
                         modifier = Modifier.weight(1f))
-                    Text(if (connected) agent.status.uppercase() else "OFFLINE",
-                        color = Palette.muted, fontSize = 11.sp)
+                    StatusPill(status = agent.status, connected = connected)
                 }
                 agent.limits.forEach { limit ->
                     Row(Modifier.fillMaxWidth()) {
@@ -187,6 +187,37 @@ private fun usageColor(pct: Float): Color {
         p < .75f -> Color(0xFFFFFF00)
         p < 1f -> Color(0xFFFF8C00)
         else -> Color(0xFFFF2200)
+    }
+}
+
+private fun statusColor(status: String, connected: Boolean): Color = when {
+    !connected -> Color(0xFF333333)
+    status == "working" -> Color(0xFFFF8C00)
+    status == "waiting" -> Color(0xFFFF2200)
+    else -> Color(0xFF00C800)
+}
+
+@Composable
+private fun StatusPill(status: String, connected: Boolean) {
+    val label = if (connected) status.uppercase() else "OFFLINE"
+    val bg = statusColor(status, connected)
+    val fg = if (connected) Color.Black else Palette.muted
+    Box(
+        modifier = Modifier
+            .width(76.dp)
+            .height(24.dp)
+            .background(bg, RoundedCornerShape(percent = 50)),
+        contentAlignment = Alignment.Center,
+    ) {
+        Text(
+            label,
+            color = fg,
+            fontSize = 10.sp,
+            fontWeight = FontWeight.Bold,
+            maxLines = 1,
+            textAlign = TextAlign.Center,
+            modifier = Modifier.fillMaxWidth(),
+        )
     }
 }
 

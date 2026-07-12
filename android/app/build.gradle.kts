@@ -6,13 +6,20 @@ plugins {
 android {
     namespace   = "se.sensnology.codelight"
     compileSdk  = 35
+    val releaseSigningEnv = listOf(
+        "SIGNING_STORE_PATH",
+        "SIGNING_STORE_PASSWORD",
+        "SIGNING_KEY_ALIAS",
+        "SIGNING_KEY_PASSWORD",
+    )
+    val hasReleaseSigning = releaseSigningEnv.all { !System.getenv(it).isNullOrBlank() }
 
     defaultConfig {
         applicationId  = "se.sensnology.codelight"
         minSdk         = 26
         targetSdk      = 35
-        versionCode    = 20
-        versionName    = "1.5.0"
+        versionCode    = 21
+        versionName    = "1.5.1"
     }
 
     signingConfigs {
@@ -34,8 +41,7 @@ android {
         release {
             isMinifyEnabled = true
             proguardFiles(getDefaultProguardFile("proguard-android-optimize.txt"), "proguard-rules.pro")
-            val rel = signingConfigs.getByName("release")
-            if (rel.storeFile != null) signingConfig = rel
+            if (hasReleaseSigning) signingConfig = signingConfigs.getByName("release")
         }
     }
 
