@@ -31,7 +31,7 @@ them. Pick and choose whatever suits your needs:
 
 | Component | Description | Example
 |---|---|---|
-| [**companion/**](companion/README.md) | Python daemon that detects supported agents, installs their hooks, polls usage where available, pushes status over WebSocket + D-Bus, and brokers remote control. Agent config and quirks: [companion/AGENTS.md](companion/AGENTS.md). |
+| [**companion/**](companion/README.md) | Python daemon that detects supported agents, installs their hooks, polls usage where available, pushes status over WebSocket + D-Bus, and brokers remote control. |
 | [**screen/**](screen/README.md) | ESP8266 firmware for the GeekMagic Ultra — renders usage bars and status | <img src="assets/demo.jpg" width="600" alt="GeekMagic Ultra showing the codelight IDLE screen"> |
 | [**android/**](android/README.md) | Responsive Android widget + Status and Conversation views, permission review, and question answering | <img src="assets/android-widget-compact.jpg" width="280" alt="Compact codelight Android widget"> |
 | [**gnome-extension/**](gnome-extension/README.md) | GNOME Shell panel extension: status + approve/answer prompts from a popup | <img src="assets/gnome-extension-grouped.png" width="600" alt="Grouped codelight GNOME Shell popup">|

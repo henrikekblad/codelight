@@ -152,35 +152,25 @@ Keys:
 
 Behavior and quirks:
 
-- Hooks are merged into `~/.codex/hooks.json`.
-- Codex requires hook trust review in the Codex CLI (`/hooks`) when hooks change.
-- Usage is read from local rollout JSONL rate-limit events (5-hour and weekly windows).
-- When `codex app-server` is available, usage prefers
-  `account/rateLimits/read` so codelight can also show
-  `rateLimitResetCredits.availableCount`.
-- Session reset consumes one earned reset via
-  `account/rateLimitResetCredit/consume`, then refreshes with
-  `account/rateLimits/read`.
-- Local Codex CLI and Codex IDE extension sessions share the user-level hooks file.
-- The question tool is `request_user_input`. It is available in Plan Mode by
-  default, or in Default Mode when enabled with:
+- Hooks are merged into `~/.codex/hooks.json`; the local Codex CLI and the
+  Codex IDE extension share this user-level file.
+- **You must trust the hooks in Codex.** After the first install — or whenever
+  Codex says a new/changed hook needs review — open the Codex CLI, run
+  `/hooks`, inspect the codelight commands, and trust them. Codex verifies
+  hooks by hash so the installer can't do this for you, and codelight
+  deliberately avoids the permanent `--dangerously-bypass-hook-trust`.
+- Usage shows Codex's own rolling limits (5-hour and weekly windows), plus
+  earned reset credits when `codex app-server` is available.
+- The question tool is `request_user_input`, available in Plan Mode by default
+  or in Default Mode when enabled:
 
   ```toml
   [features]
   default_mode_request_user_input = true
   ```
 
-- Codex lifecycle hooks cannot submit a native `request_user_input` response.
-  Codelight therefore uses an experimental fallback: after a remote answer it
-  blocks the local question tool and injects the answer into model context. If
-  no question-capable client is connected, or the request times out, codelight
-  emits no hook decision and Codex shows its normal local question UI.
-- Codex requires non-managed command hooks to be reviewed by hash. After the
-  initial install — or whenever Codex says a new/changed hook needs review —
-  open Codex CLI and run `/hooks`, inspect the codelight commands, and trust
-  them. This cannot safely be persisted by the Python installer. Codex offers
-  `--dangerously-bypass-hook-trust` for a single already-vetted automation
-  launch, but codelight deliberately does not make it a permanent bypass.
+- Remote question answering for Codex is **experimental** (Codex's hooks can't
+  submit a native question response — see `PLAN.md` for the workaround).
 
 Example:
 
@@ -201,75 +191,32 @@ Keys:
 
 - `home` (string): Grok home directory.
   - Default: `~/.grok` (or `GROK_HOME`)
-- `management_key` (string) / `management_key_file` (string): xAI **billing
-  management** key (not the inference key) to enable the monthly budget meter.
-  Or set `XAI_MANAGEMENT_KEY`. Create it in xAI Console → Settings →
-  Management Keys with billing read access.
+- `management_key` / `management_key_file` (string): xAI billing management key
+  for an optional usage meter. **Usually leave this off** — see "No usage
+  meter" below. (Or set `XAI_MANAGEMENT_KEY`.)
 
-Behavior and quirks:
+Requirements:
 
-- Status: codelight writes `~/.grok/hooks/codelight.json` (Grok reads every
-  `*.json` there) mapping UserPromptSubmit/PreToolUse/PostToolUse/
-  PostToolUseFailure/PermissionDenied/Subagent* → working, Notification →
-  waiting, Stop/SessionEnd → ended. The file MUST use Grok's matcher-group
-  schema (`{"hooks":{"Event":[{"hooks":[{"type":"command","command":...}]}]}}`);
-  a flat `Event:[{command}]` shape is silently ignored (confirm with
-  `grok inspect`).
-- **No `SessionStart` hook (deliberate)**: a session merely *opening* is not
-  "working", and Grok spawns a short-lived leader session that fires *only*
-  `SessionStart` and nothing else. Mapping it to "working" would leave a
-  phantom working session for the full `IDLE_WINDOW` (600s) that outranks the
-  real session's "waiting" state (per-agent status is the max over its
-  sessions) and hides Grok's permission prompts. So codelight only marks
-  "working" from real activity (UserPromptSubmit onward).
-- **Harness compatibility**: Grok also loads Claude Code
-  (`~/.claude/settings.json`) and Cursor (`~/.cursor/hooks.json`) hooks. With
-  harness-compat *on*, Grok runs those in preference to its own and never
-  fires its native hooks — so codelight never sees Grok's `Notification`
-  (waiting) event. codelight therefore sets `[compat.claude] hooks = false`
-  and `[compat.cursor] hooks = false` in `~/.grok/config.toml` on install
-  (`ensure_compat_hooks_off`, idempotent, preserves other keys) so Grok fires
-  its own hooks. In practice Grok still *also* runs the borrowed Claude/Cursor
-  hooks (invoked as `--agent claude`/`cursor`), so every event double-fires;
-  `hook_commands.resolve_hook_agent()` detects `GROK_SESSION_ID`/
-  `GROK_HOOK_EVENT` and re-tags those to `grok` (same session id), making the
-  duplicate idempotent. Net: correct status including the `waiting` state.
-- **No remote permission approval**: Grok's only blocking hook
-  (`PreToolUse`) can deny but cannot approve past Grok's own interactive
-  prompt, and it fires for every tool call before Grok's permission
-  pipeline — forwarding it would spam clients with requests Grok
-  auto-approves. Revisit if xAI adds an allow/bypass decision.
-- Usage meter (opt-in): with a management key, codelight polls the xAI
-  Management API (`invoice/preview`, team id auto-discovered from the key) and
-  shows a monthly meter resetting at the billing cycle:
-  - Postpaid (a spending limit is set): spend / effective spending limit.
-  - Prepaid (credits topped up, no limit): credits used / credits purchased.
-  Hidden when no key is set, or when there is neither a limit nor prepaid
-  credits (nothing to meter). The key is never logged and only sent to
-  `management-api.x.ai`.
-  **Two separate wallets — know which one you use:** xAI has two unrelated
-  billing systems. (1) The **developer API** (`console.x.ai`, `api.x.ai/v1`,
-  API-key auth) — prepaid credits / pay-as-you-go, what this meter reads.
-  (2) The **SuperGrok/Grok Pro subscription** (`grok.com`, OAuth/OIDC login)
-  with a rolling weekly rate limit. The Grok CLI, when logged in via the
-  subscription (`~/.grok/auth.json` `auth_mode = oidc`), draws on the
-  **subscription** quota, *not* API credits — so this meter will sit near 0%
-  no matter how much you use the CLI. The subscription's weekly limit is only
-  available live from grok.com behind the OIDC session (surfaced in the CLI's
-  `/usage` slash command; not cached to disk, no management-API equivalent),
-  so codelight cannot meter it. Only configure a management key if you
-  actually consume the developer API; otherwise leave the meter off.
-- Conversation: transcript extractor implemented against Grok's
-  `~/.grok/sessions/<url-encoded-cwd>/<session-id>/chat_history.jsonl`
-  (records typed system/user/reasoning/assistant/tool_result; user prompts
-  unwrapped from `<user_query>` and synthetic-context turns dropped; verified
-  against a real session). Works on demand via `get_conversation` and the
-  newest-transcript fallback even without a status hook firing.
-- **The Grok CLI requires a SuperGrok / X Premium+ subscription — pay-as-you-go
-  API credits (`XAI_API_KEY`, prepaid) do NOT run the CLI.** So status and
-  conversation only apply to subscribers who actually run `grok`. The usage
-  meter is the exception: it reads API/postpaid billing via the management key
-  and works from API credits alone, independent of the CLI.
+- The Grok CLI needs a **SuperGrok / X Premium+ subscription**; pay-as-you-go
+  API credits (`XAI_API_KEY`) do not run it. Status and conversation therefore
+  only apply to subscribers who actually run `grok`.
+- On install, codelight writes its hooks to `~/.grok/hooks/codelight.json` and
+  turns off Grok's Claude/Cursor "harness compatibility" hooks in
+  `~/.grok/config.toml` so Grok reports through its own hooks. Restart any
+  running `grok` session after the first install to pick this up.
+
+What works: status (working / waiting / idle) and conversation following.
+
+Limitations:
+
+- **No remote permission approval.** Grok's only blocking hook can deny but
+  not approve past its own prompt, so codelight is status + conversation only.
+- **No usage meter.** The subscription's weekly limit is not machine-readable,
+  and the optional management-key meter reads a *different* xAI wallet (the
+  developer-API credits) that the subscription CLI never spends — so it would
+  always read ~0%. Leave the management key unset unless you actually use the
+  developer API directly. (Rationale and internals are in the maintenance
+  notes: `PLAN.md`.)
 
 Example:
 
@@ -298,43 +245,25 @@ Keys:
 
 Behavior and quirks:
 
-- Usage meter: reads Cursor's session JWT from `state_db` (no cookie paste),
-  then calls Cursor's own `cursor.com/api/usage-summary` and shows
-  `totalPercentUsed` as a monthly bar resetting at the billing-cycle end.
-  Undocumented endpoint — if it changes or you're not signed in, the meter
-  simply hides (returns nothing). Set `usage: false` to disable the call.
-
-- Hooks are **merged into the user's own `~/.cursor/hooks.json`** (flat
-  entry format, `{"version": 1, "hooks": {...}}`): codelight entries are
-  identified by command and stripped/replaced on reinstall/uninstall; the
-  user's own hooks are never touched.
-- Status: sessionStart/beforeSubmitPrompt/postToolUse(+Failure) → working,
-  stop/sessionEnd → ended. Cursor's session key is `conversation_id` and
-  every hook payload carries `transcript_path`, which feeds the
-  conversation feature automatically.
-- **Full remote permission support** via `beforeShellExecution` and
-  `beforeMCPExecution` (`permission-cursor` hook mode): allow bypasses
-  Cursor's own prompt, deny blocks, and when no remote decision arrives
-  codelight answers `{"permission": "ask"}` so Cursor falls back to its
-  local prompt. `preToolUse` is deliberately not used for permissions
-  (allow/deny only — no safe fallback).
-- No question interception: Cursor has no agent-asks-the-user hook.
-  `beforeSubmitPrompt` fires on the *user's* prompt going in, not on the
-  agent asking a question, so it can't be used for it.
-- **Remote approval works in the Cursor IDE** (verified 2026-07-11): a
-  `beforeShellExecution` `allow` bypasses the IDE's command prompt, so a
-  remote Allow runs the command with no local prompt.
-- **The Cursor CLI (`cursor-agent`) is weaker — deny-only in practice.** Its
-  hook set is a subset, and a hook `allow` does NOT bypass the CLI's own
-  command allowlist ("Not in allowlist: …"), so you get a double prompt
-  (phone + TUI) and the command still waits for local approval. In headless
-  `-p` there's no prompt at all: commands need `--force`/`--yolo`, and a hook
-  `allow` won't auto-run them (Cursor retries to its loop limit, then gives
-  up). Remote *deny* does work everywhere (hooks can always block). Net: use
-  the IDE for the full remote-approval experience; on the CLI, codelight is
-  effectively status + remote-deny.
-- Detection: `cursor` (IDE) or `cursor-agent` (CLI) on PATH. The generic
-  `agent` alias is deliberately not probed.
+- **Usage meter:** shows Cursor's monthly included-usage as a bar, read from
+  your local Cursor sign-in (no setup). Hides if you're not signed in to the
+  IDE, or if Cursor's (undocumented) usage endpoint changes. Set
+  `usage: false` to disable it.
+- Hooks are **merged into your own `~/.cursor/hooks.json`** — codelight's
+  entries are added and removed on install/uninstall; your own hooks are
+  never touched.
+- Conversation follows automatically (every hook payload carries the
+  transcript path).
+- **Full remote permission approval in the Cursor IDE** (verified
+  2026-07-11): a remote Allow bypasses the IDE's command prompt, Deny blocks,
+  and with no remote answer Cursor falls back to its own prompt.
+- **The Cursor CLI (`cursor-agent`) is weaker — effectively status +
+  remote-deny.** A hook `allow` does not bypass the CLI's own command
+  allowlist, so you get a double prompt (phone + TUI) and the command still
+  waits for local approval; headless `-p` needs `--force`. Remote *deny* works
+  everywhere. Use the IDE for the full remote-approval experience.
+- No remote question answering: Cursor has no agent-asks-the-user hook.
+- Detection: `cursor` (IDE) or `cursor-agent` (CLI) on PATH.
 
 Example:
 
@@ -377,17 +306,9 @@ systemctl --user restart codelight.service
 systemctl --user is-active codelight.service
 ```
 
-## Remote control quirks
+## Persistent approvals
 
-The shared remote-control path normalizes permission and question prompts, but
-the native hook envelopes differ:
-
-| Agent | Permission hook | Question hook | Notes |
-|---|---|---|---|
-| Claude | `PermissionRequest` → permission decision | `PreToolUse`/`AskUserQuestion` → updated input | Falls back to Claude's native dialog when no remote answer is available. |
-| Copilot | Copilot/VSCode behavior envelope | VSCode-style context envelope | Primarily supports permission review; questions follow the VSCode hook path where available. |
-| Codex | `PermissionRequest` → permission decision | `PreToolUse`/`request_user_input` → context injection | Remote question answering is experimental because lifecycle hooks cannot submit native tool responses. |
-
-Persistent folder and exact-command approvals are not agent-specific. They are
-stored in `~/.config/codelight/policy.json` and enforced by the shared hook
-runtime before a request is sent to clients.
+Folder and exact-command approvals are not agent-specific: they are stored
+once in `~/.config/codelight/policy.json` and enforced for every agent before
+a request is sent to clients. Each agent section above notes how its own
+permission and question prompts behave.
