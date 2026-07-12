@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import sys
 import threading
 import uuid
@@ -17,6 +18,22 @@ AgentNameCallback = Callable[[str | None], str]
 AgentDisplayCallback = Callable[[str | None], str]
 
 
+def resolve_hook_agent(agent_id: str) -> tuple[str, str]:
+    """Resolve the agent that actually ran this hook, and its session id.
+
+    Grok runs other harnesses' hooks via its compatibility layer (Claude
+    Code / Cursor), which would otherwise be misattributed to `--agent
+    claude`/`cursor`. Grok sets GROK_* env on every hook it runs, so detect it
+    and re-tag to grok (with its own GROK_SESSION_ID). Returns (agent_id,
+    session_id_override) where the override is "" when the payload's own
+    session id should be used.
+    """
+    grok_session = os.environ.get("GROK_SESSION_ID", "")
+    if grok_session or os.environ.get("GROK_HOOK_EVENT"):
+        return "grok", grok_session
+    return agent_id, ""
+
+
 def run_status_hook(
     state: str,
     *,
@@ -29,7 +46,8 @@ def run_status_hook(
     """Send a fast status event to the daemon, falling back to monitor_state."""
     data = hook_runtime.parse_json_object(
         sys.stdin.read() if input_text is None else input_text)
-    session_id = hook_runtime.session_id(data)
+    agent_id, session_override = resolve_hook_agent(agent_id)
+    session_id = session_override or hook_runtime.session_id(data)
     transcript_path = transcript_core.extract_transcript_path(data)
     hook_event = hook_runtime.hook_event_name(data)
     normalized_agent = normalize_agent_id(agent_id)
@@ -90,8 +108,10 @@ def run_permission_hook(
     """Forward a permission prompt to the daemon or fall back to local prompt."""
     data = hook_runtime.parse_json_object(
         sys.stdin.read() if input_text is None else input_text)
-    session_id = hook_runtime.session_id(data)
-    normalized_agent = normalize_agent_id(agent_id or mode.default_agent_id)
+    resolved_agent, session_override = resolve_hook_agent(
+        agent_id or mode.default_agent_id)
+    session_id = session_override or hook_runtime.session_id(data)
+    normalized_agent = normalize_agent_id(resolved_agent)
     tool_name = hook_runtime.tool_name(data)
     tool_input = hook_runtime.tool_input(data)
     cwd = str(data.get("cwd") or "")
@@ -215,7 +235,9 @@ def run_question_hook(
     input_text: str | None = None,
 ) -> None:
     """Forward AskUserQuestion prompts to the daemon and emit hook output."""
-    normalized_agent = normalize_agent_id(agent_id or mode.default_agent_id)
+    resolved_agent, session_override = resolve_hook_agent(
+        agent_id or mode.default_agent_id)
+    normalized_agent = normalize_agent_id(resolved_agent)
 
     data = hook_runtime.parse_json_object(
         sys.stdin.read() if input_text is None else input_text)
@@ -226,7 +248,7 @@ def run_question_hook(
 
     request = {
         "type":       "question_request",
-        "session_id": hook_runtime.session_id(data),
+        "session_id": session_override or hook_runtime.session_id(data),
         "agent_id":   normalized_agent,
         "agent_display": agent_display_name(normalized_agent),
         "prompt_id":  data.get("prompt_id") or uuid.uuid4().hex,

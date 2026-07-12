@@ -537,8 +537,7 @@ class ClientConfigTests(unittest.TestCase):
         # Agents with a transcript extractor advertise conversation support.
         self.assertTrue(meta["cursor"]["conversation"])
         self.assertTrue(meta["claude"]["conversation"])
-        # Grok has no extractor (undocumented format) → no conversation.
-        self.assertFalse(meta["grok"]["conversation"])
+        self.assertTrue(meta["grok"]["conversation"])
 
     def test_load_config_reads_agents_section(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -1483,7 +1482,118 @@ class RemoteControlTests(unittest.TestCase):
         )
 
 
+class HookAgentResolutionTests(unittest.TestCase):
+    def test_grok_env_retags_harness_hooks(self):
+        # Grok runs Claude/Cursor compat hooks with GROK_* env set → re-tag.
+        with mock.patch.dict(os.environ,
+                             {"GROK_SESSION_ID": "grok-1", "GROK_HOOK_EVENT": "stop"},
+                             clear=False):
+            self.assertEqual(hook_commands.resolve_hook_agent("claude"),
+                             ("grok", "grok-1"))
+        with mock.patch.dict(os.environ, {"GROK_HOOK_EVENT": "pre_tool_use"},
+                             clear=False):
+            agent, sid = hook_commands.resolve_hook_agent("cursor")
+            self.assertEqual(agent, "grok")
+            self.assertEqual(sid, "")
+
+    def test_real_claude_is_not_retagged(self):
+        env = {k: v for k, v in os.environ.items()
+               if not k.startswith("GROK_")}
+        with mock.patch.dict(os.environ, env, clear=True):
+            os.environ["CLAUDE_CODE_SESSION_ID"] = "c1"
+            self.assertEqual(hook_commands.resolve_hook_agent("claude"),
+                             ("claude", ""))
+
+
 class GrokIntegrationTests(unittest.TestCase):
+    def test_usage_budget_meter_from_management_api(self):
+        responses = {
+            "/auth/teams": {"teams": [{"teamId": "team-1"}]},
+            "/v1/billing/teams/team-1/postpaid/invoice/preview": {
+                "coreInvoice": {"amountAfterVat": "2500"},   # $25.00 spent
+                "effectiveSpendingLimit": "10000",           # $100.00 limit
+                "billingCycle": {"year": 2026, "month": 7},
+            },
+        }
+
+        def fake_get(key, path):
+            return responses[path]
+
+        with mock.patch.object(grok_agent, "_management_get", side_effect=fake_get):
+            usage, team = grok_agent.get_usage("mgmt-key")
+        self.assertEqual(team, "team-1")
+        self.assertAlmostEqual(usage["monthly_pct"], 0.25, places=4)
+        self.assertEqual(usage["spent_usd"], 25.0)
+        self.assertEqual(usage["limit_usd"], 100.0)
+        self.assertEqual(usage["limits"][0]["label"], "Monthly")
+
+        # No spending limit → fall back to prepaid credits (used / purchased).
+        responses["/v1/billing/teams/team-1/postpaid/invoice/preview"] = {
+            "coreInvoice": {"amountAfterVat": "0",
+                            "prepaidCredits": {"val": "500"},   # $5.00 bought
+                            "prepaidCreditsUsed": {"val": "150"}},  # $1.50 used
+            "effectiveSpendingLimit": "0",
+            "billingCycle": {"year": 2026, "month": 7},
+        }
+        with mock.patch.object(grok_agent, "_management_get", side_effect=fake_get):
+            usage, _ = grok_agent.get_usage("mgmt-key", team_id="team-1")
+        self.assertAlmostEqual(usage["monthly_pct"], 0.30, places=4)
+        self.assertEqual(usage["limit_usd"], 5.0)
+
+        # Neither a limit nor prepaid credits → nothing to meter.
+        responses["/v1/billing/teams/team-1/postpaid/invoice/preview"] = {
+            "coreInvoice": {"amountAfterVat": "0"},
+            "effectiveSpendingLimit": "0",
+            "billingCycle": {"year": 2026, "month": 7},
+        }
+        with mock.patch.object(grok_agent, "_management_get", side_effect=fake_get):
+            usage, _ = grok_agent.get_usage("mgmt-key", team_id="team-1")
+        self.assertIsNone(usage)
+
+        # No key → no meter, no call.
+        self.assertEqual(grok_agent.get_usage(""), (None, ""))
+
+    def test_transcript_extractor_parses_grok_chat_history(self):
+        fd, path = tempfile.mkstemp(suffix=".jsonl")
+        try:
+            with os.fdopen(fd, "w") as stream:
+                for record in [
+                    {"type": "system", "content": "ignore me"},
+                    {"type": "user", "synthetic_reason": "ctx",
+                     "content": [{"type": "text", "text": "<system-reminder>x</system-reminder>"}]},
+                    {"type": "user",
+                     "content": [{"type": "text", "text": "<user_query>\nRun echo hej\n</user_query>"}]},
+                    {"type": "reasoning", "content": None},
+                    {"type": "assistant", "content": "",
+                     "tool_calls": [{"id": "1", "name": "run_terminal_command",
+                                     "arguments": '{"command":"echo hej"}'}]},
+                    {"type": "tool_result", "tool_call_id": "1", "content": "exit: 0\nhej\n"},
+                    {"type": "assistant", "content": "Done."},
+                ]:
+                    stream.write(json.dumps(record) + "\n")
+            lines = transcript_core.parse_transcript(
+                path, tool_summary=policy_core.tool_summary,
+                extractors=(grok_agent.transcript_extractor,))
+        finally:
+            os.unlink(path)
+
+        self.assertEqual([l["role"] for l in lines],
+                         ["user", "tool", "output", "assistant"])
+        self.assertEqual(lines[0]["text"], "Run echo hej")   # unwrapped, ctx dropped
+        self.assertEqual(lines[1]["text"], "run_terminal_command: echo hej")
+        self.assertEqual(lines[3]["text"], "Done.")
+
+    def test_session_path_matches_id_directory(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            sid = "019f5637-5c3d-72b2-84cc-39c01455eaac"
+            d = os.path.join(tmp, "sessions", "%2Fhome%2Fx", sid)
+            os.makedirs(d)
+            path = os.path.join(d, "chat_history.jsonl")
+            with open(path, "w") as stream:
+                stream.write("{}")
+            self.assertEqual(grok_agent.sessions_path_for_session(tmp, sid), path)
+            self.assertEqual(grok_agent.sessions_path_for_session(tmp, "nope"), "")
+
     def test_install_hooks_writes_status_only_document(self):
         with tempfile.TemporaryDirectory() as tmp:
             hooks_file = os.path.join(tmp, "hooks", "codelight.json")
@@ -1496,43 +1606,52 @@ class GrokIntegrationTests(unittest.TestCase):
                 doc = json.load(stream)
 
         hooks = doc["hooks"]
+        # Grok matcher-group format: event → [{hooks: [{type, command}]}].
+        def command_of(event):
+            return hooks[event][0]["hooks"][0]["command"]
         def state_of(event):
-            return hooks[event][0]["command"].rsplit(" ", 1)[-1]
+            return command_of(event).rsplit(" ", 1)[-1]
 
-        self.assertEqual(state_of("SessionStart"), "working")
+        self.assertEqual(state_of("UserPromptSubmit"), "working")
         self.assertEqual(state_of("Notification"), "waiting")
         self.assertEqual(state_of("Stop"), "ended")
         self.assertEqual(state_of("SessionEnd"), "ended")
-        self.assertIn("--agent grok", hooks["Stop"][0]["command"])
+        self.assertIn("--agent grok", command_of("Stop"))
+        # SessionStart must NOT mark "working": Grok's leader session fires only
+        # SessionStart, which would otherwise leave a phantom working session
+        # (IDLE_WINDOW=600s) masking the real session's "waiting" state.
+        self.assertNotIn("SessionStart", hooks)
         # No permission/question forwarding — Grok's PreToolUse cannot approve.
         self.assertNotIn("permission", json.dumps(doc))
         self.assertNotIn("question", json.dumps(doc))
 
-    def test_registry_exposes_grok_without_usage_or_hook_modes(self):
+    def test_ensure_compat_hooks_off(self):
+        import tomllib
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = os.path.join(tmp, "config.toml")
+            with open(cfg, "w") as stream:
+                stream.write('[cli]\ninstaller = "internal"\n\n'
+                             '[compat.claude]\nhooks = true\nother = 1\n')
+            grok_agent.ensure_compat_hooks_off(cfg)
+            with open(cfg, "rb") as stream:
+                parsed = tomllib.load(stream)
+            # both harnesses disabled, unrelated keys preserved
+            self.assertIs(parsed["compat"]["claude"]["hooks"], False)
+            self.assertIs(parsed["compat"]["cursor"]["hooks"], False)
+            self.assertEqual(parsed["compat"]["claude"]["other"], 1)
+            self.assertEqual(parsed["cli"]["installer"], "internal")
+            # idempotent: a second run leaves the file byte-identical
+            before = open(cfg).read()
+            grok_agent.ensure_compat_hooks_off(cfg)
+            self.assertEqual(open(cfg).read(), before)
+
+    def test_registry_exposes_grok_status_only(self):
         registry = codelight._new_agent_registry()
         self.assertIn("grok", registry.supported_agent_ids())
         self.assertEqual(registry.executables_by_agent()["grok"], ("grok",))
-        self.assertNotIn("grok", registry.usage_fetchers())
+        # No remote-control hook modes and no VSCode extension.
         self.assertNotIn("grok", registry.vscode_extensions_by_agent())
-
-    def test_session_lookup_matches_newest_file_containing_id(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            sessions = os.path.join(tmp, "sessions", "proj")
-            os.makedirs(sessions)
-            old = os.path.join(sessions, "2026-07-10-abc123.json")
-            new = os.path.join(sessions, "2026-07-11-abc123.json")
-            for path in (old, new):
-                with open(path, "w") as stream:
-                    stream.write("{}")
-            os.utime(old, (1, 1))
-
-            self.assertEqual(
-                grok_agent.sessions_path_for_session(tmp, "abc123"),
-                os.path.realpath(new))
-            self.assertEqual(
-                grok_agent.sessions_path_for_session(tmp, "missing"), "")
-            self.assertEqual(
-                grok_agent.sessions_path_for_session(tmp, "unknown"), "")
+        self.assertEqual(grok_agent.HOOK_MODES, ())
 
 
 class CursorIntegrationTests(unittest.TestCase):

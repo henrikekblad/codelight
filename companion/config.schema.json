@@ -65,6 +65,14 @@
             "home": {
               "type": "string",
               "description": "Override Grok home directory."
+            },
+            "management_key": {
+              "type": "string",
+              "description": "xAI billing management key to enable the monthly budget meter (or set XAI_MANAGEMENT_KEY)."
+            },
+            "management_key_file": {
+              "type": "string",
+              "description": "Path to a file containing the xAI billing management key."
             }
           }
         },

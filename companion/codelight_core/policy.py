@@ -118,7 +118,8 @@ def command_from_tool(tool_name: str, tool_input) -> str:
     if not isinstance(tool_input, dict):
         return ""
     name = str(tool_name or "").strip()
-    key = "command" if name in {"Bash", "run_in_terminal", "Shell"} else \
+    key = "command" if name in {"Bash", "run_in_terminal", "Shell",
+                                 "run_terminal_command"} else \
         "cmd" if name == "exec_command" else ""
     command = tool_input.get(key) if key else None
     if not isinstance(command, str):
@@ -264,7 +265,7 @@ def tool_summary(tool_name: str, tool_input: dict) -> str:
                 return line.split(":", 1)[1].strip()
         return ""
 
-    if tool_name in ("Bash", "exec_command", "Shell"):
+    if tool_name in ("Bash", "exec_command", "Shell", "run_terminal_command"):
         detail = tool_input.get("command", "") or tool_input.get("cmd", "")
     elif tool_name in ("Edit", "Write", "Read", "NotebookEdit"):
         detail = tool_input.get("file_path", "")
