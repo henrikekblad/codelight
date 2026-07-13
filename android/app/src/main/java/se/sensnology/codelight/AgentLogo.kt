@@ -21,6 +21,7 @@ internal class AgentBranding(
     val paths: List<Path>,
     val conversation: Boolean, // agent can produce a conversation feed
     val budgetSettable: Boolean, // usage-meter budget can be set from the app
+    val promptCapable: Boolean,  // new instructions can be sent to the agent
 )
 
 /**
@@ -73,6 +74,7 @@ internal object AgentBrandings {
                     paths = paths,
                     conversation = meta.optBoolean("conversation", false),
                     budgetSettable = meta.optBoolean("budget_settable", false),
+                    promptCapable = meta.optBoolean("prompt_capable", false),
                 ))
             }
         }

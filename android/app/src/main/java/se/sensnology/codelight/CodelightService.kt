@@ -93,12 +93,14 @@ class CodelightService : LifecycleService() {
         const val ACTION_EXTEND              = "se.sensnology.codelight.EXTEND"
         const val ACTION_SESSION_RESET       = "se.sensnology.codelight.SESSION_RESET"
         const val ACTION_SET_BUDGET          = "se.sensnology.codelight.SET_BUDGET"
+        const val ACTION_SEND_PROMPT         = "se.sensnology.codelight.SEND_PROMPT"
         const val ACTION_GET_CONVERSATION    = "se.sensnology.codelight.GET_CONVERSATION"
         const val EXTRA_REQUEST_ID = "request_id"
         const val EXTRA_DECISION   = "decision"
         const val EXTRA_ANSWERS    = "answers"   // JSON {question → answer}
         const val EXTRA_AGENT_ID   = "agent_id"
         const val EXTRA_BUDGET     = "budget"    // USD, double
+        const val EXTRA_TEXT       = "text"      // remote-steering instruction
         const val EXTRA_TAB        = "tab"       // MainActivity initial tab
     }
 
@@ -200,6 +202,12 @@ class CodelightService : LifecycleService() {
                 val budget = intent.getDoubleExtra(EXTRA_BUDGET, -1.0)
                 if (!agentId.isNullOrBlank() && budget >= 0.0)
                     sendSetBudgetRequest(agentId, budget)
+            }
+            ACTION_SEND_PROMPT -> {
+                val agentId = intent.getStringExtra(EXTRA_AGENT_ID)
+                val text = intent.getStringExtra(EXTRA_TEXT)
+                if (!agentId.isNullOrBlank() && !text.isNullOrBlank())
+                    sendPromptRequest(agentId, text)
             }
             ACTION_GET_CONVERSATION -> {
                 val agentId = intent.getStringExtra(EXTRA_AGENT_ID)
@@ -610,6 +618,15 @@ class CodelightService : LifecycleService() {
         getSharedPreferences(STATE_PREFS, MODE_PRIVATE).edit()
             .putString(key, obj.toString())
             .apply()
+    }
+
+    private fun sendPromptRequest(agentId: String, text: String) {
+        webSocket?.send(JSONObject()
+            .put("type", "send_prompt_request")
+            .put("id", java.util.UUID.randomUUID().toString())
+            .put("agent_id", agentId)
+            .put("text", text)
+            .toString())
     }
 
     private fun sendSetBudgetRequest(agentId: String, budget: Double) {

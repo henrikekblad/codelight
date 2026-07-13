@@ -589,9 +589,9 @@ internal fun fieldColors(accent: Color, muted: Color, text: Color) =
 
 /**
  * Shows the last N lines of the active session's conversation, mirrored to
- * STATE_PREFS by the service from the companion's `conversation` feed. Read-only:
- * injecting into a live interactive agent session isn't supported, so there is
- * no send box.
+ * STATE_PREFS by the service from the companion's `conversation` feed. For
+ * steerable agents (those the daemon marks `prompt_capable`, e.g. OpenCode) a
+ * compose bar lets you send a new instruction to the running session.
  */
 @Composable
 fun ConversationScreen(
@@ -662,6 +662,8 @@ fun ConversationScreen(
         snapshotFlow { scroll.maxValue }.collect { scroll.scrollTo(it) }
     }
 
+    val promptCapable = brandings[selected]?.promptCapable == true
+
     Column(Modifier.fillMaxSize()) {
         if (convAgents.size > 1) {
             ConversationAgentPicker(
@@ -676,18 +678,19 @@ fun ConversationScreen(
             )
         }
 
+        Box(Modifier.weight(1f).fillMaxWidth()) {
         if (shown.isEmpty()) {
             Box(Modifier.fillMaxSize().padding(24.dp), contentAlignment = Alignment.Center) {
-                Text("No conversation yet. It appears here once an agent is active on the companion.",
+                Text(
+                    if (promptCapable) "No messages yet — send an instruction below."
+                    else "No conversation yet. It appears here once an agent is active on the companion.",
                     style = TextStyle(color = muted, fontSize = 13.sp))
             }
-            return@Column
-        }
-
-    Column(
-        Modifier.fillMaxSize().verticalScroll(scroll).padding(horizontal = 16.dp, vertical = 12.dp),
-        verticalArrangement = Arrangement.spacedBy(10.dp),
-    ) {
+        } else {
+        Column(
+            Modifier.fillMaxSize().verticalScroll(scroll).padding(horizontal = 16.dp, vertical = 12.dp),
+            verticalArrangement = Arrangement.spacedBy(10.dp),
+        ) {
         shown.forEach { line ->
             val role = line.role
             val body = line.text
@@ -731,7 +734,46 @@ fun ConversationScreen(
                 }
             }
         }
+        }
+        }
+        }
+
+        if (promptCapable) {
+            ConversationComposer(onSend = { msg ->
+                sendPrompt(context, selected, msg)
+                requestConversation(context, selected)
+            })
+        }
     }
+}
+
+/** Compose bar to send a new instruction to a steerable agent (OpenCode). */
+@Composable
+private fun ConversationComposer(onSend: (String) -> Unit) {
+    var draft by remember { mutableStateOf("") }
+    Row(
+        Modifier.fillMaxWidth()
+            .background(Palette.card)
+            .padding(horizontal = 12.dp, vertical = 8.dp),
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.spacedBy(8.dp),
+    ) {
+        OutlinedTextField(
+            value = draft,
+            onValueChange = { draft = it },
+            modifier = Modifier.weight(1f),
+            placeholder = { Text("Send an instruction…", color = Palette.muted) },
+            singleLine = false,
+            maxLines = 4,
+            colors = fieldColors(Palette.accent, Palette.muted, Palette.text),
+        )
+        Button(
+            onClick = { val m = draft.trim(); if (m.isNotEmpty()) { onSend(m); draft = "" } },
+            enabled = draft.isNotBlank(),
+            colors = ButtonDefaults.buttonColors(
+                containerColor = Palette.accent, contentColor = Color.Black,
+                disabledContainerColor = Color(0xFF333333), disabledContentColor = Palette.muted),
+        ) { Text("Send") }
     }
 }
 
@@ -782,6 +824,14 @@ private fun requestConversation(ctx: Context, agentId: String) {
     ctx.startService(Intent(ctx, CodelightService::class.java)
         .setAction(CodelightService.ACTION_GET_CONVERSATION)
         .putExtra(CodelightService.EXTRA_AGENT_ID, agentId))
+}
+
+/** Remote steering: send a new instruction to a steerable agent's session. */
+private fun sendPrompt(ctx: Context, agentId: String, text: String) {
+    ctx.startService(Intent(ctx, CodelightService::class.java)
+        .setAction(CodelightService.ACTION_SEND_PROMPT)
+        .putExtra(CodelightService.EXTRA_AGENT_ID, agentId)
+        .putExtra(CodelightService.EXTRA_TEXT, text))
 }
 
 /**
