@@ -277,6 +277,43 @@ Example:
 }
 ```
 
+## OpenCode (`agents.opencode`)
+
+Keys:
+
+- `server_url` (string): OpenCode server base URL. Default `http://127.0.0.1:4096`.
+- `username` / `password` (string): basic auth, if the server requires it
+  (or set `OPENCODE_SERVER_PASSWORD`). Default user `opencode`.
+- `db_path` (string): SQLite store. Default `~/.local/share/opencode/opencode.db`.
+- `monthly_budget_usd` (number): opt-in cost meter (see below).
+
+Requirements:
+
+- OpenCode has **no hooks**; codelight follows its local HTTP server's event
+  stream instead. Run the server on a known port — `opencode serve --port 4096`
+  (or the TUI with `--port 4096`) — or point `server_url` at it. A TUI started
+  without `--port` picks a random port codelight can't discover.
+
+What works: status (working/waiting/idle), **full remote permission approval**
+and **remote question answering** — OpenCode is a first-class remote-control
+agent.
+
+Behavior and quirks:
+
+- Status: working/idle come from polling the authoritative active-session set
+  (`GET /api/session/active`) — OpenCode (v1.17) emits no idle event, only
+  activity events + heartbeats. The SSE bus (`GET /event`) supplies the waiting
+  edge: `permission.v2.asked`/`question.v2.asked` → waiting, routed to remote
+  control; the reply is POSTed back (`/permission/{id}/reply` once|always|
+  reject, `/question/{id}/reply`). Answering in OpenCode's own TUI clears
+  codelight's prompt.
+- **Usage — no provider quota (BYOK):** the only metric is cost. Opt in with
+  `monthly_budget_usd` to show this calendar month's spend (summed from the
+  store's per-session `cost`, no pricing table) vs that budget. Hidden when
+  unset. This is a self-set **tracking** budget — codelight cannot cap
+  OpenCode spend (the real bill is at your provider).
+- Detection: `opencode` on PATH.
+
 ## Combined example
 
 ```json
