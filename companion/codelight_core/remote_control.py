@@ -448,7 +448,7 @@ class RemoteRequestManager:
         persistence = entry.get("persistence") \
             if isinstance(entry.get("persistence"), dict) else None
 
-        entry["responder"]({"decision": decision})
+        entry["responder"]({"decision": decision, "persistence": persistence})
 
         outcome = decision or (
             "cancelled" if by == "cancelled" else "skip" if by else "timeout")

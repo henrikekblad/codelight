@@ -701,6 +701,7 @@ def _background_listener_context() -> agents_base.ListenerContext:
             mgr.register_permission(None, msg, responder=responder),
         submit_question=lambda msg, responder:
             mgr.register_question(None, msg, responder=responder),
+        cancel_session_prompts=_cancel_permissions_for,
         log=vprint,
         notify_conversation_changed=_notify_conversation_changed,
     )

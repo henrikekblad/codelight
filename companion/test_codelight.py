@@ -1540,27 +1540,34 @@ class OpenCodeIntegrationTests(unittest.TestCase):
         on = opencode_agent.build_integration({"monthly_budget_usd": 50})
         self.assertIsNotNone(on.usage_fetcher)
 
-    def test_classify_event_waiting_resume_ignored(self):
-        # A permission/question prompt is the waiting edge.
-        self.assertEqual(opencode_agent.classify_event(
-            {"type": "permission.v2.asked", "properties": {"sessionID": "ses1"}}),
-            ("ses1", "waiting"))
-        self.assertEqual(opencode_agent.classify_event(
-            {"type": "question.v2.asked", "properties": {"sessionID": "ses1"}}),
-            ("ses1", "waiting"))
-        # Its reply/rejection resumes the turn.
-        self.assertEqual(opencode_agent.classify_event(
-            {"type": "permission.v2.replied", "properties": {"sessionID": "ses1"}}),
-            ("ses1", "resume"))
-        self.assertEqual(opencode_agent.classify_event(
-            {"type": "question.v2.rejected", "properties": {"sessionID": "ses1"}}),
-            ("ses1", "resume"))
-        # Activity / lifecycle events are ignored — working/idle come from the
-        # active-session poll, and OpenCode emits no idle event.
-        for etype in ("session.next.tool.called", "session.idle",
-                      "session.status", "server.connected"):
-            self.assertEqual(opencode_agent.classify_event(
-                {"type": etype, "properties": {"sessionID": "ses1"}}), ("", ""))
+    def test_question_conversion_to_codelight_and_back(self):
+        oc_q = [
+            {"question": "Pick one", "header": "H",
+             "options": [{"label": "A"}, {"label": "B"}], "multiple": False},
+            {"question": "Pick many", "header": "M",
+             "options": [{"label": "X"}, {"label": "Y"}], "multiple": True},
+        ]
+        cl = opencode_agent._to_codelight_questions(oc_q)
+        self.assertEqual(cl[0]["options"], [{"label": "A"}, {"label": "B"}])
+        self.assertFalse(cl[0]["multiSelect"])
+        self.assertTrue(cl[1]["multiSelect"])
+        # codelight answers ({question: answer_string}) → OpenCode [[labels]].
+        oc_a = opencode_agent._to_opencode_answers(
+            oc_q, {"Pick one": "A", "Pick many": "X, Y"})
+        self.assertEqual(oc_a, [["A"], ["X", "Y"]])
+
+    def test_permission_responder_maps_decisions_to_replies(self):
+        posts = []
+        agent = opencode_agent.OpenCodeAgent(db_path="", monthly_budget_usd=0)
+        agent._post = lambda ctx, path, body: posts.append((path, body))
+        respond = agent._permission_responder(object(), "ses1", "per1")
+        respond({"decision": "allow"})                                   # once
+        respond({"decision": "allow",
+                 "persistence": {"requested": True, "kind": "tool"}})    # always
+        respond({"decision": "deny"})                                    # reject
+        respond({"decision": None})                                      # no POST
+        self.assertEqual([b["reply"] for _, b in posts], ["once", "always", "reject"])
+        self.assertTrue(all("/permission/per1/reply" in p for p, _ in posts))
 
 
 class SelfInvocationTests(unittest.TestCase):

@@ -66,6 +66,9 @@ class ListenerContext:
     report_status: Callable[..., None]
     submit_permission: Callable[[dict, Callable[[dict], None]], None]
     submit_question: Callable[[dict, Callable[[dict], None]], None]
+    # Cancel this session's still-pending codelight prompts (e.g. the user
+    # answered in the agent's own TUI, so the phone/GNOME card should clear).
+    cancel_session_prompts: Callable[[str], None] = lambda _s: None
     log: Callable[[str], None] = lambda _m: None
     notify_conversation_changed: Callable[[], None] = lambda: None
 

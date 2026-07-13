@@ -31,16 +31,45 @@ ACTIVE_POLL_INTERVAL = 2.0
 # working / idle come from the authoritative active-session set (OpenCode
 # v1.17 emits no session.idle/session.status event — verified 2026-07-13), so
 # the SSE bus is used only for the waiting edge: a permission/question prompt
-# blocks the turn (waiting), and its reply/rejection resumes it.
-_WAITING_EVENTS = frozenset({
-    "permission.asked", "permission.v2.asked",
-    "question.asked", "question.v2.asked",
-})
+# blocks the turn (routed to codelight's remote control), and its reply or
+# rejection resumes it.
+_PERMISSION_ASK_EVENTS = frozenset({"permission.asked", "permission.v2.asked"})
+_QUESTION_ASK_EVENTS = frozenset({"question.asked", "question.v2.asked"})
 _RESUME_EVENTS = frozenset({
     "permission.replied", "permission.v2.replied",
     "question.replied", "question.v2.replied",
     "question.rejected", "question.v2.rejected",
 })
+
+
+def _to_codelight_questions(oc_questions: list) -> list:
+    """OpenCode QuestionV2Info[] → codelight's AskUserQuestion shape."""
+    out = []
+    for q in oc_questions or []:
+        options = []
+        for opt in q.get("options") or []:
+            options.append({"label": opt.get("label", "")} if isinstance(opt, dict)
+                           else {"label": str(opt)})
+        out.append({
+            "question": q.get("question", ""),
+            "header": q.get("header", ""),
+            "options": options,
+            "multiSelect": bool(q.get("multiple")),
+        })
+    return out
+
+
+def _to_opencode_answers(oc_questions: list, answers: dict) -> list:
+    """codelight answers ({question_text: answer_string}) → OpenCode's
+    QuestionV2Reply.answers ([[selected labels] per question, in order])."""
+    result = []
+    for q in oc_questions or []:
+        text = str(answers.get(q.get("question", ""), "") or "")
+        if bool(q.get("multiple")) and ", " in text:
+            result.append([a.strip() for a in text.split(",") if a.strip()])
+        else:
+            result.append([text] if text else [])
+    return result
 
 
 # Placeholder branding: a terminal-prompt ">_" mark (currentColor SVG +
@@ -130,20 +159,6 @@ def get_usage(db_path: str, monthly_budget_usd: float,
     }
 
 
-def classify_event(event: dict) -> tuple[str, str]:
-    """Classify one SSE event as (session_id, tag) where tag is 'waiting'
-    (a permission/question prompt blocks the turn), 'resume' (it was answered),
-    or '' (ignored — working/idle come from the active-session poll). Pure for
-    testing."""
-    etype = str(event.get("type") or "")
-    sid = str((event.get("properties") or {}).get("sessionID") or "")
-    if etype in _WAITING_EVENTS:
-        return sid, "waiting"
-    if etype in _RESUME_EVENTS:
-        return sid, "resume"
-    return "", ""
-
-
 class OpenCodeAgent:
     def __init__(self, db_path: str, monthly_budget_usd: float,
                  server_url: str = DEFAULT_SERVER_URL,
@@ -178,6 +193,85 @@ class OpenCodeAgent:
             body = json.loads(resp.read() or "null")
         data = (body or {}).get("data") if isinstance(body, dict) else None
         return set(data.keys()) if isinstance(data, dict) else set()
+
+    def _post(self, ctx: base.ListenerContext, path: str, body: dict) -> None:
+        try:
+            req = urllib.request.Request(
+                self.server_url + path, method="POST",
+                data=json.dumps(body).encode(),
+                headers={**self._headers(), "Content-Type": "application/json"})
+            with urllib.request.urlopen(req, timeout=10):
+                pass
+        except Exception as exc:
+            ctx.log(f"[opencode] reply POST {path} failed ({exc})")
+
+    def _permission_responder(self, ctx, sid, req_id):
+        def respond(payload: dict) -> None:
+            decision = payload.get("decision")
+            if decision == "deny":
+                reply = "reject"
+            elif decision == "allow":
+                persistence = payload.get("persistence") or {}
+                forever = (bool(persistence.get("requested"))
+                           and persistence.get("kind") in ("tool", "command", "folder"))
+                reply = "always" if forever else "once"
+            else:
+                return  # no remote decision — let OpenCode use its own prompt
+            self._post(ctx, f"/api/session/{sid}/permission/{req_id}/reply",
+                       {"reply": reply})
+        return respond
+
+    def _question_responder(self, ctx, sid, req_id, oc_questions):
+        def respond(payload: dict) -> None:
+            answers = payload.get("answers")
+            if not answers:
+                return  # no remote answer — OpenCode asks in its own UI
+            self._post(ctx, f"/api/session/{sid}/question/{req_id}/reply",
+                       {"answers": _to_opencode_answers(oc_questions, answers)})
+        return respond
+
+    def _route_event(self, event: dict, ctx: base.ListenerContext,
+                     pending: set, lock) -> None:
+        etype = str(event.get("type") or "")
+        props = event.get("properties") or {}
+        sid = str(props.get("sessionID") or "")
+        if not sid:
+            return
+        if etype in _PERMISSION_ASK_EVENTS:
+            req_id = str(props.get("id") or "")
+            if not req_id:
+                return
+            action = str(props.get("action") or "tool")
+            resources = props.get("resources") or []
+            summary = action + (": " + ", ".join(str(r) for r in resources)
+                                if resources else "")
+            with lock:
+                pending.add(sid)
+            ctx.report_status(sid, "waiting", "opencode")
+            ctx.submit_permission({
+                "prompt_id": req_id, "session_id": sid, "agent_id": "opencode",
+                "tool_name": action, "summary": summary,
+                "tool_input": {"action": action, "resources": resources},
+                "policy_command": "", "cwd": str(props.get("cwd") or ""),
+            }, self._permission_responder(ctx, sid, req_id))
+        elif etype in _QUESTION_ASK_EVENTS:
+            req_id = str(props.get("id") or "")
+            oc_questions = props.get("questions") or []
+            if not req_id or not oc_questions:
+                return
+            with lock:
+                pending.add(sid)
+            ctx.report_status(sid, "waiting", "opencode")
+            ctx.submit_question({
+                "prompt_id": req_id, "session_id": sid, "agent_id": "opencode",
+                "questions": _to_codelight_questions(oc_questions), "cwd": "",
+            }, self._question_responder(ctx, sid, req_id, oc_questions))
+        elif etype in _RESUME_EVENTS:
+            with lock:
+                pending.discard(sid)
+            # If the user answered in OpenCode's own TUI, clear codelight's
+            # still-open prompt on the phone/GNOME card.
+            ctx.cancel_session_prompts(sid)
 
     def run_listener(self, ctx: base.ListenerContext) -> None:
         """Report OpenCode status into codelight.
@@ -228,17 +322,7 @@ class OpenCodeAgent:
                             event = json.loads(line[5:].strip())
                         except ValueError:
                             continue
-                        sid, tag = classify_event(event)
-                        if not sid:
-                            continue
-                        if tag == "waiting":
-                            with lock:
-                                pending.add(sid)
-                            ctx.report_status(sid, "waiting", "opencode")
-                        elif tag == "resume":
-                            with lock:
-                                pending.discard(sid)
-                            # the active-poll restores working/idle next tick
+                        self._route_event(event, ctx, pending, lock)
             except Exception as exc:
                 if ctx.shutdown.is_set():
                     return
