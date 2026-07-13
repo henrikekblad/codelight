@@ -122,6 +122,11 @@ class AgentIntegration:
     latest_transcript_fallback: Callable[[], str] | None = None
     # Sniffs one transcript JSONL record; see transcript.TranscriptExtractor.
     transcript_extractor: Callable[..., "tuple[str, object] | None"] | None = None
+    # Alternative to the file+extractor path for agents whose conversation lives
+    # behind an API/DB rather than a JSONL file (e.g. OpenCode): returns
+    # (session_id, lines) for the active/latest session, where each line is
+    # {"role": user|assistant|tool|output, "text": str}, or None.
+    conversation_provider: Callable[[], "tuple[str, list[dict]] | None"] | None = None
     # Hookless agents that expose a live event stream declare a listener the
     # daemon runs in its own thread with a ListenerContext (e.g. OpenCode).
     background_listener: Callable[["ListenerContext"], None] | None = None

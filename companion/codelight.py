@@ -274,6 +274,28 @@ def _conversation_payload_for(agent_id: str) -> dict | None:
     the newest one on disk."""
     aid = _normalize_agent_id(agent_id)
 
+    # Agents whose conversation lives behind an API/DB (e.g. OpenCode) supply a
+    # provider that returns (session_id, lines) directly, bypassing the file+
+    # extractor path.
+    provider = _agents.conversation_provider_for(aid)
+    if provider is not None:
+        result = provider()
+        if not result:
+            return None
+        session_id, lines = result
+        display = _agent_display_name(aid)
+        for line in lines:
+            if isinstance(line, dict):
+                line.setdefault("agent_id", aid)
+                line.setdefault("agent_display", display)
+        return {
+            "type": "conversation",
+            "session_id": session_id,
+            "agent_id": aid,
+            "agent_display": display,
+            "lines": lines,
+        }
+
     def resolve() -> tuple[str, str, str]:
         active = _state.transcript_for_agent(aid)
         if active.path:

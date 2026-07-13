@@ -59,6 +59,43 @@ def _to_codelight_questions(oc_questions: list) -> list:
     return out
 
 
+def messages_to_lines(messages: list, max_msgs: int = 60) -> list[dict]:
+    """OpenCode `GET /api/session/{id}/message` payload → codelight conversation
+    lines ({"role", "text"}). Users carry `text`; assistants carry typed
+    `content` blocks (text prose + tool calls); system messages are skipped.
+    Pure for testing."""
+    # The API returns messages newest-first; show them oldest-first.
+    ordered = sorted(
+        (m for m in (messages or []) if isinstance(m, dict)),
+        key=lambda m: (m.get("time") or {}).get("created", 0))
+    out: list[dict] = []
+    for msg in ordered:
+        mtype = msg.get("type")
+        if mtype == "user":
+            text = str(msg.get("text") or "").strip()
+            if text:
+                out.append({"role": "user", "text": text[:2000]})
+        elif mtype == "assistant":
+            prose: list[str] = []
+            tail: list[dict] = []
+            for block in msg.get("content") or []:
+                if not isinstance(block, dict):
+                    continue
+                bt = block.get("type")
+                if bt == "text":
+                    prose.append(str(block.get("text") or ""))
+                elif bt == "tool":
+                    name = (block.get("tool") or block.get("name")
+                            or (block.get("state") or {}).get("title") or "tool")
+                    tail.append({"role": "tool", "text": f"⚙ {name}"})
+            prose_text = "\n".join(p for p in prose if p).strip()
+            if prose_text:
+                out.append({"role": "assistant", "text": prose_text[:2000]})
+            out.extend(tail)
+        # system / other → skipped
+    return out[-max_msgs:]
+
+
 def _to_opencode_answers(oc_questions: list, answers: dict) -> list:
     """codelight answers ({question_text: answer_string}) → OpenCode's
     QuestionV2Reply.answers ([[selected labels] per question, in order])."""
@@ -182,15 +219,43 @@ class OpenCodeAgent:
             headers["Authorization"] = f"Basic {token}"
         return headers
 
+    def _get_data(self, path: str, timeout: float = 5.0):
+        """GET a JSON endpoint and return its `data` field (the server wraps
+        responses as {"data": ...})."""
+        req = urllib.request.Request(self.server_url + path, headers=self._headers())
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            body = json.loads(resp.read() or "null")
+        return body.get("data") if isinstance(body, dict) else None
+
     def _fetch_active_sids(self) -> set[str]:
         """The server's authoritative set of currently-working sessions
         (`GET /api/session/active` → {data: {sid: {type: running}}})."""
-        req = urllib.request.Request(
-            f"{self.server_url}/api/session/active", headers=self._headers())
-        with urllib.request.urlopen(req, timeout=5) as resp:
-            body = json.loads(resp.read() or "null")
-        data = (body or {}).get("data") if isinstance(body, dict) else None
+        data = self._get_data("/api/session/active")
         return set(data.keys()) if isinstance(data, dict) else set()
+
+    def conversation(self) -> tuple[str, list[dict]] | None:
+        """The active (or most-recently-updated) session's messages as codelight
+        conversation lines, fetched from the server. None when unavailable."""
+        try:
+            active = self._fetch_active_sids()
+            sid = next(iter(active), "")
+            if not sid:
+                sessions = self._get_data("/api/session")
+                if isinstance(sessions, dict):
+                    sessions = list(sessions.values())
+                if not isinstance(sessions, list) or not sessions:
+                    return None
+                sid = max(
+                    sessions,
+                    key=lambda s: (s.get("time") or {}).get("updated", 0)
+                    if isinstance(s, dict) else 0,
+                ).get("id", "")
+            if not sid:
+                return None
+            messages = self._get_data(f"/api/session/{sid}/message", timeout=8.0)
+            return sid, messages_to_lines(messages if isinstance(messages, list) else [])
+        except Exception:
+            return None
 
     def _post(self, ctx: base.ListenerContext, path: str, body: dict) -> None:
         try:
@@ -362,4 +427,6 @@ def build_integration(config: dict, *,
         # The BYOK $-budget is user-settable and daemon-persisted.
         budget_getter=lambda: agent.monthly_budget_usd,
         budget_setter=agent.set_budget,
+        # Conversation comes from the server API, not a JSONL file.
+        conversation_provider=agent.conversation,
     )

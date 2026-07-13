@@ -294,9 +294,9 @@ Requirements:
   (or the TUI with `--port 4096`) — or point `server_url` at it. A TUI started
   without `--port` picks a random port codelight can't discover.
 
-What works: status (working/waiting/idle), **full remote permission approval**
-and **remote question answering** — OpenCode is a first-class remote-control
-agent.
+What works: status (working/waiting/idle), **full remote permission approval**,
+**remote question answering**, and **conversation following** — OpenCode is a
+first-class remote-control agent.
 
 Behavior and quirks:
 
@@ -312,6 +312,10 @@ Behavior and quirks:
   store's per-session `cost`, no pricing table) vs that budget. Hidden when
   unset. This is a self-set **tracking** budget — codelight cannot cap
   OpenCode spend (the real bill is at your provider).
+- Conversation: read on demand from the server API (active session's
+  `GET /api/session/{id}/message`, else the most-recently-updated session) —
+  not a JSONL file, so it needs the server running (like status). System
+  messages are dropped; assistant tool calls show as a `⚙ <tool>` line.
 - Detection: `opencode` on PATH.
 
 ## Combined example

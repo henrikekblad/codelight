@@ -308,12 +308,19 @@ class AgentRegistry:
         ]
 
     def conversation_agents(self) -> set[str]:
-        """Agents that can produce a conversation feed (have an extractor)."""
+        """Agents that can produce a conversation feed — via a transcript
+        extractor (file-based) or a conversation provider (API/DB-based)."""
         return {
             agent_id
             for agent_id, integration in self._integrations.items()
             if integration.transcript_extractor is not None
+            or integration.conversation_provider is not None
         }
+
+    def conversation_provider_for(self, agent_id: str):
+        """The agent's non-file conversation provider, or None."""
+        integration = self._integrations.get(agent_id)
+        return integration.conversation_provider if integration else None
 
     def latest_transcript_for(self, agent_id: str) -> str:
         """Newest on-disk transcript for an agent, for cold-start requests

@@ -1542,6 +1542,25 @@ class OpenCodeIntegrationTests(unittest.TestCase):
         self.assertTrue(
             registry.client_metadata()["opencode"]["budget_settable"])
 
+    def test_messages_to_lines_and_conversation_capable(self):
+        messages = [
+            {"type": "user", "text": "run echo hi"},
+            {"type": "system", "text": "internal skills blurb"},
+            {"type": "assistant", "content": [
+                {"type": "tool", "tool": "bash"},
+                {"type": "text", "text": "Done."},
+            ]},
+        ]
+        lines = opencode_agent.messages_to_lines(messages)
+        self.assertEqual(lines[0], {"role": "user", "text": "run echo hi"})
+        # system dropped; assistant prose + tool line (prose first, then tail)
+        self.assertEqual(lines[1], {"role": "assistant", "text": "Done."})
+        self.assertEqual(lines[2], {"role": "tool", "text": "⚙ bash"})
+        # OpenCode is conversation-capable via its provider (no extractor).
+        registry = codelight._new_agent_registry()
+        self.assertIn("opencode", registry.conversation_agents())
+        self.assertIsNotNone(registry.conversation_provider_for("opencode"))
+
     def test_budget_set_get_roundtrip_and_meter_toggle(self):
         agent = opencode_agent.OpenCodeAgent(db_path="/no/such.db",
                                              monthly_budget_usd=0)
