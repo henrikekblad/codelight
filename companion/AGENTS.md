@@ -294,19 +294,33 @@ Requirements:
   (or the TUI with `--port 4096`) — or point `server_url` at it. A TUI started
   without `--port` picks a random port codelight can't discover.
 
-What works: status (working/waiting/idle), **full remote permission approval**,
-**remote question answering**, and **conversation following** — OpenCode is a
-first-class remote-control agent.
+What works: status (working/waiting/idle), remote permission approval **for
+API-initiated prompts** (see the TUI caveat below), **remote question
+answering**, **conversation following**, and **remote steering** — OpenCode is
+the one agent codelight can actively drive, not just observe.
 
 Behavior and quirks:
 
 - Status: working/idle come from polling the authoritative active-session set
   (`GET /api/session/active`) — OpenCode (v1.17) emits no idle event, only
   activity events + heartbeats. The SSE bus (`GET /event`) supplies the waiting
-  edge: `permission.v2.asked`/`question.v2.asked` → waiting, routed to remote
-  control; the reply is POSTed back (`/permission/{id}/reply` once|always|
-  reject, `/question/{id}/reply`). Answering in OpenCode's own TUI clears
-  codelight's prompt.
+  edge, routed to remote control; the reply is POSTed back.
+- **Permission caveat — TUI vs API (v1 vs v2).** The permission form depends on
+  what initiated the turn. A prompt sent through the *server API* (including
+  codelight's own remote steering) raises `permission.v2.asked`, answered at
+  `/api/session/{id}/permission/{id}/reply` `{reply: once|always|reject}` — this
+  round-trips correctly (verified: reply → 204 → the tool runs). A prompt typed
+  in the **interactive TUI** instead raises the legacy `permission.asked`
+  (v1, `permission`/`patterns` fields); codelight replies at
+  `/api/session/{id}/permissions/{id}` `{response: …}` and the server accepts it
+  (200), **but the TUI owns that prompt locally and does not dismiss/proceed on
+  an external reply** (the permission isn't even in the server's
+  `/api/permission/request` list). So remote approval works for prompts you
+  *drive from codelight* (steering) or the API, not for prompts typed at the
+  desktop TUI — analogous to the Cursor-CLI caveat. codelight handles both v1
+  and v2 shapes; the TUI limitation is on OpenCode's side.
+- Question answering + conversation use the same SSE/HTTP path
+  (`/question/{id}/reply`, `/api/session/{id}/message`).
 - **Usage — no provider quota (BYOK):** the only metric is cost. Opt in with
   `monthly_budget_usd` to show this calendar month's spend (summed from the
   store's per-session `cost`, no pricing table) vs that budget. Hidden when

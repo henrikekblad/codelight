@@ -292,20 +292,26 @@ class OpenCodeAgent:
         except Exception as exc:
             ctx.log(f"[opencode] reply POST {path} failed ({exc})")
 
-    def _permission_responder(self, ctx, sid, req_id):
+    def _permission_responder(self, ctx, sid, req_id, is_v2: bool):
         def respond(payload: dict) -> None:
             decision = payload.get("decision")
             if decision == "deny":
-                reply = "reject"
+                value = "reject"
             elif decision == "allow":
                 persistence = payload.get("persistence") or {}
                 forever = (bool(persistence.get("requested"))
                            and persistence.get("kind") in ("tool", "command", "folder"))
-                reply = "always" if forever else "once"
+                value = "always" if forever else "once"
             else:
                 return  # no remote decision — let OpenCode use its own prompt
-            self._post(ctx, f"/api/session/{sid}/permission/{req_id}/reply",
-                       {"reply": reply})
+            # v2 (API-origin) prompts reply at .../permission/{id}/reply {reply};
+            # v1 (TUI-origin) prompts reply at .../permissions/{id} {response}.
+            if is_v2:
+                self._post(ctx, f"/api/session/{sid}/permission/{req_id}/reply",
+                           {"reply": value})
+            else:
+                self._post(ctx, f"/api/session/{sid}/permissions/{req_id}",
+                           {"response": value})
         return respond
 
     def _question_responder(self, ctx, sid, req_id, oc_questions):
@@ -328,8 +334,15 @@ class OpenCodeAgent:
             req_id = str(props.get("id") or "")
             if not req_id:
                 return
-            action = str(props.get("action") or "tool")
-            resources = props.get("resources") or []
+            is_v2 = etype == "permission.v2.asked"
+            if is_v2:
+                action = str(props.get("action") or "tool")
+                resources = props.get("resources") or []
+            else:
+                # v1 permission.asked: {permission, patterns, metadata.command}.
+                action = str(props.get("permission") or "tool")
+                command = (props.get("metadata") or {}).get("command")
+                resources = props.get("patterns") or ([command] if command else [])
             summary = action + (": " + ", ".join(str(r) for r in resources)
                                 if resources else "")
             with lock:
@@ -340,7 +353,7 @@ class OpenCodeAgent:
                 "tool_name": action, "summary": summary,
                 "tool_input": {"action": action, "resources": resources},
                 "policy_command": "", "cwd": str(props.get("cwd") or ""),
-            }, self._permission_responder(ctx, sid, req_id))
+            }, self._permission_responder(ctx, sid, req_id, is_v2))
         elif etype in _QUESTION_ASK_EVENTS:
             req_id = str(props.get("id") or "")
             oc_questions = props.get("questions") or []

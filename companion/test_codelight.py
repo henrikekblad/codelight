@@ -1608,17 +1608,26 @@ class OpenCodeIntegrationTests(unittest.TestCase):
         self.assertEqual(oc_a, [["A"], ["X", "Y"]])
 
     def test_permission_responder_maps_decisions_to_replies(self):
-        posts = []
         agent = opencode_agent.OpenCodeAgent(db_path="", monthly_budget_usd=0)
+        posts = []
         agent._post = lambda ctx, path, body: posts.append((path, body))
-        respond = agent._permission_responder(object(), "ses1", "per1")
-        respond({"decision": "allow"})                                   # once
-        respond({"decision": "allow",
-                 "persistence": {"requested": True, "kind": "tool"}})    # always
-        respond({"decision": "deny"})                                    # reject
-        respond({"decision": None})                                      # no POST
-        self.assertEqual([b["reply"] for _, b in posts], ["once", "always", "reject"])
-        self.assertTrue(all("/permission/per1/reply" in p for p, _ in posts))
+        # v2 (API-initiated): .../permission/{id}/reply {reply}
+        v2 = agent._permission_responder(object(), "ses1", "per1", True)
+        v2({"decision": "allow"})                                        # once
+        v2({"decision": "allow",
+            "persistence": {"requested": True, "kind": "tool"}})         # always
+        v2({"decision": "deny"})                                         # reject
+        v2({"decision": None})                                           # no POST
+        self.assertEqual([b.get("reply") for _, b in posts], ["once", "always", "reject"])
+        self.assertTrue(all(p == "/api/session/ses1/permission/per1/reply"
+                            for p, _ in posts))
+        # v1 (TUI-initiated): .../permissions/{id} {response}
+        posts.clear()
+        v1 = agent._permission_responder(object(), "ses1", "per1", False)
+        v1({"decision": "allow"})
+        v1({"decision": "deny"})
+        self.assertEqual([b.get("response") for _, b in posts], ["once", "reject"])
+        self.assertTrue(all(p == "/api/session/ses1/permissions/per1" for p, _ in posts))
 
 
 class SelfInvocationTests(unittest.TestCase):
