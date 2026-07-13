@@ -20,6 +20,7 @@ internal class AgentBranding(
     val viewBox: FloatArray,   // x, y, w, h
     val paths: List<Path>,
     val conversation: Boolean, // agent can produce a conversation feed
+    val budgetSettable: Boolean, // usage-meter budget can be set from the app
 )
 
 /**
@@ -71,6 +72,7 @@ internal object AgentBrandings {
                     viewBox = viewBox ?: floatArrayOf(0f, 0f, 1f, 1f),
                     paths = paths,
                     conversation = meta.optBoolean("conversation", false),
+                    budgetSettable = meta.optBoolean("budget_settable", false),
                 ))
             }
         }

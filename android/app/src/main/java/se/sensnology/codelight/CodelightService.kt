@@ -78,6 +78,7 @@ class CodelightService : LifecycleService() {
         // Per-agent conversation cache: KEY_CONVERSATION_PREFIX + agentId → JSON lines.
         const val KEY_CONVERSATION_PREFIX = "conversation_"
         const val KEY_SESSION_RESET_RESULT = "session_reset_result"
+        const val KEY_BUDGET_RESULT = "budget_result"
 
         private const val ALERT_NOTIF_ID    = 2
         private const val ALERT_CHANNEL_ID  = "codelight_alerts"
@@ -91,11 +92,13 @@ class CodelightService : LifecycleService() {
         const val ACTION_QUESTION_RESPONSE   = "se.sensnology.codelight.QUESTION_RESPONSE"
         const val ACTION_EXTEND              = "se.sensnology.codelight.EXTEND"
         const val ACTION_SESSION_RESET       = "se.sensnology.codelight.SESSION_RESET"
+        const val ACTION_SET_BUDGET          = "se.sensnology.codelight.SET_BUDGET"
         const val ACTION_GET_CONVERSATION    = "se.sensnology.codelight.GET_CONVERSATION"
         const val EXTRA_REQUEST_ID = "request_id"
         const val EXTRA_DECISION   = "decision"
         const val EXTRA_ANSWERS    = "answers"   // JSON {question → answer}
         const val EXTRA_AGENT_ID   = "agent_id"
+        const val EXTRA_BUDGET     = "budget"    // USD, double
         const val EXTRA_TAB        = "tab"       // MainActivity initial tab
     }
 
@@ -191,6 +194,12 @@ class CodelightService : LifecycleService() {
             ACTION_SESSION_RESET -> {
                 val agentId = intent.getStringExtra(EXTRA_AGENT_ID)
                 if (!agentId.isNullOrBlank()) sendSessionResetRequest(agentId)
+            }
+            ACTION_SET_BUDGET -> {
+                val agentId = intent.getStringExtra(EXTRA_AGENT_ID)
+                val budget = intent.getDoubleExtra(EXTRA_BUDGET, -1.0)
+                if (!agentId.isNullOrBlank() && budget >= 0.0)
+                    sendSetBudgetRequest(agentId, budget)
             }
             ACTION_GET_CONVERSATION -> {
                 val agentId = intent.getStringExtra(EXTRA_AGENT_ID)
@@ -399,6 +408,7 @@ class CodelightService : LifecycleService() {
                 "permission_resolved",
                 "question_resolved"   -> { resolveRequest(obj.optString("id")); return }
                 "session_reset_result" -> { storeSessionResetResult(obj); return }
+                "budget_result"       -> { storeResult(KEY_BUDGET_RESULT, obj); return }
                 "conversation"        -> { storeConversation(obj); return }
             }
             val edit = getSharedPreferences(STATE_PREFS, MODE_PRIVATE).edit()
@@ -593,9 +603,25 @@ class CodelightService : LifecycleService() {
     }
 
     private fun storeSessionResetResult(obj: JSONObject) {
+        storeResult(KEY_SESSION_RESET_RESULT, obj)
+    }
+
+    private fun storeResult(key: String, obj: JSONObject) {
         getSharedPreferences(STATE_PREFS, MODE_PRIVATE).edit()
-            .putString(KEY_SESSION_RESET_RESULT, obj.toString())
+            .putString(key, obj.toString())
             .apply()
+    }
+
+    private fun sendSetBudgetRequest(agentId: String, budget: Double) {
+        val id = java.util.UUID.randomUUID().toString()
+        storeResult(KEY_BUDGET_RESULT, JSONObject()
+            .put("id", id).put("agent_id", agentId).put("pending", true))
+        webSocket?.send(JSONObject()
+            .put("type", "set_budget_request")
+            .put("id", id)
+            .put("agent_id", agentId)
+            .put("budget", budget)
+            .toString())
     }
 
     // Pending requests are mirrored to STATE_PREFS so RequestActivity can render them.

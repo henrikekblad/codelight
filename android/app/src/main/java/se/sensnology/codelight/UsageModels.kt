@@ -17,6 +17,8 @@ internal data class AgentUsage(
     val limits: List<UsageLimit>,
     val sessionResetSupported: Boolean = false,
     val rateLimitResetCreditsAvailableCount: Int? = null,
+    val budgetUsd: Double = 0.0,
+    val spentUsd: Double = 0.0,
 )
 
 internal fun loadAgentUsage(prefs: SharedPreferences, now: Long): List<AgentUsage> {
@@ -90,6 +92,8 @@ internal fun loadAgentUsage(prefs: SharedPreferences, now: Long): List<AgentUsag
                     value.optInt("rate_limit_reset_available_count", 0)
                 else -> null
             },
+            budgetUsd = value?.optDouble("budget_usd", 0.0) ?: 0.0,
+            spentUsd = value?.optDouble("spent_usd", 0.0) ?: 0.0,
         )
     }.sortedWith(compareByDescending<AgentUsage> { it.id == activeId }
         .thenByDescending { statusRank(it.status) }

@@ -70,6 +70,7 @@ fun StatusScreen(onOpenConversation: (String) -> Unit = {}) {
     val brandings = AgentBrandings.fromPrefs(state)
     val resetResult = state.getString(CodelightService.KEY_SESSION_RESET_RESULT, "") ?: ""
     var confirmResetAgent by remember { mutableStateOf<AgentUsage?>(null) }
+    var editBudgetAgent by remember { mutableStateOf<AgentUsage?>(null) }
 
     LaunchedEffect(resetResult) {
         if (resetResult.isBlank()) return@LaunchedEffect
@@ -109,6 +110,45 @@ fun StatusScreen(onOpenConversation: (String) -> Unit = {}) {
             },
             dismissButton = {
                 TextButton(onClick = { confirmResetAgent = null }) { Text("Cancel") }
+            },
+        )
+    }
+
+    editBudgetAgent?.let { agent ->
+        var text by remember(agent.id) {
+            mutableStateOf(if (agent.budgetUsd > 0) "%.0f".format(agent.budgetUsd) else "")
+        }
+        AlertDialog(
+            onDismissRequest = { editBudgetAgent = null },
+            title = { Text("Monthly budget — ${agent.display}") },
+            text = {
+                Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                    Text(
+                        "Track this calendar month's spend against a USD budget. " +
+                            "A tracking target, not an enforced cap. Set 0 to hide the meter.",
+                        color = Palette.muted, fontSize = 12.sp,
+                    )
+                    OutlinedTextField(
+                        value = text,
+                        onValueChange = { v -> text = v.filter { it.isDigit() || it == '.' } },
+                        label = { Text("USD / month") },
+                        singleLine = true,
+                        keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Decimal),
+                    )
+                }
+            },
+            confirmButton = {
+                TextButton(onClick = {
+                    val budget = text.toDoubleOrNull() ?: 0.0
+                    context.startService(Intent(context, CodelightService::class.java)
+                        .setAction(CodelightService.ACTION_SET_BUDGET)
+                        .putExtra(CodelightService.EXTRA_AGENT_ID, agent.id)
+                        .putExtra(CodelightService.EXTRA_BUDGET, budget))
+                    editBudgetAgent = null
+                }) { Text("Save") }
+            },
+            dismissButton = {
+                TextButton(onClick = { editBudgetAgent = null }) { Text("Cancel") }
             },
         )
     }
@@ -172,6 +212,31 @@ fun StatusScreen(onOpenConversation: (String) -> Unit = {}) {
                             ),
                         ) {
                             Text("Reset session limits")
+                        }
+                    }
+                }
+                if (branding?.budgetSettable == true) {
+                    HorizontalDivider(color = Color(0xFF333333), thickness = 1.dp)
+                    Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+                        Text(
+                            if (agent.budgetUsd > 0)
+                                "Budget: $%.2f / $%.0f".format(agent.spentUsd, agent.budgetUsd)
+                            else "No budget set — $%.2f spent".format(agent.spentUsd),
+                            color = Palette.muted,
+                            fontSize = 11.sp,
+                            modifier = Modifier.weight(1f),
+                        )
+                        Button(
+                            onClick = { editBudgetAgent = agent },
+                            enabled = connected,
+                            colors = ButtonDefaults.buttonColors(
+                                containerColor = Palette.accent,
+                                contentColor = Color.Black,
+                                disabledContainerColor = Color(0xFF333333),
+                                disabledContentColor = Palette.muted,
+                            ),
+                        ) {
+                            Text(if (agent.budgetUsd > 0) "Edit budget" else "Set budget")
                         }
                     }
                 }
