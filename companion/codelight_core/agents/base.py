@@ -127,6 +127,11 @@ class AgentIntegration:
     # (session_id, lines) for the active/latest session, where each line is
     # {"role": user|assistant|tool|output, "text": str}, or None.
     conversation_provider: Callable[[], "tuple[str, list[dict]] | None"] | None = None
+    # Remote steering: send a new instruction to a running agent from a client.
+    # (text, session_id) → ok; session_id "" targets the active/latest session.
+    # Only agents with a control API (e.g. OpenCode) can do this — hook-based
+    # agents are reactive and cannot be prompted.
+    prompt_sender: Callable[[str, str], bool] | None = None
     # Hookless agents that expose a live event stream declare a listener the
     # daemon runs in its own thread with a ListenerContext (e.g. OpenCode).
     background_listener: Callable[["ListenerContext"], None] | None = None

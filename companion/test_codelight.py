@@ -452,6 +452,7 @@ class AuthenticationTests(unittest.TestCase):
             respond_question=lambda request_id, answers, by: False,
             consume_session_reset=lambda agent_id, request_id: {},
             set_budget=lambda agent_id, budget, request_id: {},
+            send_prompt=lambda agent_id, text, session_id, request_id: {},
             extend_request=lambda request_id: False,
             announce_gnome=lambda features: False,
             log=lambda message: None,
@@ -1560,6 +1561,26 @@ class OpenCodeIntegrationTests(unittest.TestCase):
         registry = codelight._new_agent_registry()
         self.assertIn("opencode", registry.conversation_agents())
         self.assertIsNotNone(registry.conversation_provider_for("opencode"))
+
+    def test_prompt_capable_and_send_prompt_routing(self):
+        registry = codelight._new_agent_registry()
+        self.assertIn("opencode", registry.prompt_capable_agents())
+        self.assertTrue(registry.client_metadata()["opencode"]["prompt_capable"])
+        # Hook-based agents cannot be steered.
+        self.assertNotIn("claude", registry.prompt_capable_agents())
+        self.assertFalse(registry.send_prompt("claude", "hi"))
+        # OpenCodeAgent.send_prompt guards empty text (no network needed).
+        agent = opencode_agent.OpenCodeAgent(db_path="", monthly_budget_usd=0)
+        self.assertFalse(agent.send_prompt("   "))
+        # Routing: registry.send_prompt forwards (text, session_id) to the
+        # integration's sender.
+        sent = []
+        stub = agents_base.AgentIntegration(
+            spec=agents_base.AgentSpec("stub", "Stub"),
+            prompt_sender=lambda text, sid: (sent.append((text, sid)), True)[1])
+        reg = AgentRegistry(agents_config={}, modules=(), extra_agents=(stub,))
+        self.assertTrue(reg.send_prompt("stub", "do X", "ses1"))
+        self.assertEqual(sent, [("do X", "ses1")])
 
     def test_budget_set_get_roundtrip_and_meter_toggle(self):
         agent = opencode_agent.OpenCodeAgent(db_path="/no/such.db",

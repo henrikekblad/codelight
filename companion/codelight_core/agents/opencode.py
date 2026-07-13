@@ -233,23 +233,47 @@ class OpenCodeAgent:
         data = self._get_data("/api/session/active")
         return set(data.keys()) if isinstance(data, dict) else set()
 
+    def _latest_session_id(self) -> str:
+        """The active session if any, else the most-recently-updated one."""
+        active = self._fetch_active_sids()
+        sid = next(iter(active), "")
+        if sid:
+            return sid
+        sessions = self._get_data("/api/session")
+        if isinstance(sessions, dict):
+            sessions = list(sessions.values())
+        if not isinstance(sessions, list) or not sessions:
+            return ""
+        newest = max(sessions, key=lambda s: (s.get("time") or {}).get("updated", 0)
+                     if isinstance(s, dict) else 0)
+        return newest.get("id", "") if isinstance(newest, dict) else ""
+
+    def send_prompt(self, text: str, session_id: str = "") -> bool:
+        """Send a new instruction to a session (remote steering). Targets the
+        given session, or the active/latest one. Returns True on a 2xx."""
+        text = (text or "").strip()
+        if not text:
+            return False
+        sid = session_id or self._latest_session_id()
+        if not sid:
+            return False
+        try:
+            req = urllib.request.Request(
+                f"{self.server_url}/api/session/{sid}/prompt", method="POST",
+                data=json.dumps({"prompt": {"text": text}}).encode(),
+                headers={**self._headers(), "Content-Type": "application/json"})
+            with urllib.request.urlopen(req, timeout=15) as resp:
+                return 200 <= resp.status < 300
+        except Exception as exc:
+            if self.log:
+                self.log(f"[opencode] send_prompt failed ({exc})")
+            return False
+
     def conversation(self) -> tuple[str, list[dict]] | None:
         """The active (or most-recently-updated) session's messages as codelight
         conversation lines, fetched from the server. None when unavailable."""
         try:
-            active = self._fetch_active_sids()
-            sid = next(iter(active), "")
-            if not sid:
-                sessions = self._get_data("/api/session")
-                if isinstance(sessions, dict):
-                    sessions = list(sessions.values())
-                if not isinstance(sessions, list) or not sessions:
-                    return None
-                sid = max(
-                    sessions,
-                    key=lambda s: (s.get("time") or {}).get("updated", 0)
-                    if isinstance(s, dict) else 0,
-                ).get("id", "")
+            sid = self._latest_session_id()
             if not sid:
                 return None
             messages = self._get_data(f"/api/session/{sid}/message", timeout=8.0)
@@ -429,4 +453,6 @@ def build_integration(config: dict, *,
         budget_setter=agent.set_budget,
         # Conversation comes from the server API, not a JSONL file.
         conversation_provider=agent.conversation,
+        # Remote steering: send new instructions to a session from a client.
+        prompt_sender=agent.send_prompt,
     )

@@ -48,6 +48,7 @@ class CodelightWebsocketHub:
         respond_question: QuestionResponseCallback,
         consume_session_reset: SessionResetCallback,
         set_budget: Callable[[str, object, str], JsonDict],
+        send_prompt: Callable[[str, str, str, str], JsonDict],
         extend_request: ExtendCallback,
         announce_gnome: AnnounceCallback,
         log: LogCallback,
@@ -69,6 +70,7 @@ class CodelightWebsocketHub:
         self._respond_question = respond_question
         self._consume_session_reset = consume_session_reset
         self._set_budget = set_budget
+        self._send_prompt = send_prompt
         self._extend_request = extend_request
         self._announce_gnome = announce_gnome
         self._log = log
@@ -289,6 +291,15 @@ class CodelightWebsocketHub:
             agent_id = str(message.get("agent_id") or "")
             result = self._set_budget(
                 agent_id, message.get("budget"), request_id)
+            await ws.send(json.dumps(result))
+            return client_name
+
+        if message_type == "send_prompt_request":
+            request_id = str(message.get("id") or "")
+            agent_id = str(message.get("agent_id") or "")
+            result = self._send_prompt(
+                agent_id, str(message.get("text") or ""),
+                str(message.get("session_id") or ""), request_id)
             await ws.send(json.dumps(result))
             return client_name
 

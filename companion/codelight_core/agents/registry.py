@@ -151,6 +151,7 @@ class AgentRegistry:
             }
         conversation = self.conversation_agents()
         budget = self.budget_agents()
+        promptable = self.prompt_capable_agents()
         return {
             agent_id: {
                 "display": spec.display,
@@ -158,6 +159,7 @@ class AgentRegistry:
                 "logo_svg": spec.logo_svg,
                 "conversation": agent_id in conversation,
                 "budget_settable": agent_id in budget,
+                "prompt_capable": agent_id in promptable,
             }
             for agent_id, spec in self.specs.items()
         }
@@ -228,6 +230,20 @@ class AgentRegistry:
             return False
         integration.budget_setter(monthly_budget_usd)
         return True
+
+    def prompt_capable_agents(self) -> set[str]:
+        """Agents that can be sent new instructions remotely (have a control
+        API) — hook-based agents cannot."""
+        return {
+            agent_id for agent_id, integration in self._integrations.items()
+            if integration.prompt_sender is not None
+        }
+
+    def send_prompt(self, agent_id: str, text: str, session_id: str = "") -> bool:
+        integration = self._integrations.get(agent_id)
+        if integration is None or integration.prompt_sender is None:
+            return False
+        return bool(integration.prompt_sender(text, session_id))
 
     def session_reset_supported(self, agent_id: str) -> bool:
         integration = self._integrations.get(agent_id)

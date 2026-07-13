@@ -656,6 +656,23 @@ def _set_budget(agent_id: str, budget, request_id: str = "") -> dict:
     }
 
 
+def _send_prompt(agent_id: str, text, session_id: str = "",
+                 request_id: str = "") -> dict:
+    """Remote steering: forward a new instruction to an agent that has a
+    control API (OpenCode). session_id targets the viewed session; empty means
+    the active/latest one."""
+    aid = _state.normalize_agent_id(agent_id)
+    ok = _agents.send_prompt(aid, str(text or ""), str(session_id or ""))
+    _log(f"[prompt] {aid} → {'sent' if ok else 'failed'}")
+    return {
+        "type": "send_prompt_result",
+        "id": request_id,
+        "agent_id": aid,
+        "agent_display": _state.agent_display_name(aid),
+        "ok": ok,
+    }
+
+
 def run_dashboard(host: str, ws_port: int, secret: str) -> None:
     """Run the terminal dashboard as a normal WebSocket client."""
     if not _have_websockets:
@@ -703,6 +720,7 @@ def _ws_thread(port: int, secret: str) -> None:
         respond_question=_resolve_question,
         consume_session_reset=_consume_session_reset,
         set_budget=_set_budget,
+        send_prompt=_send_prompt,
         extend_request=_extend_request,
         announce_gnome=_announce_gnome,
         log=_log,
