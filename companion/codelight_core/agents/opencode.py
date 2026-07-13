@@ -12,13 +12,35 @@ background-listener component is the next slice (see PLAN.md, OpenCode).
 """
 from __future__ import annotations
 
+import base64
+import json
 import os
 import sqlite3
+import threading
+import urllib.request
 from datetime import datetime, timezone
 from typing import Callable
 
 from codelight_core.agents import base
 from codelight_core.timefmt import format_epoch_countdown
+
+
+DEFAULT_SERVER_URL = "http://127.0.0.1:4096"
+ACTIVE_POLL_INTERVAL = 2.0
+
+# working / idle come from the authoritative active-session set (OpenCode
+# v1.17 emits no session.idle/session.status event — verified 2026-07-13), so
+# the SSE bus is used only for the waiting edge: a permission/question prompt
+# blocks the turn (waiting), and its reply/rejection resumes it.
+_WAITING_EVENTS = frozenset({
+    "permission.asked", "permission.v2.asked",
+    "question.asked", "question.v2.asked",
+})
+_RESUME_EVENTS = frozenset({
+    "permission.replied", "permission.v2.replied",
+    "question.replied", "question.v2.replied",
+    "question.rejected", "question.v2.rejected",
+})
 
 
 # Placeholder branding: a terminal-prompt ">_" mark (currentColor SVG +
@@ -108,15 +130,122 @@ def get_usage(db_path: str, monthly_budget_usd: float,
     }
 
 
+def classify_event(event: dict) -> tuple[str, str]:
+    """Classify one SSE event as (session_id, tag) where tag is 'waiting'
+    (a permission/question prompt blocks the turn), 'resume' (it was answered),
+    or '' (ignored — working/idle come from the active-session poll). Pure for
+    testing."""
+    etype = str(event.get("type") or "")
+    sid = str((event.get("properties") or {}).get("sessionID") or "")
+    if etype in _WAITING_EVENTS:
+        return sid, "waiting"
+    if etype in _RESUME_EVENTS:
+        return sid, "resume"
+    return "", ""
+
+
 class OpenCodeAgent:
     def __init__(self, db_path: str, monthly_budget_usd: float,
+                 server_url: str = DEFAULT_SERVER_URL,
+                 username: str = "", password: str = "",
                  log: Callable[[str], None] | None = None) -> None:
         self.db_path = db_path
         self.monthly_budget_usd = monthly_budget_usd
+        self.server_url = server_url.rstrip("/")
+        self.username = username
+        self.password = password
         self.log = log
 
     def get_usage(self) -> dict | None:
         return get_usage(self.db_path, self.monthly_budget_usd, self.log)
+
+    def _headers(self, accept: str = "") -> dict:
+        headers = {}
+        if accept:
+            headers["Accept"] = accept
+        if self.password:
+            token = base64.b64encode(
+                f"{self.username or 'opencode'}:{self.password}".encode()).decode()
+            headers["Authorization"] = f"Basic {token}"
+        return headers
+
+    def _fetch_active_sids(self) -> set[str]:
+        """The server's authoritative set of currently-working sessions
+        (`GET /api/session/active` → {data: {sid: {type: running}}})."""
+        req = urllib.request.Request(
+            f"{self.server_url}/api/session/active", headers=self._headers())
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            body = json.loads(resp.read() or "null")
+        data = (body or {}).get("data") if isinstance(body, dict) else None
+        return set(data.keys()) if isinstance(data, dict) else set()
+
+    def run_listener(self, ctx: base.ListenerContext) -> None:
+        """Report OpenCode status into codelight.
+
+        Working/idle come from polling the authoritative active-session set
+        (OpenCode emits no idle event); the SSE bus supplies the waiting edge
+        (a permission/question prompt) which overrides working until answered.
+        Both loops reconnect/retry until shutdown."""
+        pending: set[str] = set()   # sessions blocked on a permission/question
+        tracked: set[str] = set()   # sessions we've reported as working
+        lock = threading.Lock()
+
+        def poll_active() -> None:
+            while not ctx.shutdown.is_set():
+                try:
+                    active = self._fetch_active_sids()
+                    with lock:
+                        for sid in active:
+                            if sid not in pending:
+                                ctx.report_status(sid, "working", "opencode")
+                                tracked.add(sid)
+                        for sid in list(tracked):
+                            if sid not in active and sid not in pending:
+                                ctx.report_status(sid, "idle", "opencode")
+                                tracked.discard(sid)
+                except Exception:
+                    pass  # server down / transient — next tick retries
+                ctx.shutdown.wait(ACTIVE_POLL_INTERVAL)
+
+        threading.Thread(target=poll_active, daemon=True).start()
+
+        url = f"{self.server_url}/event"
+        backoff = 1.0
+        while not ctx.shutdown.is_set():
+            try:
+                req = urllib.request.Request(
+                    url, headers=self._headers("text/event-stream"))
+                with urllib.request.urlopen(req, timeout=120) as stream:
+                    backoff = 1.0
+                    ctx.log(f"[opencode] listening on {self.server_url}")
+                    for raw in stream:
+                        if ctx.shutdown.is_set():
+                            return
+                        line = raw.decode("utf-8", "replace").strip()
+                        if not line.startswith("data:"):
+                            continue
+                        try:
+                            event = json.loads(line[5:].strip())
+                        except ValueError:
+                            continue
+                        sid, tag = classify_event(event)
+                        if not sid:
+                            continue
+                        if tag == "waiting":
+                            with lock:
+                                pending.add(sid)
+                            ctx.report_status(sid, "waiting", "opencode")
+                        elif tag == "resume":
+                            with lock:
+                                pending.discard(sid)
+                            # the active-poll restores working/idle next tick
+            except Exception as exc:
+                if ctx.shutdown.is_set():
+                    return
+                ctx.log(f"[opencode] listener reconnecting in {backoff:.0f}s ({exc})")
+                ctx.shutdown.wait(backoff)
+                backoff = min(backoff * 2, 30.0)
+                backoff = min(backoff * 2, 30.0)
 
 
 def build_integration(config: dict, *,
@@ -131,14 +260,20 @@ def build_integration(config: dict, *,
         budget = float(config.get("monthly_budget_usd") or 0)
     except (TypeError, ValueError):
         budget = 0.0
-    agent = OpenCodeAgent(db_path, budget, log)
+    agent = OpenCodeAgent(
+        db_path, budget,
+        server_url=str(config.get("server_url") or DEFAULT_SERVER_URL),
+        username=str(config.get("username") or ""),
+        password=str(config.get("password") or ""),
+        log=log,
+    )
     return base.AgentIntegration(
         spec=SPEC,
         agent=agent,
         # Opt-in $-budget meter; hidden (usage_fetcher=None) without a budget.
         usage_fetcher=agent.get_usage if budget > 0 else None,
-        # No install_hooks: OpenCode has no hooks. Status + remote
-        # permission/question answering will come from the server's SSE bus via
-        # a background listener (next slice — needs AgentIntegration to grow an
-        # optional long-lived listener component; see PLAN.md).
+        # No install_hooks: OpenCode has no hooks. Status comes from the
+        # server's SSE bus via this listener; remote permission/question
+        # routing is layered on next.
+        background_listener=agent.run_listener,
     )

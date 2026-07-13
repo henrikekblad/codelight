@@ -19,6 +19,7 @@ import threading
 import time
 from datetime import datetime
 from codelight_core.agents.registry import AgentRegistry
+from codelight_core.agents import base as agents_base
 from codelight_core import conversation as conversation_core
 from codelight_core.conversation import ConversationRefresher
 from codelight_core import dashboard_client
@@ -686,6 +687,33 @@ def _usage_thread() -> None:
         push=_push,
     ).run()
 
+
+def _background_listener_context() -> agents_base.ListenerContext:
+    """Daemon capabilities for a hookless agent's event-stream listener: report
+    status like a hook, and route permission/question prompts through the same
+    remote-control manager (the listener supplies its own transport responder)."""
+    mgr = _remote_request_manager()
+    return agents_base.ListenerContext(
+        shutdown=_shutdown,
+        report_status=lambda session_id, state, agent_id, cwd="":
+            _update_session(session_id, state, cwd=cwd, agent_id=agent_id),
+        submit_permission=lambda msg, responder:
+            mgr.register_permission(None, msg, responder=responder),
+        submit_question=lambda msg, responder:
+            mgr.register_question(None, msg, responder=responder),
+        log=vprint,
+        notify_conversation_changed=_notify_conversation_changed,
+    )
+
+
+def _run_background_listener(agent_id: str, listener) -> None:
+    ctx = _background_listener_context()
+    try:
+        listener(ctx)
+    except Exception as exc:  # never let one listener take down its thread quietly
+        vprint(f"[{agent_id}] listener stopped: {exc}")
+
+
 # ── Uninstall ─────────────────────────────────────────────────────────────────
 
 def uninstall() -> None:
@@ -848,6 +876,14 @@ def main():
         args=(args.ws_port, args.name),
         daemon=True,
     ).start()
+
+    for _agent_id, _listener in _agents.background_listeners(enabled_agents).items():
+        threading.Thread(
+            target=_run_background_listener,
+            args=(_agent_id, _listener),
+            daemon=True,
+        ).start()
+        print(f"[{_agent_id}] background listener started", flush=True)
 
     print(f"daemon ready — next usage poll in {USAGE_INTERVAL}s", flush=True)
 

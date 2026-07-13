@@ -74,6 +74,24 @@ def wait_question(
         entry["event"].wait(min(remaining, tick))
 
 
+def _reply_and_close(conn, payload: dict) -> None:
+    """Deliver a decision to a blocked hook over its held socket, then close."""
+    try:
+        conn.sendall((json.dumps(payload) + "\n").encode())
+    except Exception:
+        pass
+    try:
+        conn.close()
+    except Exception:
+        pass
+
+
+def socket_responder(conn):
+    """A responder that replies to a hook over its socket connection. Other
+    transports (e.g. OpenCode's HTTP server) pass their own responder instead."""
+    return lambda payload: _reply_and_close(conn, payload)
+
+
 class SessionToolAllowances:
     """Tools the user allowed for the remainder of a session ("allow this
     session"). In-memory only — dies with the daemon; a session's entry is
@@ -352,9 +370,13 @@ class RemoteRequestManager:
     def clear_session_allowances(self, session_id: str) -> None:
         self.session_allowances.clear(session_id)
 
-    def register_permission(self, conn, msg: dict) -> None:
+    def register_permission(self, conn, msg: dict, *, responder=None) -> None:
+        # Hooks reply over their held socket; other transports (OpenCode's HTTP
+        # server) pass an explicit responder instead of a conn.
+        if responder is None:
+            responder = socket_responder(conn)
         if not self.remote_permissions():
-            self._reply_and_close(conn, {"decision": None})
+            responder({"decision": None})
             return
 
         request_id = str(msg.get("prompt_id") or "") or uuid.uuid4().hex
@@ -363,11 +385,11 @@ class RemoteRequestManager:
         # "Allow this tool for the session" — answer without prompting anyone.
         tool_name = str(msg.get("tool_name") or "")
         if self.session_allowances.is_allowed(session_id, tool_name):
-            self._reply_and_close(conn, {"decision": "allow"})
+            responder({"decision": "allow"})
             self.log(f"[perm] {tool_name} → allow (session allowance)")
             return
         entry = {
-            "conn":       conn,
+            "responder":  responder,
             "id":         request_id,
             "session_id": session_id,
             "agent_id":   self.normalize_agent_id(msg.get("agent_id")),
@@ -389,15 +411,17 @@ class RemoteRequestManager:
         threading.Thread(
             target=self._permission_waiter, args=(entry,), daemon=True).start()
 
-    def register_question(self, conn, msg: dict) -> None:
+    def register_question(self, conn, msg: dict, *, responder=None) -> None:
+        if responder is None:
+            responder = socket_responder(conn)
         if not self.remote_questions():
-            self._reply_and_close(conn, {"answers": None})
+            responder({"answers": None})
             return
 
         request_id = str(msg.get("prompt_id") or "") or uuid.uuid4().hex
         session_id = msg.get("session_id", "unknown")
         entry = {
-            "conn":       conn,
+            "responder":  responder,
             "id":         request_id,
             "session_id": session_id,
             "agent_id":   self.normalize_agent_id(msg.get("agent_id")),
@@ -424,7 +448,7 @@ class RemoteRequestManager:
         persistence = entry.get("persistence") \
             if isinstance(entry.get("persistence"), dict) else None
 
-        self._reply_and_close(entry["conn"], {"decision": decision})
+        entry["responder"]({"decision": decision})
 
         outcome = decision or (
             "cancelled" if by == "cancelled" else "skip" if by else "timeout")
@@ -450,7 +474,7 @@ class RemoteRequestManager:
         answers = entry["answers"]
         by = entry["by"]
 
-        self._reply_and_close(entry["conn"], {"answers": answers})
+        entry["responder"]({"answers": answers})
 
         outcome = "answered" if answers else (
             "cancelled" if by == "cancelled" else "timeout")
@@ -461,14 +485,3 @@ class RemoteRequestManager:
             "QuestionResolved",
         )
         self.push_status()
-
-    @staticmethod
-    def _reply_and_close(conn, payload: dict) -> None:
-        try:
-            conn.sendall((json.dumps(payload) + "\n").encode())
-        except Exception:
-            pass
-        try:
-            conn.close()
-        except Exception:
-            pass

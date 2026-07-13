@@ -1352,7 +1352,7 @@ class RemoteControlTests(unittest.TestCase):
     @staticmethod
     def make_permission_entry(request_id, session_id="s1", tool_name="WebFetch"):
         return {
-            "conn": None,
+            "responder": lambda payload: None,
             "id": request_id,
             "session_id": session_id,
             "agent_id": "claude",
@@ -1530,12 +1530,37 @@ class OpenCodeIntegrationTests(unittest.TestCase):
     def test_registry_autodiscovers_opencode_meter_opt_in(self):
         registry = codelight._new_agent_registry()
         self.assertIn("opencode", registry.supported_agent_ids())
-        # OpenCode has no hooks; the meter is opt-in via a budget.
+        # OpenCode has no hooks; the meter is opt-in via a budget, and it
+        # always exposes an SSE background listener (no install_hooks).
         off = opencode_agent.build_integration({})
         self.assertIsNone(off.usage_fetcher)
         self.assertIsNone(off.install_hooks)
+        self.assertIsNotNone(off.background_listener)
+        self.assertIn("opencode", registry.background_listeners())
         on = opencode_agent.build_integration({"monthly_budget_usd": 50})
         self.assertIsNotNone(on.usage_fetcher)
+
+    def test_classify_event_waiting_resume_ignored(self):
+        # A permission/question prompt is the waiting edge.
+        self.assertEqual(opencode_agent.classify_event(
+            {"type": "permission.v2.asked", "properties": {"sessionID": "ses1"}}),
+            ("ses1", "waiting"))
+        self.assertEqual(opencode_agent.classify_event(
+            {"type": "question.v2.asked", "properties": {"sessionID": "ses1"}}),
+            ("ses1", "waiting"))
+        # Its reply/rejection resumes the turn.
+        self.assertEqual(opencode_agent.classify_event(
+            {"type": "permission.v2.replied", "properties": {"sessionID": "ses1"}}),
+            ("ses1", "resume"))
+        self.assertEqual(opencode_agent.classify_event(
+            {"type": "question.v2.rejected", "properties": {"sessionID": "ses1"}}),
+            ("ses1", "resume"))
+        # Activity / lifecycle events are ignored — working/idle come from the
+        # active-session poll, and OpenCode emits no idle event.
+        for etype in ("session.next.tool.called", "session.idle",
+                      "session.status", "server.connected"):
+            self.assertEqual(opencode_agent.classify_event(
+                {"type": etype, "properties": {"sessionID": "ses1"}}), ("", ""))
 
 
 class SelfInvocationTests(unittest.TestCase):

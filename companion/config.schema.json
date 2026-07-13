@@ -105,6 +105,18 @@
             "monthly_budget_usd": {
               "type": "number",
               "description": "Opt-in cost meter: this calendar month's OpenCode spend vs this budget in USD. Hidden when unset (OpenCode is BYOK — a self-set tracking budget, not an enforced limit)."
+            },
+            "server_url": {
+              "type": "string",
+              "description": "OpenCode server base URL for the status/permission listener (default http://127.0.0.1:4096). Run `opencode serve --port 4096`."
+            },
+            "username": {
+              "type": "string",
+              "description": "Basic-auth username for the OpenCode server, if it requires auth (default 'opencode')."
+            },
+            "password": {
+              "type": "string",
+              "description": "Basic-auth password for the OpenCode server, if it requires auth (or set OPENCODE_SERVER_PASSWORD)."
             }
           }
         }

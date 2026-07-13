@@ -197,6 +197,16 @@ class AgentRegistry:
             if integration.usage_fetcher is not None
         }
 
+    def background_listeners(self, agent_ids=None) -> dict[str, Callable]:
+        """Agents (optionally filtered to ``agent_ids``) that expose a
+        long-lived event-stream listener the daemon should run in a thread."""
+        return {
+            agent_id: integration.background_listener
+            for agent_id, integration in self._integrations.items()
+            if integration.background_listener is not None
+            and (agent_ids is None or agent_id in agent_ids)
+        }
+
     def session_reset_supported(self, agent_id: str) -> bool:
         integration = self._integrations.get(agent_id)
         return bool(integration and integration.session_reset_consumer)

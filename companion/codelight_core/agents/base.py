@@ -5,6 +5,7 @@ import it, so it must not import other codelight_core modules.
 """
 from __future__ import annotations
 
+import threading
 from dataclasses import dataclass
 from typing import Callable
 
@@ -41,6 +42,32 @@ class HookMode:
     # E.g. Cursor's "ask" explicitly falls back to its own local prompt;
     # empty means emit nothing (the agent's default behavior applies).
     fallback_decision: str = ""
+
+
+@dataclass(frozen=True)
+class ListenerContext:
+    """Daemon capabilities a ``background_listener`` reports into.
+
+    An agent that has no hooks but exposes a live event stream (e.g. OpenCode's
+    HTTP server SSE bus) declares a ``background_listener``; the daemon runs it
+    in its own thread and passes this context. The listener maps the agent's
+    events onto codelight state and remote-control requests, transport-agnostic:
+    - ``report_status(session_id, state, agent_id=, cwd=)`` — working/waiting/
+      idle/ended, exactly like a status hook event.
+    - ``submit_permission(msg, responder)`` / ``submit_question(msg, responder)``
+      — route a prompt through the shared remote-control manager; ``responder``
+      is called with the decision (``{"decision": ...}`` / ``{"answers": ...}``)
+      so the listener can reply over its own transport (an HTTP POST for
+      OpenCode). ``decision``/``answers`` of ``None`` means no remote answer —
+      let the agent fall back to its own prompt.
+    """
+
+    shutdown: threading.Event
+    report_status: Callable[..., None]
+    submit_permission: Callable[[dict, Callable[[dict], None]], None]
+    submit_question: Callable[[dict, Callable[[dict], None]], None]
+    log: Callable[[str], None] = lambda _m: None
+    notify_conversation_changed: Callable[[], None] = lambda: None
 
 
 @dataclass(frozen=True)
@@ -92,3 +119,6 @@ class AgentIntegration:
     latest_transcript_fallback: Callable[[], str] | None = None
     # Sniffs one transcript JSONL record; see transcript.TranscriptExtractor.
     transcript_extractor: Callable[..., "tuple[str, object] | None"] | None = None
+    # Hookless agents that expose a live event stream declare a listener the
+    # daemon runs in its own thread with a ListenerContext (e.g. OpenCode).
+    background_listener: Callable[["ListenerContext"], None] | None = None
