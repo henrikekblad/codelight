@@ -72,21 +72,16 @@ def _to_opencode_answers(oc_questions: list, answers: dict) -> list:
     return result
 
 
-# Placeholder branding: a terminal-prompt ">_" mark (currentColor SVG +
-# matching 48x48 1-bit bitmap for the screen). TODO(branding): swap for
-# OpenCode's official logo and brand color when available.
-_LOGO_SVG = (
-    '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 48 48" fill="none" '
-    'stroke="currentColor" stroke-width="5" stroke-linecap="round" '
-    'stroke-linejoin="round"><path d="M16 12 L32 24 L16 36"/>'
-    '<line x1="18" y1="40" x2="34" y2="40"/></svg>'
-)
-_LOGO_BITMAP = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAGAAAAAAAPAAAAAAAfwAAAAAAf4AAAAAAP8AAAAAAH/AAAAAAD/gAAAAAA/wAAAAAAf8AAAAAAP+AAAAAAD/AAAAAAB/wAAAAAA/4AAAAAAP8AAAAAAH+AAAAAAH+AAAAAAP8AAAAAA/4AAAAAB/wAAAAAD/AAAAAAP+AAAAAAf8AAAAAA/wAAAAAD/gAAAAAH/AAAAAAP8AAAAAAf4AAAAAAfwAAAAAAPAAAAAAAG//8AAAAA//8AAAAA//8AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+# OpenCode's official mark rendered single-color (currentColor SVG +
+# matching 48x48 1-bit bitmap for the screen): outer frame + filled lower
+# block, derived from the 240x300 two-tone logo.
+_LOGO_SVG = '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 240 300" fill="currentColor"><path d="M0 0H240V60H0ZM0 0H60V300H0ZM180 0H240V300H180ZM0 240H240V300H0ZM60 120H180V240H60Z"/></svg>'
+_LOGO_BITMAP = "B//////gB//////gB//////gB//////gB//////gB//////gB//////gB//////gB//////gB//////gB/wAAD/gB/wAAD/gB/wAAD/gB/wAAD/gB/wAAD/gB/wAAD/gB/wAAD/gB/wAAD/gB/wAAD/gB//////gB//////gB//////gB//////gB//////gB//////gB//////gB//////gB//////gB//////gB//////gB//////gB//////gB//////gB//////gB//////gB//////gB//////gB//////gB//////gB//////gB//////gB//////gB//////gB//////gB//////gB//////gB//////gB//////g"
 SPEC = base.AgentSpec(
     agent_id="opencode",
     display="OpenCode",
     executables=("opencode",),
-    color="#6b7280",
+    color="#F1ECEC",
     logo_svg=_LOGO_SVG,
     logo_bitmap=_LOGO_BITMAP,
 )
