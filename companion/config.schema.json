@@ -93,6 +93,20 @@
               "description": "Show Cursor's monthly included-usage meter via its web API (default true)."
             }
           }
+        },
+        "opencode": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "db_path": {
+              "type": "string",
+              "description": "Path to OpenCode's SQLite store (default ~/.local/share/opencode/opencode.db)."
+            },
+            "monthly_budget_usd": {
+              "type": "number",
+              "description": "Opt-in cost meter: this calendar month's OpenCode spend vs this budget in USD. Hidden when unset (OpenCode is BYOK — a self-set tracking budget, not an enforced limit)."
+            }
+          }
         }
       }
     }

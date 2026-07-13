@@ -22,6 +22,7 @@ from codelight_core.agents import codex as codex_agent
 from codelight_core.agents import copilot as copilot_agent
 from codelight_core.agents import cursor as cursor_agent
 from codelight_core.agents import grok as grok_agent
+from codelight_core.agents import opencode as opencode_agent
 from codelight_core.state import CodelightState
 from codelight_core import auth as auth_core
 from codelight_core import dashboard_client
@@ -1482,6 +1483,59 @@ class RemoteControlTests(unittest.TestCase):
             ),
             10.0,
         )
+
+
+class OpenCodeIntegrationTests(unittest.TestCase):
+    def _make_db(self, path, rows):
+        import sqlite3
+        conn = sqlite3.connect(path)
+        conn.execute("CREATE TABLE session (id TEXT, cost REAL, time_created INTEGER)")
+        conn.executemany(
+            "INSERT INTO session (id, cost, time_created) VALUES (?,?,?)", rows)
+        conn.commit()
+        conn.close()
+
+    def _ms(self, dt):
+        return int(dt.timestamp() * 1000)
+
+    def test_month_cost_sums_only_current_month(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            db = os.path.join(tmp, "opencode.db")
+            now = datetime(2026, 7, 13, tzinfo=timezone.utc)
+            self._make_db(db, [
+                ("ses1", 1.50, self._ms(datetime(2026, 7, 2, tzinfo=timezone.utc))),
+                ("ses2", 2.25, self._ms(datetime(2026, 7, 12, tzinfo=timezone.utc))),
+                ("ses3", 9.99, self._ms(datetime(2026, 6, 20, tzinfo=timezone.utc))),
+            ])
+            self.assertAlmostEqual(opencode_agent.month_cost_usd(db, now=now), 3.75)
+
+    def test_get_usage_meter_shape_and_budget_gate(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            db = os.path.join(tmp, "opencode.db")
+            month_start = datetime.now(timezone.utc).replace(
+                day=1, hour=12, minute=0, second=0, microsecond=0)
+            self._make_db(db, [("ses1", 10.0, self._ms(month_start))])
+            # No budget configured -> no meter.
+            self.assertIsNone(opencode_agent.get_usage(db, 0))
+            # Budget -> monthly_pct is a fraction, plus $ fields.
+            usage = opencode_agent.get_usage(db, 40.0)
+            self.assertAlmostEqual(usage["monthly_pct"], 0.25)
+            self.assertEqual(usage["spent_usd"], 10.0)
+            self.assertEqual(usage["budget_usd"], 40.0)
+            self.assertIn("monthly_reset", usage)
+
+    def test_get_usage_none_when_store_missing(self):
+        self.assertIsNone(opencode_agent.get_usage("/no/such/opencode.db", 40.0))
+
+    def test_registry_autodiscovers_opencode_meter_opt_in(self):
+        registry = codelight._new_agent_registry()
+        self.assertIn("opencode", registry.supported_agent_ids())
+        # OpenCode has no hooks; the meter is opt-in via a budget.
+        off = opencode_agent.build_integration({})
+        self.assertIsNone(off.usage_fetcher)
+        self.assertIsNone(off.install_hooks)
+        on = opencode_agent.build_integration({"monthly_budget_usd": 50})
+        self.assertIsNotNone(on.usage_fetcher)
 
 
 class SelfInvocationTests(unittest.TestCase):
