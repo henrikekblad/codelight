@@ -150,12 +150,14 @@ class AgentRegistry:
                 list(self.specs.items())[:self.MAX_SCREEN_AGENTS]
             }
         conversation = self.conversation_agents()
+        budget = self.budget_agents()
         return {
             agent_id: {
                 "display": spec.display,
                 "color": spec.color,
                 "logo_svg": spec.logo_svg,
                 "conversation": agent_id in conversation,
+                "budget_settable": agent_id in budget,
             }
             for agent_id, spec in self.specs.items()
         }
@@ -206,6 +208,26 @@ class AgentRegistry:
             if integration.background_listener is not None
             and (agent_ids is None or agent_id in agent_ids)
         }
+
+    def budget_agents(self) -> set[str]:
+        """Agents whose usage-meter budget the user can set from a client."""
+        return {
+            agent_id for agent_id, integration in self._integrations.items()
+            if integration.budget_setter is not None
+        }
+
+    def get_budget(self, agent_id: str) -> float:
+        integration = self._integrations.get(agent_id)
+        if integration is None or integration.budget_getter is None:
+            return 0.0
+        return float(integration.budget_getter())
+
+    def set_budget(self, agent_id: str, monthly_budget_usd: float) -> bool:
+        integration = self._integrations.get(agent_id)
+        if integration is None or integration.budget_setter is None:
+            return False
+        integration.budget_setter(monthly_budget_usd)
+        return True
 
     def session_reset_supported(self, agent_id: str) -> bool:
         integration = self._integrations.get(agent_id)

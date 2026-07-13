@@ -174,6 +174,9 @@ class OpenCodeAgent:
     def get_usage(self) -> dict | None:
         return get_usage(self.db_path, self.monthly_budget_usd, self.log)
 
+    def set_budget(self, monthly_budget_usd: float) -> None:
+        self.monthly_budget_usd = max(0.0, float(monthly_budget_usd))
+
     def _headers(self, accept: str = "") -> dict:
         headers = {}
         if accept:
@@ -354,10 +357,14 @@ def build_integration(config: dict, *,
     return base.AgentIntegration(
         spec=SPEC,
         agent=agent,
-        # Opt-in $-budget meter; hidden (usage_fetcher=None) without a budget.
-        usage_fetcher=agent.get_usage if budget > 0 else None,
-        # No install_hooks: OpenCode has no hooks. Status comes from the
-        # server's SSE bus via this listener; remote permission/question
-        # routing is layered on next.
+        # Always wired: get_usage returns None while the budget is 0 (meter
+        # hidden), so setting a budget from the app takes effect without a
+        # restart.
+        usage_fetcher=agent.get_usage,
+        # No install_hooks: OpenCode has no hooks. Status + remote permission/
+        # question answering come from the server's SSE bus via this listener.
         background_listener=agent.run_listener,
+        # The BYOK $-budget is user-settable and daemon-persisted.
+        budget_getter=lambda: agent.monthly_budget_usd,
+        budget_setter=agent.set_budget,
     )

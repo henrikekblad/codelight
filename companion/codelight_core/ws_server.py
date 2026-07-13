@@ -47,6 +47,7 @@ class CodelightWebsocketHub:
         respond_permission: PermissionResponseCallback,
         respond_question: QuestionResponseCallback,
         consume_session_reset: SessionResetCallback,
+        set_budget: Callable[[str, object, str], JsonDict],
         extend_request: ExtendCallback,
         announce_gnome: AnnounceCallback,
         log: LogCallback,
@@ -67,6 +68,7 @@ class CodelightWebsocketHub:
         self._respond_permission = respond_permission
         self._respond_question = respond_question
         self._consume_session_reset = consume_session_reset
+        self._set_budget = set_budget
         self._extend_request = extend_request
         self._announce_gnome = announce_gnome
         self._log = log
@@ -279,6 +281,14 @@ class CodelightWebsocketHub:
             request_id = str(message.get("id") or "")
             agent_id = str(message.get("agent_id") or "")
             result = self._consume_session_reset(agent_id, request_id)
+            await ws.send(json.dumps(result))
+            return client_name
+
+        if message_type == "set_budget_request":
+            request_id = str(message.get("id") or "")
+            agent_id = str(message.get("agent_id") or "")
+            result = self._set_budget(
+                agent_id, message.get("budget"), request_id)
             await ws.send(json.dumps(result))
             return client_name
 

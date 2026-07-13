@@ -125,3 +125,8 @@ class AgentIntegration:
     # Hookless agents that expose a live event stream declare a listener the
     # daemon runs in its own thread with a ListenerContext (e.g. OpenCode).
     background_listener: Callable[["ListenerContext"], None] | None = None
+    # A user-settable monthly $-budget for the usage meter (OpenCode is BYOK, so
+    # its meter is a self-set budget). When both are present, clients may show
+    # and edit it on the agent's status card; the daemon persists changes.
+    budget_getter: Callable[[], float] | None = None
+    budget_setter: Callable[[float], None] | None = None

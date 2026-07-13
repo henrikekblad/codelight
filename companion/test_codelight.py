@@ -451,6 +451,7 @@ class AuthenticationTests(unittest.TestCase):
             respond_permission=lambda request_id, decision, by: False,
             respond_question=lambda request_id, answers, by: False,
             consume_session_reset=lambda agent_id, request_id: {},
+            set_budget=lambda agent_id, budget, request_id: {},
             extend_request=lambda request_id: False,
             announce_gnome=lambda features: False,
             log=lambda message: None,
@@ -967,7 +968,7 @@ class UsagePollerTests(unittest.TestCase):
 
             self.assertEqual(copilot.token(), "token")
             self.assertEqual(set(registry.usage_fetchers()),
-                             {"claude", "codex", "copilot", "cursor"})
+                             {"claude", "codex", "copilot", "cursor", "opencode"})
             self.assertIsNotNone(usage)
             self.assertEqual(usage["used_credits"], 100)
 
@@ -1527,18 +1528,28 @@ class OpenCodeIntegrationTests(unittest.TestCase):
     def test_get_usage_none_when_store_missing(self):
         self.assertIsNone(opencode_agent.get_usage("/no/such/opencode.db", 40.0))
 
-    def test_registry_autodiscovers_opencode_meter_opt_in(self):
+    def test_registry_autodiscovers_opencode_listener_and_budget(self):
         registry = codelight._new_agent_registry()
         self.assertIn("opencode", registry.supported_agent_ids())
-        # OpenCode has no hooks; the meter is opt-in via a budget, and it
-        # always exposes an SSE background listener (no install_hooks).
-        off = opencode_agent.build_integration({})
-        self.assertIsNone(off.usage_fetcher)
-        self.assertIsNone(off.install_hooks)
-        self.assertIsNotNone(off.background_listener)
+        integ = opencode_agent.build_integration({})
+        self.assertIsNone(integ.install_hooks)          # no hooks
+        self.assertIsNotNone(integ.background_listener)  # SSE listener instead
+        # The usage fetcher is always wired; it returns None while the budget
+        # is 0 so the meter stays hidden until one is set (from config or app).
+        self.assertIsNotNone(integ.usage_fetcher)
         self.assertIn("opencode", registry.background_listeners())
-        on = opencode_agent.build_integration({"monthly_budget_usd": 50})
-        self.assertIsNotNone(on.usage_fetcher)
+        self.assertIn("opencode", registry.budget_agents())
+        self.assertTrue(
+            registry.client_metadata()["opencode"]["budget_settable"])
+
+    def test_budget_set_get_roundtrip_and_meter_toggle(self):
+        agent = opencode_agent.OpenCodeAgent(db_path="/no/such.db",
+                                             monthly_budget_usd=0)
+        self.assertIsNone(agent.get_usage())   # no budget → hidden
+        agent.set_budget(25)
+        self.assertEqual(agent.monthly_budget_usd, 25.0)
+        agent.set_budget(-5)                    # clamped to 0
+        self.assertEqual(agent.monthly_budget_usd, 0.0)
 
     def test_question_conversion_to_codelight_and_back(self):
         oc_q = [

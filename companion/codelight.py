@@ -49,6 +49,10 @@ CODELIGHT_CONFIG_HOME = os.path.expanduser(
 MONITOR_STATE_DIR = os.path.join(CODELIGHT_CONFIG_HOME, "monitor_state")
 SOCKET_PATH       = os.path.join(CODELIGHT_CONFIG_HOME, "codelight.sock")
 POLICY_PATH       = os.path.join(CODELIGHT_CONFIG_HOME, "policy.json")
+# Daemon-owned, runtime-mutable settings (e.g. app-set agent budgets). Kept
+# separate from the user's hand-authored config.json so the daemon never
+# rewrites it.
+SETTINGS_PATH     = os.path.join(CODELIGHT_CONFIG_HOME, "settings.json")
 USAGE_INTERVAL      = 60   # seconds between usage API polls
 IDLE_WINDOW         = 600  # seconds before a silent "working" session is dropped
 IDLE_WINDOW_WAITING = 30   # seconds before a "waiting" session is dropped (subagents resolve quickly)
@@ -105,6 +109,51 @@ def _load_config() -> dict:
 
 
 _config = _load_config()
+
+
+def _load_settings() -> dict:
+    """Daemon-owned runtime settings (settings.json); {} if absent/unreadable."""
+    try:
+        with open(SETTINGS_PATH) as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else {}
+    except FileNotFoundError:
+        return {}
+    except Exception as e:
+        print(f"[settings] could not read settings.json: {e}",
+              file=sys.stderr, flush=True)
+        return {}
+
+
+def _persist_agent_budget(agent_id: str, budget: float) -> None:
+    """Write an app-set budget into settings.json (agent-scoped), preserving
+    other settings. Never touches the user's config.json."""
+    settings = _load_settings()
+    agents = settings.setdefault("agents", {})
+    if not isinstance(agents, dict):
+        agents = settings["agents"] = {}
+    agents.setdefault(agent_id, {})
+    if not isinstance(agents[agent_id], dict):
+        agents[agent_id] = {}
+    agents[agent_id]["monthly_budget_usd"] = budget
+    os.makedirs(CODELIGHT_CONFIG_HOME, exist_ok=True)
+    tmp = SETTINGS_PATH + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(settings, f, indent=2)
+    os.replace(tmp, SETTINGS_PATH)
+
+
+def _apply_persisted_budgets() -> None:
+    """On startup, apply app-set budgets (settings.json) over config defaults."""
+    agents = _load_settings().get("agents")
+    if not isinstance(agents, dict):
+        return
+    for agent_id, section in agents.items():
+        if isinstance(section, dict) and "monthly_budget_usd" in section:
+            try:
+                _agents.set_budget(agent_id, float(section["monthly_budget_usd"]))
+            except (TypeError, ValueError):
+                pass
 
 
 def _new_agent_registry(log=None) -> AgentRegistry:
@@ -559,6 +608,32 @@ def _consume_session_reset(agent_id: str, request_id: str = "") -> dict:
     return payload
 
 
+def _set_budget(agent_id: str, budget, request_id: str = "") -> dict:
+    """Set an agent's usage-meter budget from a client, persist it, and refresh
+    the meter. Mirrors the session-reset request/result contract."""
+    aid = _state.normalize_agent_id(agent_id)
+    try:
+        value = max(0.0, float(budget))
+    except (TypeError, ValueError):
+        value = 0.0
+    ok = _agents.set_budget(aid, value)
+    if ok:
+        _persist_agent_budget(aid, value)
+        fetcher = _agents.usage_fetchers().get(aid)
+        if fetcher is not None:
+            _state.update_usage(usages={aid: fetcher()})
+        _log(f"[budget] {aid} → ${value:.2f}")
+        _push()
+    return {
+        "type": "budget_result",
+        "id": request_id,
+        "agent_id": aid,
+        "agent_display": _state.agent_display_name(aid),
+        "ok": ok,
+        "budget_usd": _agents.get_budget(aid),
+    }
+
+
 def run_dashboard(host: str, ws_port: int, secret: str) -> None:
     """Run the terminal dashboard as a normal WebSocket client."""
     if not _have_websockets:
@@ -605,6 +680,7 @@ def _ws_thread(port: int, secret: str) -> None:
         respond_permission=_resolve_permission,
         respond_question=_resolve_question,
         consume_session_reset=_consume_session_reset,
+        set_budget=_set_budget,
         extend_request=_extend_request,
         announce_gnome=_announce_gnome,
         log=_log,
@@ -841,6 +917,7 @@ def main():
     # and no active session — otherwise hook-only agents like Cursor/Grok only
     # appear while actively working.
     _state.set_enabled_agents(enabled_agents)
+    _apply_persisted_budgets()
 
     lifecycle.install_agent_hooks(
         agent_registry=_new_agent_registry(log=vprint),
