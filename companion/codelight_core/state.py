@@ -252,6 +252,12 @@ class CodelightState:
                 "",
             )
         weekly_title, session_title = self.agent_meter_titles(agent_id)
+        # Blank the title of a window the agent doesn't report so the screen
+        # hides that bar (it draws a meter only when its title is non-empty).
+        if "weekly_pct" not in usage:
+            weekly_title = ""
+        if "session_pct" not in usage:
+            session_title = ""
         return dict(usage), weekly_title, session_title
 
     def _per_agent_usage(self, snapshots: dict[str, dict[str, Any]]) -> dict[str, Any]:
@@ -306,11 +312,17 @@ class CodelightState:
 
     @staticmethod
     def _usage_limits(usage: dict[str, Any]) -> list[dict[str, Any]]:
-        if "weekly_pct" in usage or "session_pct" in usage:
-            return [
-                CodelightState._usage_limit("Weekly", usage, "weekly"),
-                CodelightState._usage_limit("Session", usage, "session"),
-            ]
+        # A meter is shown only for a window the agent actually reports, so a
+        # limit the plan no longer has (e.g. Codex's 5-hour session window after
+        # OpenAI's 2026-07 weekly-only change) disappears instead of showing 0%,
+        # and reappears on its own once the window returns.
+        limits = []
+        if "weekly_pct" in usage:
+            limits.append(CodelightState._usage_limit("Weekly", usage, "weekly"))
+        if "session_pct" in usage:
+            limits.append(CodelightState._usage_limit("Session", usage, "session"))
+        if limits:
+            return limits
         if "monthly_pct" in usage:
             return [CodelightState._usage_limit("Monthly", usage, "monthly")]
         return []

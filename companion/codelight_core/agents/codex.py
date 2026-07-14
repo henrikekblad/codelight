@@ -296,6 +296,71 @@ def latest_rollout_path(code_home: str) -> str:
         return ""
 
 
+# Codex reports two rate-limit windows positionally (primary/secondary), but
+# which slot holds the ~5h session limit vs the ~7d weekly cap shifts with plan
+# and policy — since 2026-07 a weekly-only plan reports the weekly window in
+# `primary` and leaves `secondary` null, which otherwise renders as a
+# session/weekly swap in the clients. Classify each window by its length rather
+# than its slot; fall back to position for windows that omit their length (e.g.
+# the app-server RPC, whose payload carries no window-minutes field).
+WEEKLY_WINDOW_MIN_MINUTES = 1440  # >= 1 day → weekly cap; shorter → session window
+# Codex spells the window length differently across payloads — `window_minutes`
+# in the rollout JSONL, `windowDurationMins` in the app-server RPC. Accept every
+# spelling we've seen so classification never silently falls back to position.
+WINDOW_MINUTES_KEYS = ("window_minutes", "windowDurationMins", "windowMinutes")
+
+
+def _window_minutes(window: dict) -> float:
+    for key in WINDOW_MINUTES_KEYS:
+        try:
+            minutes = float(window.get(key) or 0.0)
+        except (TypeError, ValueError):
+            minutes = 0.0
+        if minutes:
+            return minutes
+    return 0.0
+
+
+def classify_rate_limit_windows(primary, secondary):
+    """Bucket Codex's two rate-limit windows into (session, weekly) by length."""
+    primary = primary if isinstance(primary, dict) else {}
+    secondary = secondary if isinstance(secondary, dict) else {}
+    session: dict = {}
+    weekly: dict = {}
+    for window in (primary, secondary):
+        if not window:
+            continue
+        minutes = _window_minutes(window)
+        if minutes >= WEEKLY_WINDOW_MIN_MINUTES:
+            weekly = weekly or window
+        elif minutes > 0:
+            session = session or window
+        elif not session:  # unknown length → positional fallback (primary=session)
+            session = window
+        elif not weekly:
+            weekly = window
+    return session, weekly
+
+
+def _meter_fields(session, weekly, *, pct, reset_at) -> dict:
+    """Emit meter keys only for windows Codex actually reports, so clients hide
+    (rather than zero) a limit the plan no longer has — e.g. the 5-hour session
+    window after OpenAI's 2026-07 weekly-only change. The keys reappear on their
+    own once the window comes back."""
+    fields: dict = {}
+    if weekly:
+        weekly_reset_at = reset_at(weekly)
+        fields["weekly_pct"] = pct(weekly)
+        fields["weekly_reset"] = format_epoch_countdown(weekly_reset_at)
+        fields["weekly_reset_at"] = weekly_reset_at
+    if session:
+        session_reset_at = reset_at(session)
+        fields["session_pct"] = pct(session)
+        fields["session_reset"] = format_epoch_countdown(session_reset_at)
+        fields["session_reset_at"] = session_reset_at
+    return fields
+
+
 def usage_from_rollout(path: str) -> dict | None:
     """Read the newest Codex 5-hour and weekly rate-limit snapshot."""
     if not path:
@@ -324,8 +389,8 @@ def usage_from_rollout(path: str) -> dict | None:
     if not limits:
         return None
 
-    primary = limits.get("primary") if isinstance(limits.get("primary"), dict) else {}
-    secondary = limits.get("secondary") if isinstance(limits.get("secondary"), dict) else {}
+    session, weekly = classify_rate_limit_windows(
+        limits.get("primary"), limits.get("secondary"))
 
     def pct(window: dict) -> float:
         try:
@@ -339,16 +404,7 @@ def usage_from_rollout(path: str) -> dict | None:
         except (TypeError, ValueError):
             return 0
 
-    session_reset_at = reset_at(primary)
-    weekly_reset_at = reset_at(secondary)
-    return {
-        "session_pct": pct(primary),
-        "weekly_pct": pct(secondary),
-        "session_reset": format_epoch_countdown(session_reset_at),
-        "weekly_reset": format_epoch_countdown(weekly_reset_at),
-        "session_reset_at": session_reset_at,
-        "weekly_reset_at": weekly_reset_at,
-    }
+    return _meter_fields(session, weekly, pct=pct, reset_at=reset_at)
 
 
 def pct_from_window(window: dict) -> float:
@@ -374,21 +430,11 @@ def usage_from_app_server_rate_limits(result: dict) -> dict | None:
     if not isinstance(codex_limits, dict):
         return None
 
-    primary = codex_limits.get("primary")
-    secondary = codex_limits.get("secondary")
-    primary = primary if isinstance(primary, dict) else {}
-    secondary = secondary if isinstance(secondary, dict) else {}
+    session, weekly = classify_rate_limit_windows(
+        codex_limits.get("primary"), codex_limits.get("secondary"))
 
-    session_reset_at = reset_at_from_window(primary)
-    weekly_reset_at = reset_at_from_window(secondary)
-    usage = {
-        "session_pct": pct_from_window(primary),
-        "weekly_pct": pct_from_window(secondary),
-        "session_reset": format_epoch_countdown(session_reset_at),
-        "weekly_reset": format_epoch_countdown(weekly_reset_at),
-        "session_reset_at": session_reset_at,
-        "weekly_reset_at": weekly_reset_at,
-    }
+    usage = _meter_fields(session, weekly,
+                          pct=pct_from_window, reset_at=reset_at_from_window)
 
     reset_credits = result.get("rateLimitResetCredits")
     if isinstance(reset_credits, dict):

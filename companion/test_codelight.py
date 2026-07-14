@@ -195,6 +195,67 @@ class CodexUsageTests(unittest.TestCase):
         self.assertEqual(usage["session_reset_at"], 2_000_000_000)
         self.assertEqual(usage["weekly_reset_at"], 2_000_604_800)
 
+    def test_weekly_only_snapshot_is_not_shown_as_session(self):
+        # Since 2026-07 a weekly-only plan reports the weekly window (10080 min)
+        # in `primary` with `secondary` null; classify by length, not slot, so
+        # it lands in weekly — not mislabelled as the 5-hour session limit.
+        records = [
+            {
+                "type": "event_msg",
+                "payload": {
+                    "type": "token_count",
+                    "rate_limits": {
+                        "limit_id": "codex",
+                        "primary": {
+                            "used_percent": 55.0,
+                            "window_minutes": 10_080,
+                            "resets_at": 2_000_604_800,
+                        },
+                        "secondary": None,
+                    },
+                },
+            },
+        ]
+        fd, path = tempfile.mkstemp(suffix=".jsonl")
+        try:
+            with os.fdopen(fd, "w") as stream:
+                for record in records:
+                    stream.write(json.dumps(record) + "\n")
+            usage = codex_agent.usage_from_rollout(path)
+        finally:
+            os.unlink(path)
+
+        self.assertIsNotNone(usage)
+        self.assertEqual(usage["weekly_pct"], 0.55)
+        self.assertEqual(usage["weekly_reset_at"], 2_000_604_800)
+        # No session window → session keys omitted entirely, so clients hide
+        # the bar rather than showing a misleading "Session — 0%".
+        self.assertNotIn("session_pct", usage)
+        self.assertNotIn("session_reset_at", usage)
+
+    def test_app_server_weekly_only_uses_window_duration_mins(self):
+        # The real app-server RPC classifies by `windowDurationMins`; a
+        # weekly-only plan (10080 min in primary, secondary null) must land in
+        # weekly, not be mislabelled as the 5-hour session limit.
+        def rpc(requests):
+            return [{
+                "id": 2,
+                "result": {"rateLimitsByLimitId": {"codex": {
+                    "primary": {
+                        "usedPercent": 55,
+                        "windowDurationMins": 10_080,
+                        "resetsAt": 2_000_604_800,
+                    },
+                    "secondary": None,
+                }}},
+            }]
+
+        usage = codex_agent.get_app_server_usage("/tmp/codex", rpc=rpc)
+
+        self.assertIsNotNone(usage)
+        self.assertEqual(usage["weekly_pct"], 0.55)
+        self.assertNotIn("session_pct", usage)
+
     def test_app_server_usage_includes_rate_limit_reset_credits(self):
         def rpc(requests):
             self.assertEqual(requests[0]["method"], "account/rateLimits/read")
@@ -767,6 +828,25 @@ class StateSnapshotTests(unittest.TestCase):
             idle_window=600,
             idle_window_waiting=30,
         )
+
+    def test_meter_hidden_when_agent_omits_a_window(self):
+        state = self.make_state()
+        # Codex reports only a weekly window (post-2026-07 weekly-only plan).
+        state.update_usage(usages={"codex": {
+            "weekly_pct": 0.55,
+            "weekly_reset": "5d 23h",
+            "weekly_reset_at": 1_784_565_260,
+        }})
+
+        # Android/VSCode: the limits array carries Weekly only, no Session.
+        limits = state.status_snapshot()["per_agent_usage"]["codex"]["limits"]
+        self.assertEqual([lim["label"] for lim in limits], ["Weekly"])
+
+        # Screen: the session bar is hidden via an empty title, weekly kept.
+        _, weekly_title, session_title = state._meter_usage(
+            "codex", {"weekly_pct": 0.55})
+        self.assertTrue(weekly_title)
+        self.assertEqual(session_title, "")
 
     def test_active_transcript_carries_its_agent(self):
         state = self.make_state()
