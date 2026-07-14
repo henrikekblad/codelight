@@ -593,7 +593,12 @@ def run_question_hook(wait_secs: int, mode, agent_id: str | None = None) -> None
 # Credentials are read fresh each poll so token rotations are picked up automatically.
 
 def _usage_fetchers():
-    return _new_agent_registry(log=vprint).usage_fetchers()
+    # Use the shared registry (not a fresh one) so runtime-mutable state —
+    # notably app-set/persisted budgets applied via _apply_persisted_budgets /
+    # _set_budget — is reflected by the usage poller. A fresh registry would
+    # rebuild agents from config.json (budget 0) and silently clear the meter
+    # on the next poll.
+    return _agents.usage_fetchers()
 
 
 def _push() -> None:
