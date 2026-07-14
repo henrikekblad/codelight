@@ -13,12 +13,16 @@ import androidx.compose.ui.graphics.vector.PathParser
 import androidx.compose.ui.unit.Dp
 import org.json.JSONObject
 
+/** One logo sub-path plus its fill-opacity (so a mark can be two-tone against
+ * the tint colour, e.g. a solid frame + a 50%-opacity field). */
+internal class PathFill(val path: Path, val alpha: Float)
+
 /** Branding for one agent, parsed from the daemon's config `agents` map. */
 internal class AgentBranding(
     val display: String,
     val color: Color?,
     val viewBox: FloatArray,   // x, y, w, h
-    val paths: List<Path>,
+    val paths: List<PathFill>,
     val conversation: Boolean, // agent can produce a conversation feed
     val budgetSettable: Boolean, // usage-meter budget can be set from the app
     val promptCapable: Boolean,  // new instructions can be sent to the agent
@@ -31,7 +35,9 @@ internal class AgentBranding(
  */
 internal object AgentBrandings {
     private val VIEWBOX = Regex("""viewBox="([^"]+)"""")
-    private val PATH_D = Regex("""<path[^>]*?\sd="([^"]+)"""")
+    private val PATH_TAG = Regex("""<path\b[^>]*>""")
+    private val D_ATTR = Regex("""\sd="([^"]+)"""")
+    private val FILL_OPACITY = Regex("""fill-opacity="([^"]+)"""")
     private val HEX_COLOR = Regex("""#[0-9a-fA-F]{6}""")
 
     @Volatile private var cachedJson: String? = null
@@ -57,9 +63,14 @@ internal object AgentBrandings {
                     ?.mapNotNull { it.toFloatOrNull() }
                     ?.takeIf { it.size == 4 }?.toFloatArray()
                 val paths = if (viewBox == null) emptyList() else
-                    PATH_D.findAll(svg).mapNotNull { match ->
+                    PATH_TAG.findAll(svg).mapNotNull { match ->
+                        val tag = match.value
+                        val d = D_ATTR.find(tag)?.groupValues?.get(1)
+                            ?: return@mapNotNull null
+                        val alpha = FILL_OPACITY.find(tag)?.groupValues?.get(1)
+                            ?.toFloatOrNull()?.coerceIn(0f, 1f) ?: 1f
                         try {
-                            PathParser().parsePathString(match.groupValues[1]).toPath()
+                            PathFill(PathParser().parsePathString(d).toPath(), alpha)
                         } catch (_: Exception) {
                             null
                         }
@@ -98,7 +109,7 @@ internal fun AgentLogo(branding: AgentBranding?, tint: Color, size: Dp) {
             translate(dx, dy)
             scale(scale, scale, pivot = Offset.Zero)
         }) {
-            paths.forEach { drawPath(it, color = tint) }
+            paths.forEach { drawPath(it.path, color = tint.copy(alpha = tint.alpha * it.alpha)) }
         }
     }
 }

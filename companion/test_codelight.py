@@ -1543,6 +1543,22 @@ class OpenCodeIntegrationTests(unittest.TestCase):
         self.assertTrue(
             registry.client_metadata()["opencode"]["budget_settable"])
 
+    def test_server_url_resolution(self):
+        # Explicit config override wins.
+        a = opencode_agent.OpenCodeAgent(db_path="", monthly_budget_usd=0,
+                                         server_url="http://127.0.0.1:1234")
+        self.assertEqual(a._base(), "http://127.0.0.1:1234")
+        # Discovery never raises; returns a string.
+        self.assertIsInstance(opencode_agent.discover_server_url(), str)
+        # No override: auto-detected port wins, else the conventional default.
+        b = opencode_agent.OpenCodeAgent(db_path="", monthly_budget_usd=0)
+        with mock.patch.object(opencode_agent, "discover_server_url",
+                               return_value="http://127.0.0.1:5555"):
+            self.assertEqual(b._base(), "http://127.0.0.1:5555")
+        with mock.patch.object(opencode_agent, "discover_server_url",
+                               return_value=""):
+            self.assertEqual(b._base(), opencode_agent.DEFAULT_SERVER_URL)
+
     def test_messages_to_lines_and_conversation_capable(self):
         messages = [
             {"type": "user", "text": "run echo hi"},

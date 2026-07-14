@@ -28,6 +28,61 @@ from codelight_core.timefmt import format_epoch_countdown
 DEFAULT_SERVER_URL = "http://127.0.0.1:4096"
 ACTIVE_POLL_INTERVAL = 2.0
 
+
+def discover_server_url() -> str:
+    """Auto-detect a running opencode server's loopback URL from /proc.
+
+    opencode picks a random port when started without ``--port`` (the TUI and
+    VSCode both do), and writes it nowhere, so find the ``opencode`` process and
+    read the loopback TCP port it listens on. Returns "" if none is found.
+    Linux-only (codelight already targets Linux/systemd)."""
+    try:
+        pids = []
+        for entry in os.listdir("/proc"):
+            if not entry.isdigit():
+                continue
+            try:
+                with open(f"/proc/{entry}/comm") as f:
+                    if f.read().strip() == "opencode":
+                        pids.append(entry)
+            except OSError:
+                continue
+        if not pids:
+            return ""
+        inodes = set()
+        for pid in pids:
+            fddir = f"/proc/{pid}/fd"
+            try:
+                fds = os.listdir(fddir)
+            except OSError:
+                continue
+            for fd in fds:
+                try:
+                    link = os.readlink(f"{fddir}/{fd}")
+                except OSError:
+                    continue
+                if link.startswith("socket:["):
+                    inodes.add(link[len("socket:["):-1])
+        if not inodes:
+            return ""
+        ports = []
+        for tcp in ("/proc/net/tcp", "/proc/net/tcp6"):
+            try:
+                rows = open(tcp).read().splitlines()[1:]
+            except OSError:
+                continue
+            for row in rows:
+                f = row.split()
+                if len(f) < 10 or f[3] != "0A":   # 0A = TCP_LISTEN
+                    continue
+                if f[9] not in inodes:
+                    continue
+                port_hex = f[1].split(":")[1]
+                ports.append(int(port_hex, 16))
+        return f"http://127.0.0.1:{min(ports)}" if ports else ""
+    except Exception:
+        return ""
+
 # working / idle come from the authoritative active-session set (OpenCode
 # v1.17 emits no session.idle/session.status event — verified 2026-07-13), so
 # the SSE bus is used only for the waiting edge: a permission/question prompt
@@ -109,11 +164,12 @@ def _to_opencode_answers(oc_questions: list, answers: dict) -> list:
     return result
 
 
-# OpenCode's official mark rendered single-color (currentColor SVG +
-# matching 48x48 1-bit bitmap for the screen): outer frame + filled lower
-# block, derived from the 240x300 two-tone logo.
-_LOGO_SVG = '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 240 300" fill="currentColor"><path d="M0 0H240V60H0ZM0 0H60V300H0ZM180 0H240V300H180ZM0 240H240V300H0ZM60 120H180V240H60Z"/></svg>'
-_LOGO_BITMAP = "B//////gB//////gB//////gB//////gB//////gB//////gB//////gB//////gB//////gB//////gB/wAAD/gB/wAAD/gB/wAAD/gB/wAAD/gB/wAAD/gB/wAAD/gB/wAAD/gB/wAAD/gB/wAAD/gB//////gB//////gB//////gB//////gB//////gB//////gB//////gB//////gB//////gB//////gB//////gB//////gB//////gB//////gB//////gB//////gB//////gB//////gB//////gB//////gB//////gB//////gB//////gB//////gB//////gB//////gB//////gB//////gB//////g"
+# OpenCode's official mark, two-tone via currentColor: a solid outer frame and
+# a 50%-opacity lower block (so it tints with the status/brand colour and the
+# block reads as a lighter shade). The screen's 1-bit bitmap approximates the
+# block with a 50% checkerboard dither. Derived from the 240x300 logo.
+_LOGO_SVG = '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 240 300" fill="currentColor"><path d="M0 0H240V60H0ZM0 0H60V300H0ZM180 0H240V300H180ZM0 240H240V300H0Z"/><path fill-opacity="0.5" d="M60 120H180V240H60Z"/></svg>'
+_LOGO_BITMAP = "B//////gB//////gB//////gB//////gB//////gB//////gB//////gB//////gB//////gB//////gB/wAAD/gB/wAAD/gB/wAAD/gB/wAAD/gB/wAAD/gB/wAAD/gB/wAAD/gB/wAAD/gB/wAAD/gB/1VVX/gB/6qqr/gB/1VVX/gB/6qqr/gB/1VVX/gB/6qqr/gB/1VVX/gB/6qqr/gB/1VVX/gB/6qqr/gB/1VVX/gB/6qqr/gB/1VVX/gB/6qqr/gB/1VVX/gB/6qqr/gB/1VVX/gB/6qqr/gB/1VVX/gB//////gB//////gB//////gB//////gB//////gB//////gB//////gB//////gB//////gB//////g"
 SPEC = base.AgentSpec(
     agent_id="opencode",
     display="OpenCode",
@@ -193,15 +249,21 @@ def get_usage(db_path: str, monthly_budget_usd: float,
 
 class OpenCodeAgent:
     def __init__(self, db_path: str, monthly_budget_usd: float,
-                 server_url: str = DEFAULT_SERVER_URL,
+                 server_url: str = "",
                  username: str = "", password: str = "",
                  log: Callable[[str], None] | None = None) -> None:
         self.db_path = db_path
         self.monthly_budget_usd = monthly_budget_usd
+        # Explicit override from config; "" → auto-detect the running server.
         self.server_url = server_url.rstrip("/")
         self.username = username
         self.password = password
         self.log = log
+
+    def _base(self) -> str:
+        """Resolved server URL: the configured override, else the auto-detected
+        running server, else the conventional default."""
+        return self.server_url or discover_server_url() or DEFAULT_SERVER_URL
 
     def get_usage(self) -> dict | None:
         return get_usage(self.db_path, self.monthly_budget_usd, self.log)
@@ -222,7 +284,7 @@ class OpenCodeAgent:
     def _get_data(self, path: str, timeout: float = 5.0):
         """GET a JSON endpoint and return its `data` field (the server wraps
         responses as {"data": ...})."""
-        req = urllib.request.Request(self.server_url + path, headers=self._headers())
+        req = urllib.request.Request(self._base() + path, headers=self._headers())
         with urllib.request.urlopen(req, timeout=timeout) as resp:
             body = json.loads(resp.read() or "null")
         return body.get("data") if isinstance(body, dict) else None
@@ -259,7 +321,7 @@ class OpenCodeAgent:
             return False
         try:
             req = urllib.request.Request(
-                f"{self.server_url}/api/session/{sid}/prompt", method="POST",
+                f"{self._base()}/api/session/{sid}/prompt", method="POST",
                 data=json.dumps({"prompt": {"text": text}}).encode(),
                 headers={**self._headers(), "Content-Type": "application/json"})
             with urllib.request.urlopen(req, timeout=15) as resp:
@@ -284,7 +346,7 @@ class OpenCodeAgent:
     def _post(self, ctx: base.ListenerContext, path: str, body: dict) -> None:
         try:
             req = urllib.request.Request(
-                self.server_url + path, method="POST",
+                self._base() + path, method="POST",
                 data=json.dumps(body).encode(),
                 headers={**self._headers(), "Content-Type": "application/json"})
             with urllib.request.urlopen(req, timeout=10):
@@ -403,15 +465,15 @@ class OpenCodeAgent:
 
         threading.Thread(target=poll_active, daemon=True).start()
 
-        url = f"{self.server_url}/event"
         backoff = 1.0
         while not ctx.shutdown.is_set():
             try:
+                base = self._base()   # re-resolve each connect (port may change)
                 req = urllib.request.Request(
-                    url, headers=self._headers("text/event-stream"))
+                    base + "/event", headers=self._headers("text/event-stream"))
                 with urllib.request.urlopen(req, timeout=120) as stream:
                     backoff = 1.0
-                    ctx.log(f"[opencode] listening on {self.server_url}")
+                    ctx.log(f"[opencode] listening on {base}")
                     for raw in stream:
                         if ctx.shutdown.is_set():
                             return
@@ -446,7 +508,7 @@ def build_integration(config: dict, *,
         budget = 0.0
     agent = OpenCodeAgent(
         db_path, budget,
-        server_url=str(config.get("server_url") or DEFAULT_SERVER_URL),
+        server_url=str(config.get("server_url") or ""),  # "" → auto-detect
         username=str(config.get("username") or ""),
         password=str(config.get("password") or ""),
         log=log,
