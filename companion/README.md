@@ -122,7 +122,7 @@ kinds of prompt are handled:
 Works across integrations that expose compatible permission/question hook
 modes. Whoever answers first wins; a local fallback remains available when the
 native agent prompt is preferred. The exact hook names and fallback semantics
-are agent-specific; see [AGENTS.md](AGENTS.md#remote-control-quirks).
+are agent-specific; see the per-agent sections in [AGENTS.md](AGENTS.md).
 
 ```bash
 python3 companion/codelight.py --install --name my-laptop \
@@ -235,11 +235,12 @@ the shared policy file, and the systemd service.
 flowchart LR
     A1["Supported agent"] -->|hooks| D
     A2["Supported agent"] -->|hooks| D
-    A3["Supported agent"] -->|hooks| D
+    A3["Hookless agent<br/>(e.g. OpenCode)"] -->|HTTP server + SSE| D
 
     subgraph D["codelight.py daemon"]
         REG["Agent registry<br/>metadata + hook modes + branding"]
         SOCK["Unix socket thread<br/>receives hook events"]
+        LISTEN["Background listener<br/>follows server event streams"]
         USAGE["Multi-agent usage poller"]
         WS["WebSocket server :8765"]
         DBUS["D-Bus service<br/>se.sensnology.codelight"]
@@ -255,10 +256,16 @@ flowchart LR
     USAGE -.-> WS
     SOCK -.-> WS
     SOCK -.-> DBUS
+    LISTEN -.-> WS
+    LISTEN -.-> DBUS
 ```
 
-Status updates reach clients the moment an enabled agent hook fires — there is no
-polling delay on the client side.
+Most agents integrate via installed hooks (blocking calls the daemon answers);
+hookless agents that expose a live event stream (e.g. OpenCode's local HTTP
+server) are instead followed by a background listener, which maps their events
+onto the same status and remote-control paths. Status updates reach clients the
+moment a hook fires or an event arrives — there is no polling delay on the
+client side.
 
 ### Status detection and conversation following
 

@@ -52,6 +52,9 @@ client so you can respond from wherever you are:
   **GNOME panel**.
 - **Questions** (multiple-choice + free text) - from the **Android app**,
   the **GNOME panel**, or **VSCode** (a themed WebView in the editor).
+- **Send instructions** (remote steering) — for agents that expose a control
+  API (currently OpenCode): type a new instruction to a running agent from the
+  **Android app** — the first agent codelight can *drive*, not just observe.
 
 Whoever answers first wins. If no capable client is connected, codelight falls
 through to the agent's built-in prompt. See
@@ -77,10 +80,11 @@ The status UIs all show the same core information:
 flowchart LR
     A1["Supported agent"] -->|hooks| D
     A2["Supported agent"] -->|hooks| D
-    A3["Supported agent"] -->|hooks| D
+    A3["Hookless agent<br/>(e.g. OpenCode)"] -->|HTTP server + SSE| D
 
     subgraph D["codelight.py daemon"]
         SOCK["Unix socket thread<br/>receives hook events"]
+        LISTEN["Background listener<br/>follows server event streams"]
         REG["Agent registry<br/>metadata + hook modes + branding"]
         USAGE["Multi-agent usage poller"]
         WS["WebSocket server :8765"]
@@ -96,6 +100,8 @@ flowchart LR
     USAGE -.-> WS
     SOCK -.-> WS
     SOCK -.-> DBUS
+    LISTEN -.-> WS
+    LISTEN -.-> DBUS
 ```
 
 The ESP8266 screen and Android app use WebSocket (discovered via mDNS). The
