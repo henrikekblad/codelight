@@ -2,9 +2,9 @@
 
 Live status, usage, conversation following, and **remote-control prompts** for
 supported coding agents. Watch grouped working/waiting/idle state on a desk
-screen, phone, GNOME or KDE Plasma panel, or in VSCode — and, when you're away from the
-keyboard, **approve permission prompts and answer agent questions** from any of
-them. Pick and choose whatever suits your needs:
+screen, phone, GNOME and KDE Plasma panels, or in VSCode — and, when you're
+away from the keyboard, **approve permission prompts and answer agent
+questions** from any of them. Pick and choose whatever suits your needs:
 
 ## Currently supported agents
 
