@@ -2,11 +2,12 @@
 
 The Python daemon `codelight.py` runs on your computer and pushes coding-agent
 status to all connected clients — the GeekMagic Ultra screen, Android app,
-GNOME extension, KDE Plasma applet, and VSCode extension. It detects supported agent integrations,
-installs their hooks, and normalizes their status/usage/prompt events into one
-client protocol. With `--remote-control` it also brokers supported interactive
-prompts to those clients so you can approve permissions and answer questions
-remotely (see [Remote control](#remote-control)).
+GNOME extension, KDE Plasma applet, and VSCode extension. It detects
+supported agent integrations, installs their hooks, and normalizes their
+status/usage/prompt events into one client protocol. With `--remote-control`
+it also brokers supported interactive prompts to the clients that support
+them, so you can approve permissions and answer questions remotely (see
+[Remote control](#remote-control)).
 
 When run in a terminal it shows a live dashboard. When run as a systemd service
 it is silent (key events are logged to the journal via stdout).
