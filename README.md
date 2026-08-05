@@ -57,9 +57,6 @@ client so you can respond from wherever you are:
   API (currently OpenCode): type a new instruction to a running agent from the
   **Android app** — the first agent codelight can *drive*, not just observe.
 
-The KDE Plasma applet is status & usage only and does not consume prompt
-signals — see [kde-plasma/README.md](kde-plasma/README.md#scope-this-version).
-
 Whoever answers first wins. If no capable client is connected, codelight falls
 through to the agent's built-in prompt. See
 [companion/README.md](companion/README.md#remote-control); agent-specific
