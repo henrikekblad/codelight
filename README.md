@@ -2,7 +2,7 @@
 
 Live status, usage, conversation following, and **remote-control prompts** for
 supported coding agents. Watch grouped working/waiting/idle state on a desk
-screen, phone, GNOME panel, or in VSCode — and, when you're away from the
+screen, phone, GNOME or KDE Plasma panel, or in VSCode — and, when you're away from the
 keyboard, **approve permission prompts and answer agent questions** from any of
 them. Pick and choose whatever suits your needs:
 
@@ -40,6 +40,7 @@ them. Pick and choose whatever suits your needs:
 | [**screen/**](screen/README.md) | ESP8266 firmware for the GeekMagic Ultra — renders usage bars and status | <img src="assets/demo.jpg" width="600" alt="GeekMagic Ultra showing the codelight IDLE screen"> |
 | [**android/**](android/README.md) | Responsive Android widget + Status and Conversation views, permission review, and question answering | <img src="assets/android-widget-compact.jpg" width="280" alt="Compact codelight Android widget"> |
 | [**gnome-extension/**](gnome-extension/README.md) | GNOME Shell panel extension: status + approve/answer prompts from a popup | <img src="assets/gnome-extension-grouped.png" width="600" alt="Grouped codelight GNOME Shell popup">|
+| [**kde-plasma/**](kde-plasma/README.md) | KDE Plasma 6 panel/tray icon + resizable desktop widget: status & usage | |
 | [**vscode-extension/**](vscode-extension/README.md) | VSCode status bar + answers supported agent questions in the editor | |
 
 ## Remote control
@@ -55,6 +56,9 @@ client so you can respond from wherever you are:
 - **Send instructions** (remote steering) — for agents that expose a control
   API (currently OpenCode): type a new instruction to a running agent from the
   **Android app** — the first agent codelight can *drive*, not just observe.
+
+The KDE Plasma applet is status & usage only and does not consume prompt
+signals — see [kde-plasma/README.md](kde-plasma/README.md#scope-this-version).
 
 Whoever answers first wins. If no capable client is connected, codelight falls
 through to the agent's built-in prompt. See
@@ -95,6 +99,7 @@ flowchart LR
     WS -->|status + questions + remote control<br/>+ conversation| ANDROID["Android app<br/>(mDNS)"]
     WS -->|status + questions + remote control| VSCODE["VSCode extension"]
     DBUS -->|status + questions + remote control| GNOME["GNOME extension"]
+    DBUS -->|status + usage| KDE["KDE Plasma widget"]
 
     REG -.-> USAGE
     USAGE -.-> WS
@@ -105,10 +110,10 @@ flowchart LR
 ```
 
 The ESP8266 screen and Android app use WebSocket (discovered via mDNS). The
-GNOME extension uses D-Bus on the session bus — no network socket or
-configuration needed. With `--remote-control`, permission and question prompts
-are pushed to the clients that subscribe to them (the screen and older apps
-never see them). See
+GNOME extension and the KDE Plasma widget use D-Bus on the session bus — no
+network socket or configuration needed. With `--remote-control`, permission
+and question prompts are pushed to the clients that subscribe to them (the
+screen, the KDE Plasma widget, and older apps never see them). See
 [companion/README.md](companion/README.md#remote-control).
 
 ## Quick start
@@ -130,7 +135,9 @@ never see them). See
 
 4. *(Optional)* Install the GNOME extension: [gnome-extension/README.md](gnome-extension/README.md).
 
-5. *(Optional)* Install the VSCode extension: [vscode-extension/README.md](vscode-extension/README.md).
+5. *(Optional)* Install the KDE Plasma applet: [kde-plasma/README.md](kde-plasma/README.md).
+
+6. *(Optional)* Install the VSCode extension: [vscode-extension/README.md](vscode-extension/README.md).
 
 ## More screenshots
 

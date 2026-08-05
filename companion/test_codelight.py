@@ -650,6 +650,130 @@ class ClientConfigTests(unittest.TestCase):
         self.assertLess(len(json.dumps(config)), 4096)
 
 
+class KdeClientModelTests(unittest.TestCase):
+    """The KDE Plasma applet consumes the daemon's GetConfig('kde') and
+    status_snapshot payloads directly. Pin the contract the QML relies on:
+    SVG branding (not bitmaps), the limits[] array with 0/1/2 windows, the
+    union of per-agent status and usage, and the shape of each limit entry.
+
+    Note the daemon deliberately does *not* clamp `pct` — it passes the
+    agent-reported value straight through — so every client clamps for itself
+    (UsageBar.qml `clampedPct`). The test below pins that pass-through rather
+    than asserting a clamp the daemon never performs."""
+
+    def make_state(self):
+        return CodelightState(
+            default_agent_id="claude",
+            agent_registry=codelight.AGENT_REGISTRY,
+            idle_window=600,
+            idle_window_waiting=30,
+        )
+
+    def test_kde_config_carries_svg_branding_for_every_agent(self):
+        config = codelight._client_config("kde")
+
+        self.assertEqual(config["default_agent_id"], codelight.DEFAULT_AGENT_ID)
+        self.assertEqual(set(config["agents"]), set(codelight.AGENT_REGISTRY))
+        for agent_id, meta in config["agents"].items():
+            self.assertTrue(meta["display"], agent_id)
+            self.assertRegex(meta["color"], r"^#[0-9A-Fa-f]{6}$", agent_id)
+            # KDE renders SVG logos; the screen gets pre-rasterized bitmaps.
+            self.assertTrue(meta["logo_svg"].startswith("<svg"), agent_id)
+            self.assertIn("currentColor", meta["logo_svg"], agent_id)
+            self.assertNotIn("logo_bitmap", meta, agent_id)
+
+    def test_limits_array_supports_zero_one_and_two_windows(self):
+        state = self.make_state()
+        # Two windows (weekly + session).
+        state.update_usage(usages={"claude": {
+            "weekly_pct": 0.2, "weekly_reset": "2d",
+            "session_pct": 0.1, "session_reset": "1h",
+        }})
+        # One window (weekly only, after a plan drops the session window).
+        state.update_usage(usages={"codex": {
+            "weekly_pct": 0.55, "weekly_reset": "5d 23h",
+        }})
+        # One window (monthly only).
+        state.update_usage(usages={"copilot": {
+            "monthly_pct": 0.5, "monthly_reset": "20d",
+        }})
+        # Zero windows: a usage cache with no readable pct.
+        state.update_usage(usages={"grok": {"weekly_reset": "--"}})
+
+        limits_by = state.status_snapshot()["per_agent_usage"]
+        self.assertEqual(
+            [lim["label"] for lim in limits_by["claude"]["limits"]],
+            ["Weekly", "Session"])
+        self.assertEqual(
+            [lim["label"] for lim in limits_by["codex"]["limits"]],
+            ["Weekly"])
+        self.assertEqual(
+            [lim["label"] for lim in limits_by["copilot"]["limits"]],
+            ["Monthly"])
+        # Zero-windows case: a usage cache with no readable pct. The daemon omits
+        # the `limits` key entirely when there are no windows, so the applet
+        # must treat a missing key as an empty list.
+        self.assertNotIn("limits", limits_by["grok"])
+        self.assertEqual(limits_by["grok"].get("limits", []), [])
+
+    def test_visible_agents_are_the_union_of_status_and_usage(self):
+        state = self.make_state()
+        state.set_enabled_agents({"claude", "grok"})
+        state.update_usage(usages={
+            "claude": {"weekly_pct": 0.2, "session_pct": 0.1},
+            "codex": {"weekly_pct": 0.55},
+            "copilot": {"monthly_pct": 0.5},
+        })
+
+        snapshot = state.status_snapshot()
+        per_agent_status = snapshot["per_agent_status"]
+        per_agent_usage = snapshot["per_agent_usage"]
+        # Grok: enabled (status idle) but no usage cache → status only.
+        self.assertEqual(per_agent_status.get("grok"), "idle")
+        self.assertNotIn("grok", per_agent_usage)
+        # Codex/Copilot: usage but no active session and not enabled → usage only.
+        for agent_id in ("codex", "copilot"):
+            self.assertIn(agent_id, per_agent_usage)
+            self.assertNotIn(agent_id, per_agent_status)
+        # Claude: default + enabled + usage → both.
+        self.assertIn("claude", per_agent_status)
+        self.assertIn("claude", per_agent_usage)
+        # The union covers every visible agent the applet must render.
+        union = set(per_agent_status) | set(per_agent_usage)
+        self.assertGreaterEqual(union, {"claude", "grok", "codex", "copilot"})
+
+    def test_every_limit_entry_has_the_full_shape(self):
+        state = self.make_state()
+        state.update_usage(usages={
+            "claude": {"weekly_pct": 0.0, "session_pct": 1.0,
+                       "weekly_reset": "2d", "session_reset": "1h"},
+            "codex": {"weekly_pct": 0.55, "weekly_reset": "5d"},
+            "copilot": {"monthly_pct": 0.5, "monthly_reset": "20d"},
+        })
+        for usage in state.status_snapshot()["per_agent_usage"].values():
+            for limit in usage.get("limits", []):
+                self.assertGreaterEqual(limit["pct"], 0.0)
+                self.assertLessEqual(limit["pct"], 1.0)
+                self.assertIn("label", limit)
+                self.assertIn("reset", limit)
+                self.assertIn("reset_at", limit)
+
+    def test_out_of_range_pct_reaches_the_client_unclamped(self):
+        """Clamping is the client's job. If this ever starts failing because
+        the daemon began clamping, the applet's own clamp becomes redundant —
+        but until then, removing it would render a >100% bar."""
+        state = self.make_state()
+        state.update_usage(usages={"claude": {
+            "weekly_pct": 1.4, "weekly_reset": "2d",
+            "session_pct": -0.2, "session_reset": "1h",
+        }})
+
+        limits = state.status_snapshot()["per_agent_usage"]["claude"]["limits"]
+        by_label = {lim["label"]: lim["pct"] for lim in limits}
+        self.assertAlmostEqual(by_label["Weekly"], 1.4)
+        self.assertAlmostEqual(by_label["Session"], -0.2)
+
+
 class FakeAgentIntegrationTests(unittest.TestCase):
     """Prove the registry path is additive: a new agent registers one
     AgentIntegration and flows through every client surface unchanged."""

@@ -1,0 +1,12 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 48 48" width="48" height="48">
+  <title>codelight</title>
+  <!-- Dark rounded tile (Breeze neutral) -->
+  <rect x="4" y="4" width="40" height="40" rx="10" ry="10" fill="#232629"/>
+  <rect x="4.5" y="4.5" width="39" height="39" rx="9.5" ry="9.5" fill="none" stroke="#31363b" stroke-width="1"/>
+  <!-- &lt;/&gt; code chevrons -->
+  <path d="M19 17 L13 24 L19 31" fill="none" stroke="#eff0ec" stroke-width="3.2" stroke-linecap="round" stroke-linejoin="round"/>
+  <path d="M29 17 L35 24 L29 31" fill="none" stroke="#eff0ec" stroke-width="3.2" stroke-linecap="round" stroke-linejoin="round"/>
+  <path d="M27 15 L21 33" fill="none" stroke="#eff0ec" stroke-width="3.2" stroke-linecap="round"/>
+  <!-- Status light (codelight idle green) -->
+  <circle cx="38" cy="10" r="4.2" fill="#00C800"/>
+</svg>

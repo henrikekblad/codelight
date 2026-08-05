@@ -244,7 +244,7 @@ def _client_config(client: str = "") -> dict:
     """One-time per-connection client config: agent branding and defaults.
 
     ``client`` is the requesting client's self-reported type (vscode/android/
-    gnome/screen/…); the screen gets bitmap logos instead of SVGs.
+    gnome/kde/screen/…); the screen gets bitmap logos instead of SVGs.
     """
     return {
         "default_agent_id": DEFAULT_AGENT_ID,
