@@ -1,0 +1,28 @@
+{
+    "KPackageStructure": "Plasma/Applet",
+    "KPlugin": {
+        "Authors": [
+            {
+                "Name": "Henrik Ekblad",
+                "Email": "henrik@sensnology.se"
+            },
+            {
+                "Name": "John Venice",
+                "Email": "john@johnvenice.dev"
+            }
+        ],
+        "Category": "System Information",
+        "Description": "Show codelight coding-agent status and usage",
+        "Icon": "codelight",
+        "Id": "se.sensnology.codelight",
+        "License": "MIT",
+        "Name": "codelight",
+        "Version": "1.6.1",
+        "Website": "https://github.com/henrikekblad/codelight"
+    },
+    "X-Plasma-API": "declarativeappletscript",
+    "X-Plasma-API-Minimum-Version": "6.2",
+    "X-Plasma-MainScript": "ui/main.qml",
+    "X-Plasma-NotificationArea": "true",
+    "X-Plasma-NotificationAreaCategory": "SystemServices"
+}

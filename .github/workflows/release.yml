@@ -154,12 +154,12 @@ jobs:
             ### Companion script
 
             ```bash
-            pip install websockets zeroconf dbus-fast   # dbus-fast optional: GNOME extension
+            pip install websockets zeroconf dbus-fast   # dbus-fast optional: GNOME extension / KDE applet
             python3 companion/codelight.py --name my-laptop
             ```
 
             The screen and Android widget discover the companion automatically via mDNS.
-            The GNOME extension connects via D-Bus — no configuration needed.
+            The GNOME extension and the KDE Plasma applet connect via D-Bus — no configuration needed.
           files: |
             screen/.pio/build/geekmagic_ultra/codelight-${{ github.ref_name }}.bin
             screen/.pio/build/geekmagic_ultra/codelight-${{ github.ref_name }}.bin.gz

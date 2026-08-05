@@ -2,11 +2,12 @@
 
 The Python daemon `codelight.py` runs on your computer and pushes coding-agent
 status to all connected clients — the GeekMagic Ultra screen, Android app,
-GNOME extension, and VSCode extension. It detects supported agent integrations,
-installs their hooks, and normalizes their status/usage/prompt events into one
-client protocol. With `--remote-control` it also brokers supported interactive
-prompts to those clients so you can approve permissions and answer questions
-remotely (see [Remote control](#remote-control)).
+GNOME extension, KDE Plasma applet, and VSCode extension. It detects
+supported agent integrations, installs their hooks, and normalizes their
+status/usage/prompt events into one client protocol. With `--remote-control`
+it also brokers supported interactive prompts to the clients that support
+them, so you can approve permissions and answer questions remotely (see
+[Remote control](#remote-control)).
 
 When run in a terminal it shows a live dashboard. When run as a systemd service
 it is silent (key events are logged to the journal via stdout).
@@ -15,16 +16,17 @@ it is silent (key events are logged to the journal via stdout).
 
 **Arch Linux**
 ```bash
-sudo pacman -S python-websockets python-zeroconf python-dbus-fast  # python-dbus-fast optional: GNOME extension
+sudo pacman -S python-websockets python-zeroconf python-dbus-fast  # python-dbus-fast optional: GNOME extension / KDE applet
 ```
 
 **Debian / Ubuntu**
 ```bash
-pip install websockets zeroconf dbus-fast  # dbus-fast optional: GNOME extension
+pip install websockets zeroconf dbus-fast  # dbus-fast optional: GNOME extension / KDE applet
 ```
 
 `websockets` and `zeroconf` are required. `dbus-fast` is optional — install it
-to enable the D-Bus service that the GNOME extension subscribes to.
+to enable the D-Bus service that the GNOME extension and the KDE Plasma
+applet subscribe to.
 
 ## Run
 
@@ -42,7 +44,8 @@ python3 companion/codelight.py --name my-laptop --secret mypassword
 ```
 
 Set the same secret in the screen's config page and in the Android app.
-The GNOME extension uses D-Bus (session bus) and does not need a secret.
+The GNOME extension and the KDE Plasma applet use D-Bus (session bus) and do
+not need a secret.
 
 On startup the script detects supported agents from installed CLIs and VSCode
 extensions, then manages hooks for every detected integration. The public daemon
@@ -212,8 +215,8 @@ sudo firewall-cmd --add-port=5353/udp --permanent
 sudo firewall-cmd --reload
 ```
 
-The GNOME extension communicates via D-Bus (session bus) — no firewall rules
-needed for that.
+The GNOME extension and the KDE Plasma applet communicate via D-Bus (session
+bus) — no firewall rules needed for those.
 
 ## Uninstalling
 
@@ -250,6 +253,7 @@ flowchart LR
     WS -->|status + questions + remote control<br/>+ conversation| ANDROID["Android app<br/>(mDNS)"]
     WS -->|status + questions + remote control| VSCODE["VSCode extension"]
     DBUS -->|status + questions + remote control| GNOME["GNOME extension"]
+    DBUS -->|status + usage| KDE["KDE Plasma widget"]
 
     REG -.-> USAGE
     REG -.-> WS
