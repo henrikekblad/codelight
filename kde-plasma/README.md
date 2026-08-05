@@ -5,6 +5,9 @@ A KDE Plasma 6 widget that shows the active supported-agent status and usage for
 companion daemon. One Plasma applet package provides **both** a panel/system-tray
 icon with a popup **and** a resizable desktop widget — place it wherever you like.
 
+<img src="../assets/kde-plasma-tray-popup.png" width="458"
+     alt="codelight KDE Plasma tray popup with grouped agent status and usage">
+
 The panel/tray icon shows the active agent's logo tinted with its status
 (**WORKING** orange, **WAITING** red, **IDLE** green, offline grey); hovering
 shows a live tooltip with agent, status, and session count. Click it to open a
@@ -19,6 +22,22 @@ window fills, matching the screen firmware and the Android and GNOME clients.
 
 This applet is **status and usage only** — it does not answer permission or
 question prompts. See [Scope](#scope-this-version).
+
+<table>
+<tr>
+<td><img src="../assets/kde-plasma-tooltip.png" width="199"
+         alt="Tray icon tooltip showing agent, status, and session count"></td>
+<td><img src="../assets/kde-plasma-desktop.png" width="431"
+         alt="Resizable desktop widget"></td>
+<td><img src="../assets/kde-plasma-desktop-light.png" width="430"
+         alt="The same desktop widget on a light color scheme"></td>
+</tr>
+<tr>
+<td align="center">Tray icon tooltip</td>
+<td align="center">Desktop widget</td>
+<td align="center">Light color scheme</td>
+</tr>
+</table>
 
 ## Requires
 
@@ -109,6 +128,9 @@ offline state and the *Keep the icon visible* option unreachable in the tray,
 the placement they exist for.
 
 ## Configuration
+
+<img src="../assets/kde-plasma-settings.png" width="620"
+     alt="codelight KDE Plasma configuration page">
 
 Right-click the widget → **Configure codelight…**. There is also a ⚙ button in
 the widget's bottom-right corner on the desktop and in a `plasmawindowed`

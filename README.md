@@ -40,7 +40,7 @@ them. Pick and choose whatever suits your needs:
 | [**screen/**](screen/README.md) | ESP8266 firmware for the GeekMagic Ultra — renders usage bars and status | <img src="assets/demo.jpg" width="600" alt="GeekMagic Ultra showing the codelight IDLE screen"> |
 | [**android/**](android/README.md) | Responsive Android widget + Status and Conversation views, permission review, and question answering | <img src="assets/android-widget-compact.jpg" width="280" alt="Compact codelight Android widget"> |
 | [**gnome-extension/**](gnome-extension/README.md) | GNOME Shell panel extension: status + approve/answer prompts from a popup | <img src="assets/gnome-extension-grouped.png" width="600" alt="Grouped codelight GNOME Shell popup">|
-| [**kde-plasma/**](kde-plasma/README.md) | KDE Plasma 6 panel/tray icon + resizable desktop widget: status & usage | |
+| [**kde-plasma/**](kde-plasma/README.md) | KDE Plasma 6 panel/tray icon + resizable desktop widget: status & usage | <img src="assets/kde-plasma-tray-popup.png" width="458" alt="codelight KDE Plasma tray popup with grouped agent status and usage">|
 | [**vscode-extension/**](vscode-extension/README.md) | VSCode status bar + answers supported agent questions in the editor | |
 
 ## Remote control
@@ -170,5 +170,21 @@ screen, the KDE Plasma widget, and older apps never see them). See
 <td align="center">VS Code status</td>
 <td align="center">VS Code permission review</td>
 <td align="center">Companion dashboard</td>
+</tr>
+</table>
+
+<table>
+<tr>
+<td><img src="assets/kde-plasma-desktop.png" width="431"
+         alt="codelight KDE Plasma desktop widget"></td>
+<td><img src="assets/kde-plasma-desktop-light.png" width="430"
+         alt="codelight KDE Plasma desktop widget on a light color scheme"></td>
+<td><img src="assets/kde-plasma-settings.png" width="413"
+         alt="codelight KDE Plasma configuration page"></td>
+</tr>
+<tr>
+<td align="center">KDE Plasma desktop widget</td>
+<td align="center">Same widget, light scheme</td>
+<td align="center">KDE Plasma settings</td>
 </tr>
 </table>
