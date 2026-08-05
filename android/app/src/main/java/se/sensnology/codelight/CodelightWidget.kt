@@ -37,29 +37,38 @@ class CodelightWidget : GlanceAppWidget() {
         val KEY_TICK = intPreferencesKey("tick")
 
         // Responsive size buckets. Glance picks the largest-area bucket that
-        // fits the current widget dimensions:
+        // fits entirely inside the current widget dimensions — there's no
+        // closest-match, so a gap between two buckets means anything in
+        // between collapses all the way down to the smaller one.
         //
-        //  SMALL     (100× 80) – always fits — active agent only
-        //  TALL      (100×200) – height ≥ 200 dp — all agents stacked, status below
-        //  WIDE_TALL (240×200) – width ≥ 240 dp AND height ≥ 200 dp — agents
+        //  SMALL       (100× 80) – always fits — active agent only
+        //  MEDIUM_TALL (100×140) – height ≥ 140 dp — all agents stacked, status below
+        //  TALL        (100×200) – height ≥ 200 dp — same layout as MEDIUM_TALL,
+        //                           just more room for the list
+        //  WIDE_TALL   (240×200) – width ≥ 240 dp AND height ≥ 200 dp — agents
         //                         stacked, status column on the right
         //  EXTRA_WIDE_TALL (300×200) – meters capped at a fixed width on the
         //                         left, status window consumes the extra width
         //
-        // Area order: EXTRA_WIDE_TALL > WIDE_TALL > TALL > SMALL.
+        // Area order: EXTRA_WIDE_TALL > WIDE_TALL > TALL > MEDIUM_TALL > SMALL.
         // A narrow+tall widget can’t fit WIDE_TALL,
-        // so TALL wins → status below.
+        // so TALL/MEDIUM_TALL wins → status below.
         // A wide+tall widget fits WIDE_TALL → status right.
         // A wider widget fits EXTRA_WIDE_TALL → status grows while meters stay capped.
         // A short or landscape widget fits only SMALL → active agent only.
-        val SIZE_SMALL     = DpSize(100.dp, 80.dp)
-        val SIZE_TALL      = DpSize(100.dp, 200.dp)
-        val SIZE_WIDE_TALL = DpSize(240.dp, 200.dp)
+        // MEDIUM_TALL exists because some launchers (e.g. a foldable's inner-
+        // screen grid) hand out heights well short of 200dp for a widget the
+        // user has resized to be narrow+tall — without this bucket that
+        // still falls all the way back to SMALL.
+        val SIZE_SMALL       = DpSize(100.dp, 80.dp)
+        val SIZE_MEDIUM_TALL = DpSize(100.dp, 140.dp)
+        val SIZE_TALL        = DpSize(100.dp, 200.dp)
+        val SIZE_WIDE_TALL   = DpSize(240.dp, 200.dp)
         val SIZE_EXTRA_WIDE_TALL = DpSize(300.dp, 200.dp)
     }
 
     override val sizeMode: SizeMode = SizeMode.Responsive(
-        setOf(SIZE_SMALL, SIZE_TALL, SIZE_WIDE_TALL, SIZE_EXTRA_WIDE_TALL)
+        setOf(SIZE_SMALL, SIZE_MEDIUM_TALL, SIZE_TALL, SIZE_WIDE_TALL, SIZE_EXTRA_WIDE_TALL)
     )
 
     override suspend fun provideGlance(context: Context, id: GlanceId) {
