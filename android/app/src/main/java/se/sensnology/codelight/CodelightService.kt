@@ -83,8 +83,8 @@ class CodelightService : LifecycleService() {
         private const val ALERT_NOTIF_ID    = 2
         private const val ALERT_CHANNEL_ID  = "codelight_alerts"
         private const val SVC_NOTIF_ID      = 1
-        private const val SVC_CHANNEL_ID    = "codelight_service"
-        private const val PAUSED_CHANNEL_ID = "codelight_paused"
+        const val SVC_CHANNEL_ID            = "codelight_service"
+        const val PAUSED_CHANNEL_ID         = "codelight_paused"
         private const val PERM_CHANNEL_ID   = "codelight_permissions"
         private const val SERVICE_TYPE      = "_codelight._tcp"
 
@@ -911,8 +911,14 @@ class CodelightService : LifecycleService() {
     private fun createNotificationChannels() {
         val nm = getSystemService(NotificationManager::class.java)
         nm.createNotificationChannel(
-            NotificationChannel(SVC_CHANNEL_ID, "codelight service", NotificationManager.IMPORTANCE_LOW)
-                .apply { setShowBadge(false) }
+            NotificationChannel(
+                SVC_CHANNEL_ID,
+                "codelight connected computer",
+                NotificationManager.IMPORTANCE_LOW,
+            ).apply {
+                description = "Persistent background connection indicator. You can turn this off without disabling codelight alerts or permission prompts."
+                setShowBadge(false)
+            }
         )
         nm.createNotificationChannel(
             NotificationChannel(ALERT_CHANNEL_ID, "codelight alerts", NotificationManager.IMPORTANCE_HIGH)

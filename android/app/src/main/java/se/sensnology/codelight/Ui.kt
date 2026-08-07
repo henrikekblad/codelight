@@ -4,6 +4,8 @@ import android.app.Activity
 import android.content.Context
 import android.content.Intent
 import android.content.SharedPreferences
+import android.os.Build
+import android.provider.Settings
 import android.widget.Toast
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
@@ -494,6 +496,29 @@ fun SettingsScreen(onClose: (() -> Unit)? = null) {
                  "the phone. Requires the companion to run with --remote-control.",
                  style = TextStyle(color = muted, fontSize = 10.sp))
             Spacer(Modifier.height(8.dp))
+            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                OutlinedButton(
+                    onClick = { openNotificationChannelSettings(context, CodelightService.SVC_CHANNEL_ID) },
+                    colors = ButtonDefaults.outlinedButtonColors(contentColor = accent),
+                    contentPadding = PaddingValues(horizontal = 10.dp, vertical = 0.dp),
+                    modifier = Modifier.weight(1f).height(40.dp),
+                ) {
+                    Text("Connected", fontSize = 13.sp, maxLines = 1)
+                }
+                OutlinedButton(
+                    onClick = { openNotificationChannelSettings(context, CodelightService.PAUSED_CHANNEL_ID) },
+                    colors = ButtonDefaults.outlinedButtonColors(contentColor = accent),
+                    contentPadding = PaddingValues(horizontal = 10.dp, vertical = 0.dp),
+                    modifier = Modifier.weight(1f).height(40.dp),
+                ) {
+                    Text("Paused", fontSize = 13.sp, maxLines = 1)
+                }
+            }
+            Text("Hide background indicators via Android's notification channels. " +
+                 "Turning them off hides the connected/paused indicators only; alerts " +
+                 "and permission prompts use separate channels.",
+                 style = TextStyle(color = muted, fontSize = 10.sp))
+            Spacer(Modifier.height(8.dp))
             CheckRow("Auto-open on request", autoOpen, accent, text) { autoOpen = it }
             Text("Open the app automatically when a request arrives, instead of " +
                  "tapping the notification. Needs the \"draw over other apps\" permission.",
@@ -584,6 +609,25 @@ internal fun fieldColors(accent: Color, muted: Color, text: Color) =
         focusedTextColor     = text,
         unfocusedTextColor   = text,
     )
+
+private fun openNotificationChannelSettings(context: Context, channelId: String) {
+    val intent = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+        Intent(Settings.ACTION_CHANNEL_NOTIFICATION_SETTINGS)
+            .putExtra(Settings.EXTRA_APP_PACKAGE, context.packageName)
+            .putExtra(Settings.EXTRA_CHANNEL_ID, channelId)
+    } else {
+        Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS)
+            .setData(android.net.Uri.parse("package:${context.packageName}"))
+    }
+    try {
+        context.startActivity(intent)
+    } catch (_: Exception) {
+        context.startActivity(
+            Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS)
+                .setData(android.net.Uri.parse("package:${context.packageName}"))
+        )
+    }
+}
 
 // ── Conversation (read-only feed) ─────────────────────────────────────────────
 
