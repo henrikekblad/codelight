@@ -1,0 +1,2 @@
+commit:
+  fix_message: "chore(no-mistakes): {{.Step}}: {{.Summary}}"
