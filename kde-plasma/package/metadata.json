@@ -17,7 +17,7 @@
         "Id": "se.sensnology.codelight",
         "License": "MIT",
         "Name": "codelight",
-        "Version": "1.7.1",
+        "Version": "1.8.0",
         "Website": "https://github.com/henrikekblad/codelight"
     },
     "X-Plasma-API": "declarativeappletscript",
