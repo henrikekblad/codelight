@@ -78,6 +78,9 @@ Keys:
   - Default: `~/.claude/settings.json`
 - `credentials_path` (string): path to Claude OAuth credentials file used for usage polling.
   - Default: `~/.claude/.credentials.json`
+  - macOS: the CLI keeps credentials in the login keychain rather than on
+    disk, so when the file is missing codelight reads the `Claude Code-credentials`
+    generic-password item instead. No config needed.
 
 Behavior and quirks:
 
@@ -357,8 +360,13 @@ Behavior and quirks:
 Restart the companion service:
 
 ```bash
+# Linux
 systemctl --user restart codelight.service
 systemctl --user is-active codelight.service
+
+# macOS
+launchctl kickstart -k gui/$(id -u)/se.sensnology.codelight
+launchctl print gui/$(id -u)/se.sensnology.codelight | grep state
 ```
 
 ## Persistent approvals

@@ -864,7 +864,8 @@ def main():
     parser.add_argument("--uninstall", action="store_true",
                         help="Remove codelight agent hooks and delete state files.")
     parser.add_argument("--install", action="store_true",
-                        help="Install and start a systemd user service (requires --name).")
+                        help="Install and start a user service — systemd on "
+                             "Linux, launchd on macOS (requires --name).")
     parser.add_argument("--hook", metavar="STATE",
                         help="Hook mode: send STATE event to daemon and exit. "
                              "Used internally by agent hooks (working/waiting/ended).")

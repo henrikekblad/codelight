@@ -9,8 +9,9 @@ it also brokers supported interactive prompts to the clients that support
 them, so you can approve permissions and answer questions remotely (see
 [Remote control](#remote-control)).
 
-When run in a terminal it shows a live dashboard. When run as a systemd service
-it is silent (key events are logged to the journal via stdout).
+When run in a terminal it shows a live dashboard. When run as a background
+service it is silent (key events go to stdout — the systemd journal on Linux,
+`~/Library/Logs/codelight.log` on macOS).
 
 ## Dependencies
 
@@ -24,9 +25,15 @@ sudo pacman -S python-websockets python-zeroconf python-dbus-fast  # python-dbus
 pip install websockets zeroconf dbus-fast  # dbus-fast optional: GNOME extension / KDE applet
 ```
 
+**macOS**
+```bash
+pip3 install -r companion/requirements.txt  # dbus-fast is skipped here by marker
+```
+
 `websockets` and `zeroconf` are required. `dbus-fast` is optional — install it
 to enable the D-Bus service that the GNOME extension and the KDE Plasma
-applet subscribe to.
+applet subscribe to. There is no D-Bus session bus on macOS, so the daemon
+skips it there and clients use the WebSocket protocol.
 
 ## Run
 
@@ -82,9 +89,10 @@ Some integrations expose extra usage sources or credential options. Full
 details live in [AGENTS.md](AGENTS.md). Editors that understand JSON Schema can
 use [config.schema.json](config.schema.json) for validation/completion.
 
-## Run as a systemd user service
+## Run as a background service
 
-The `--install` flag writes the unit file and enables the service in one step:
+The `--install` flag writes the service definition and enables it in one step —
+a systemd user unit on Linux, a launchd LaunchAgent on macOS:
 
 ```bash
 python3 companion/codelight.py --install --name my-laptop
@@ -95,6 +103,8 @@ python3 companion/codelight.py --install --name my-laptop \
 
 No per-agent install flags are needed. The detected agent set is stored in the
 service command so each daemon restart keeps those hooks current.
+
+### Linux (systemd)
 
 ```bash
 systemctl --user status codelight   # verify it's running
@@ -109,6 +119,32 @@ journalctl --user -fu codelight     # live logs
 systemctl --user restart codelight  # restart after config change
 systemctl --user disable --now codelight  # disable
 ```
+
+### macOS (launchd)
+
+The LaunchAgent is written to
+`~/Library/LaunchAgents/se.sensnology.codelight.plist` and loaded into your
+`gui/<uid>` domain, so it starts at login and restarts if it crashes.
+
+```bash
+launchctl print gui/$(id -u)/se.sensnology.codelight   # verify it's running
+```
+
+Useful commands:
+
+```bash
+tail -f ~/Library/Logs/codelight.log                        # live logs
+launchctl kickstart -k gui/$(id -u)/se.sensnology.codelight # restart
+launchctl bootout gui/$(id -u)/se.sensnology.codelight      # stop
+```
+
+The agent's `PATH` is captured from the shell you ran `--install` in, because
+launchd otherwise hands it a minimal `PATH` that hides agent CLIs and leaves
+the daemon with no agents enabled. Re-run `--install` if you later move an
+agent CLI somewhere new.
+
+macOS will ask for Local Network access the first time the daemon advertises
+over mDNS. Approve it, or clients won't discover the machine automatically.
 
 ## Remote control
 
@@ -227,7 +263,8 @@ python3 companion/codelight.py --uninstall
 This removes every codelight-owned hook/file declared by the registered
 integrations, even if an agent is no longer installed. It also deletes
 `~/.config/codelight/codelight.sock`, `~/.config/codelight/monitor_state/`,
-the shared policy file, and the systemd service.
+the shared policy file, and the installed service (systemd unit or
+LaunchAgent).
 
 > **Stop the daemon before uninstalling.** If it is still running it will
 > re-install the hooks on its next startup.

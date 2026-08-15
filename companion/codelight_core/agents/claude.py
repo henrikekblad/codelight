@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import subprocess
 import sys
 import urllib.error
 import urllib.request
@@ -112,6 +113,54 @@ def default_credentials_path() -> str:
     return os.path.expanduser("~/.claude/.credentials.json")
 
 
+# On macOS the CLI stores its OAuth credentials in the login keychain instead
+# of ~/.claude/.credentials.json.
+KEYCHAIN_SERVICE = "Claude Code-credentials"
+
+
+def read_keychain_credentials(
+    service: str = KEYCHAIN_SERVICE,
+    *,
+    run=subprocess.run,
+    platform: str = sys.platform,
+) -> dict | None:
+    """Read Claude's OAuth credentials from the macOS login keychain.
+
+    Reading the item may prompt for keychain access the first time; once the
+    user allows it, ``security`` returns the same JSON blob the Linux CLI
+    writes to disk.
+    """
+    if platform != "darwin":
+        return None
+    try:
+        out = run(
+            ["security", "find-generic-password", "-s", service, "-w"],
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+    except Exception:
+        return None
+    if out.returncode != 0 or not out.stdout.strip():
+        return None
+    try:
+        return json.loads(out.stdout)
+    except Exception:
+        return None
+
+
+def read_credentials(credentials_path: str,
+                     *, read_keychain=read_keychain_credentials) -> dict | None:
+    """Load Claude OAuth credentials from disk, falling back to the keychain."""
+    try:
+        with open(credentials_path) as f:
+            return json.load(f)
+    except FileNotFoundError:
+        return read_keychain()
+    except Exception:
+        return None
+
+
 class ClaudeAgent:
     def __init__(
         self,
@@ -143,9 +192,13 @@ def get_usage(
     Returns session/weekly usage percentages and reset metadata, or None when
     credentials/API access are unavailable.
     """
+    creds = read_credentials(credentials_path)
+    if creds is None:
+        print(f"[usage] no Claude credentials in {credentials_path}"
+              + (" or the login keychain" if sys.platform == "darwin" else ""),
+              file=sys.stderr, flush=True)
+        return None
     try:
-        with open(credentials_path) as f:
-            creds = json.load(f)
         token = creds["claudeAiOauth"]["accessToken"]
     except Exception as e:
         print(f"[usage] could not read credentials: {e}", file=sys.stderr, flush=True)

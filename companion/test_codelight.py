@@ -5,6 +5,7 @@ import io
 import importlib.util
 import json
 import os
+import plistlib
 import shlex
 import sys
 import tempfile
@@ -18,6 +19,7 @@ from unittest import mock
 sys.path.insert(0, os.path.dirname(__file__))
 import codelight
 from codelight_core.agents import base as agents_base
+from codelight_core.agents import claude as claude_agent
 from codelight_core.agents import codex as codex_agent
 from codelight_core.agents import copilot as copilot_agent
 from codelight_core.agents import cursor as cursor_agent
@@ -374,7 +376,10 @@ class CopilotUsageTests(unittest.TestCase):
             error.close()
 
     def test_events_path_for_session_stays_inside_copilot_home(self):
-        with tempfile.TemporaryDirectory() as tmp:
+        with tempfile.TemporaryDirectory() as raw_tmp:
+            # realpath: the production lookups resolve symlinks, and macOS
+            # hands out /var/... temp dirs that resolve to /private/var/...
+            tmp = os.path.realpath(raw_tmp)
             home = os.path.join(tmp, "copilot")
             session_dir = os.path.join(home, "session-state", "session-1")
             os.makedirs(session_dir)
@@ -429,7 +434,7 @@ class PermissionPolicyTests(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         self.policy = os.path.join(self.tmp.name, "policy.json")
-        self.repo = os.path.join(self.tmp.name, "repo")
+        self.repo = os.path.join(os.path.realpath(self.tmp.name), "repo")
         os.makedirs(os.path.join(self.repo, ".git"))
         self.policy_patch = mock.patch.object(codelight, "POLICY_PATH", self.policy)
         self.policy_patch.start()
@@ -1278,13 +1283,242 @@ class ServiceInstallTests(unittest.TestCase):
                 return mock.Mock(returncode=0, stderr="")
 
             with mock.patch.dict(os.environ, {"HOME": tmp}):
-                service_core.uninstall_service(run=run)
+                service_core.uninstall_service(run=run, platform="linux")
 
             self.assertFalse(os.path.exists(service_path))
             self.assertEqual(calls, [
                 ["systemctl", "--user", "disable", "--now", "codelight"],
                 ["systemctl", "--user", "daemon-reload"],
             ])
+
+
+class LaunchAgentInstallTests(unittest.TestCase):
+    def _render(self, args_line="--name my-laptop", path_env="/opt/bin:/usr/bin"):
+        return plistlib.loads(service_core.render_launch_agent(
+            python_path="/usr/bin/python3",
+            script_path="/opt/codelight/codelight.py",
+            args_line=args_line,
+            path_env=path_env,
+            log_path="/tmp/codelight.log",
+        ))
+
+    def test_render_splits_args_and_keeps_quoted_values_intact(self):
+        plist = self._render(args_line="--name 'my laptop' --secret 'a b'")
+
+        self.assertEqual(plist["ProgramArguments"], [
+            "/usr/bin/python3", "-u", "/opt/codelight/codelight.py",
+            "--name", "my laptop", "--secret", "a b",
+        ])
+
+    def test_render_restarts_only_on_failure_and_inherits_path(self):
+        plist = self._render()
+
+        self.assertEqual(plist["Label"], "se.sensnology.codelight")
+        self.assertTrue(plist["RunAtLoad"])
+        # launchd's spelling of systemd Restart=on-failure.
+        self.assertEqual(plist["KeepAlive"], {"SuccessfulExit": False})
+        # Without an explicit PATH, launchd's minimal default breaks agent
+        # detection and the daemon starts with no agents enabled.
+        self.assertEqual(plist["EnvironmentVariables"]["PATH"],
+                         "/opt/bin:/usr/bin")
+        self.assertEqual(plist["StandardOutPath"], "/tmp/codelight.log")
+        self.assertEqual(plist["StandardErrorPath"], "/tmp/codelight.log")
+
+    def test_install_writes_plist_and_reloads_launchd(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            calls: list[list[str]] = []
+
+            def run(cmd, **_kwargs):
+                calls.append(cmd)
+                return mock.Mock(returncode=0, stderr="")
+
+            with mock.patch.dict(os.environ, {"HOME": tmp, "PATH": "/opt/bin"}):
+                service_core.install_service(
+                    name="my-laptop",
+                    secret="",
+                    ws_port=8765,
+                    verbose=False,
+                    script_path="/opt/codelight/codelight.py",
+                    run=run,
+                    platform="darwin",
+                )
+                plist_path = service_core.launch_agent_path()
+
+            self.assertTrue(os.path.exists(plist_path))
+            with open(plist_path, "rb") as stream:
+                plist = plistlib.load(stream)
+            self.assertEqual(plist["ProgramArguments"][3:],
+                             ["--name", "my-laptop"])
+            self.assertEqual(plist["EnvironmentVariables"]["PATH"], "/opt/bin")
+
+            uid = os.getuid()
+            target = f"gui/{uid}/se.sensnology.codelight"
+            self.assertEqual(calls, [
+                ["launchctl", "bootout", target],
+                ["launchctl", "enable", target],
+                ["launchctl", "bootstrap", f"gui/{uid}", plist_path],
+                ["launchctl", "kickstart", "-k", target],
+            ])
+
+    def test_bootstrap_retries_while_the_old_job_is_still_leaving(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            attempts = {"bootstrap": 0}
+            slept: list[float] = []
+
+            def run(cmd, **_kwargs):
+                if cmd[1] == "bootstrap":
+                    attempts["bootstrap"] += 1
+                    if attempts["bootstrap"] < 3:
+                        # What launchd reports while the booted-out job is
+                        # still tearing down.
+                        return mock.Mock(
+                            returncode=5,
+                            stderr="Bootstrap failed: 5: Input/output error")
+                return mock.Mock(returncode=0, stderr="")
+
+            with mock.patch.dict(os.environ, {"HOME": tmp, "PATH": "/opt/bin"}):
+                service_core.install_service(
+                    name="my-laptop",
+                    secret="",
+                    ws_port=8765,
+                    verbose=False,
+                    script_path="/opt/codelight/codelight.py",
+                    run=run,
+                    platform="darwin",
+                    sleep=slept.append,
+                )
+
+            self.assertEqual(attempts["bootstrap"], 3)
+            self.assertEqual(len(slept), 2)
+
+    def test_bootstrap_gives_up_after_the_retry_budget(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            attempts = {"bootstrap": 0}
+
+            def run(cmd, **_kwargs):
+                if cmd[1] == "bootstrap":
+                    attempts["bootstrap"] += 1
+                    return mock.Mock(returncode=5, stderr="nope")
+                return mock.Mock(returncode=0, stderr="")
+
+            with mock.patch.dict(os.environ, {"HOME": tmp, "PATH": "/opt/bin"}):
+                with contextlib.redirect_stderr(io.StringIO()) as err:
+                    service_core.install_service(
+                        name="my-laptop",
+                        secret="",
+                        ws_port=8765,
+                        verbose=False,
+                        script_path="/opt/codelight/codelight.py",
+                        run=run,
+                        platform="darwin",
+                        sleep=lambda _secs: None,
+                    )
+
+            self.assertEqual(attempts["bootstrap"],
+                             service_core.BOOTSTRAP_ATTEMPTS)
+            self.assertIn("nope", err.getvalue())
+
+    def test_uninstall_boots_out_and_removes_plist(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            calls: list[list[str]] = []
+
+            def run(cmd, **_kwargs):
+                calls.append(cmd)
+                return mock.Mock(returncode=0, stderr="")
+
+            with mock.patch.dict(os.environ, {"HOME": tmp}):
+                plist_path = service_core.launch_agent_path()
+                os.makedirs(os.path.dirname(plist_path))
+                with open(plist_path, "w") as stream:
+                    stream.write("plist")
+
+                service_core.uninstall_service(run=run, platform="darwin")
+
+                self.assertFalse(os.path.exists(plist_path))
+
+            self.assertEqual(calls, [[
+                "launchctl", "bootout",
+                f"gui/{os.getuid()}/se.sensnology.codelight",
+            ]])
+
+    def test_uninstall_is_a_no_op_when_never_installed(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            calls: list[list[str]] = []
+
+            def run(cmd, **_kwargs):
+                calls.append(cmd)
+                return mock.Mock(returncode=0, stderr="")
+
+            with mock.patch.dict(os.environ, {"HOME": tmp}):
+                service_core.uninstall_service(run=run, platform="darwin")
+
+            self.assertEqual(calls, [])
+
+
+class ClaudeKeychainCredentialTests(unittest.TestCase):
+    CREDS = {"claudeAiOauth": {"accessToken": "tok"}}
+
+    def test_disk_credentials_win_and_keychain_is_not_consulted(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, ".credentials.json")
+            with open(path, "w") as stream:
+                json.dump(self.CREDS, stream)
+
+            def unexpected():
+                raise AssertionError("keychain should not be read")
+
+            self.assertEqual(
+                claude_agent.read_credentials(path, read_keychain=unexpected),
+                self.CREDS)
+
+    def test_missing_file_falls_back_to_keychain(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "missing.json")
+
+            self.assertEqual(
+                claude_agent.read_credentials(
+                    path, read_keychain=lambda: self.CREDS),
+                self.CREDS)
+
+    def test_keychain_read_parses_security_output_on_darwin(self):
+        calls: list[list[str]] = []
+
+        def run(cmd, **_kwargs):
+            calls.append(cmd)
+            return mock.Mock(returncode=0, stdout=json.dumps(self.CREDS))
+
+        self.assertEqual(
+            claude_agent.read_keychain_credentials(run=run, platform="darwin"),
+            self.CREDS)
+        self.assertEqual(calls, [[
+            "security", "find-generic-password",
+            "-s", "Claude Code-credentials", "-w",
+        ]])
+
+    def test_keychain_is_skipped_off_darwin(self):
+        def unexpected(*_args, **_kwargs):
+            raise AssertionError("security should not run off darwin")
+
+        self.assertIsNone(claude_agent.read_keychain_credentials(
+            run=unexpected, platform="linux"))
+
+    def test_keychain_miss_and_garbage_return_none(self):
+        misses = [
+            mock.Mock(returncode=44, stdout=""),      # item not in keychain
+            mock.Mock(returncode=0, stdout="   "),    # empty payload
+            mock.Mock(returncode=0, stdout="not json"),
+        ]
+        for result in misses:
+            with self.subTest(returncode=result.returncode):
+                self.assertIsNone(claude_agent.read_keychain_credentials(
+                    run=lambda *a, **k: result, platform="darwin"))
+
+    def test_keychain_failure_is_swallowed(self):
+        def boom(*_args, **_kwargs):
+            raise OSError("security missing")
+
+        self.assertIsNone(claude_agent.read_keychain_credentials(
+            run=boom, platform="darwin"))
 
 
 class DiscoveryTests(unittest.TestCase):
@@ -1969,7 +2203,8 @@ class GrokIntegrationTests(unittest.TestCase):
         self.assertEqual(lines[3]["text"], "Done.")
 
     def test_session_path_matches_id_directory(self):
-        with tempfile.TemporaryDirectory() as tmp:
+        with tempfile.TemporaryDirectory() as raw_tmp:
+            tmp = os.path.realpath(raw_tmp)
             sid = "019f5637-5c3d-72b2-84cc-39c01455eaac"
             d = os.path.join(tmp, "sessions", "%2Fhome%2Fx", sid)
             os.makedirs(d)
