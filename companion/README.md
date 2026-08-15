@@ -27,7 +27,7 @@ pip install websockets zeroconf dbus-fast  # dbus-fast optional: GNOME extension
 
 **macOS**
 ```bash
-pip3 install websockets zeroconf  # dbus-fast is Linux-only and not needed here
+pip3 install -r companion/requirements.txt  # dbus-fast is skipped here by marker
 ```
 
 `websockets` and `zeroconf` are required. `dbus-fast` is optional — install it
