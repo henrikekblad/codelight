@@ -20,6 +20,7 @@ struct Config {
     String companionSecret;  // optional shared secret for WebSocket auth
     bool sleepOnDisconnect;  // sleep screen after 10 min without companion
     bool sleepOnIdle;        // sleep screen after 1 h of idle status
+    long utcOffsetSeconds;   // last timezone offset received from companion
 };
 
 extern Config cfg;

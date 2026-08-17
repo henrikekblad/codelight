@@ -95,6 +95,11 @@ static bool decodeLogoBitmap(const char* b64, uint8_t* out) {
 static void applyConfig(JsonDocument& doc) {
     if (doc["utc_offset"].is<long>()) {
         long off = doc["utc_offset"].as<long>();
+        if (off != cfg.utcOffsetSeconds) {
+            cfg.utcOffsetSeconds = off;
+            configSave();
+            dbgLog("[ws] saved utc_offset=" + String(off) + "s");
+        }
         configTime(off, 0L, ntpServer);
         dbgLog("[ws] utc_offset=" + String(off) + "s");
     }
@@ -280,7 +285,10 @@ static void connectWifi() {
         if (WiFi.status() == WL_CONNECTED) {
             dbgLog("WiFi connected: " + WiFi.localIP().toString() +
                    " RSSI=" + String(WiFi.RSSI()) + "dBm");
-            configTime(0, 0, ntpServer);  // offset corrected when companion sends config
+            // Use the last companion-provided timezone immediately. If the
+            // companion is offline after a device reboot, the screensaver clock
+            // still shows local time instead of falling back to UTC.
+            configTime(cfg.utcOffsetSeconds, 0L, ntpServer);
             return;
         }
 

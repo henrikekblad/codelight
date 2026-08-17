@@ -173,7 +173,9 @@ On boot the screen connects to the companion daemon over WebSocket:
 
 Once connected it receives push updates in real time. If the connection drops it
 reconnects automatically after 15 seconds. The timezone offset is pushed by the
-companion on every new connection so the clock always shows the correct local time.
+companion on every new connection and cached in the screen's LittleFS config, so
+the clock still shows the last-known local time after a screen reboot even when
+the companion is offline.
 
 ## Debug page
 

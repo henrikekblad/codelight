@@ -11,6 +11,7 @@ void configDefaults() {
     cfg.companionSecret = "";
     cfg.sleepOnDisconnect = true;
     cfg.sleepOnIdle       = true;
+    cfg.utcOffsetSeconds  = 0;
 }
 
 bool configLoad() {
@@ -42,6 +43,7 @@ bool configLoad() {
     cfg.companionSecret = doc["companionSecret"] | "";
     cfg.sleepOnDisconnect = doc["sleepOnDisconnect"] | true;
     cfg.sleepOnIdle       = doc["sleepOnIdle"]       | true;
+    cfg.utcOffsetSeconds  = doc["utcOffsetSeconds"]  | 0L;
 
     JsonArray nets = doc["wifi"].as<JsonArray>();
     cfg.wifiCount = 0;
@@ -65,6 +67,7 @@ void configSave() {
     doc["companionSecret"] = cfg.companionSecret;
     doc["sleepOnDisconnect"] = cfg.sleepOnDisconnect;
     doc["sleepOnIdle"]       = cfg.sleepOnIdle;
+    doc["utcOffsetSeconds"]  = cfg.utcOffsetSeconds;
 
     JsonArray nets = doc["wifi"].to<JsonArray>();
     for (uint8_t i = 0; i < cfg.wifiCount; i++) {

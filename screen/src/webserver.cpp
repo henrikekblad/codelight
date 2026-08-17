@@ -253,6 +253,7 @@ static void handleGetConfig(AsyncWebServerRequest* req) {
     doc["hasSecret"]       = cfg.companionSecret.length() > 0;
     doc["sleepOnDisconnect"] = cfg.sleepOnDisconnect;
     doc["sleepOnIdle"]       = cfg.sleepOnIdle;
+    doc["utcOffsetSeconds"]  = cfg.utcOffsetSeconds;
     JsonArray nets = doc["wifi"].to<JsonArray>();
     for (int i = 0; i < cfg.wifiCount; i++) {
         JsonObject n = nets.add<JsonObject>();
