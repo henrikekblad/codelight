@@ -1,5 +1,6 @@
 import GLib from 'gi://GLib';
 import Gio from 'gi://Gio';
+import GObject from 'gi://GObject';
 import St from 'gi://St';
 import Clutter from 'gi://Clutter';
 import Pango from 'gi://Pango';
@@ -90,6 +91,12 @@ function toHex([r, g, b]) {
     return '#' + [r, g, b].map(v => Math.round(v * 255).toString(16).padStart(2, '0')).join('');
 }
 
+// St.BoxLayout's `vertical` property was replaced by `orientation` in GNOME 48
+// and removed in GNOME 51; pick whichever this shell supports.
+const VERTICAL = GObject.Object.find_property.call(St.BoxLayout, 'orientation')
+    ? {orientation: Clutter.Orientation.VERTICAL}
+    : {vertical: true};
+
 // Agent branding from the daemon's GetConfig:
 // { agent_id: { display, color, logo_svg } }. Empty until the daemon appears.
 let AGENTS_META = {};
@@ -164,7 +171,7 @@ function makeMeterItem(label) {
     const item = new PopupMenu.PopupBaseMenuItem({ reactive: false });
     item.set_style('padding: 2px 12px 3px;');
 
-    const col = new St.BoxLayout({ vertical: true, x_expand: true });
+    const col = new St.BoxLayout({ ...VERTICAL, x_expand: true });
 
     const row = new St.BoxLayout({ x_expand: true });
     const lbl = new St.Label({
@@ -607,7 +614,7 @@ export default class CodelightExtension extends Extension {
 
     _buildPermission(req) {
         const item = new PopupMenu.PopupBaseMenuItem({ reactive: false });
-        const box  = new St.BoxLayout({ vertical: true, x_expand: true, style: 'spacing: 8px; width: 380px;' });
+        const box  = new St.BoxLayout({ ...VERTICAL, x_expand: true, style: 'spacing: 8px; width: 380px;' });
         const canAllowFolder = req?.allow_folder_available !== false;
         const canAllowCommand = req?.allow_command_available === true;
         const tool = String(req.tool_name || req.toolName || 'tool use');
@@ -664,7 +671,7 @@ export default class CodelightExtension extends Extension {
                 `Skip further prompts for the '${tool}' tool — for this session, or always and for every agent.`,
                 'font-size: 11px; color: #ffb74d;'
             ));
-            const toolRow = new St.BoxLayout({ x_expand: true, vertical: true, style: 'padding-top: 2px; spacing: 4px;' });
+            const toolRow = new St.BoxLayout({ x_expand: true, ...VERTICAL, style: 'padding-top: 2px; spacing: 4px;' });
             const allowToolSession = new St.Button({
                 x_expand: true,
                 style: 'padding: 6px; border-radius: 6px; background-color: #2f6f9f; color: #fff;',
@@ -695,7 +702,7 @@ export default class CodelightExtension extends Extension {
             this._qState.push(st);
 
             const qItem = new PopupMenu.PopupBaseMenuItem({ reactive: false });
-            const qBox  = new St.BoxLayout({ vertical: true, x_expand: true, style: 'spacing: 4px; max-width: 360px;' });
+            const qBox  = new St.BoxLayout({ ...VERTICAL, x_expand: true, style: 'spacing: 4px; max-width: 360px;' });
             if (q.header) qBox.add_child(wrapLabel(q.header, 'font-size: 10px; color: #888888;'));
             qBox.add_child(wrapLabel(q.question, 'font-size: 12px;'));
 
