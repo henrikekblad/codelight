@@ -13,7 +13,7 @@ from codelight_core.agents import base
 from codelight_core.timefmt import epoch, format_iso_countdown
 
 
-USAGE_API = "https://claude.ai/api/oauth/usage"
+USAGE_API = "https://api.anthropic.com/api/oauth/usage"
 
 LOGO_SVG = (
     '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 50 50">'
@@ -209,6 +209,7 @@ def get_usage(
         headers={
             "Authorization": f"Bearer {token}",
             "User-Agent": "claude-code/1.0.0",
+            "anthropic-beta": "oauth-2025-04-20",
             "Accept": "application/json",
         },
     )
