@@ -268,6 +268,17 @@ class OpenCodeAgent:
     def get_usage(self) -> dict | None:
         return get_usage(self.db_path, self.monthly_budget_usd, self.log)
 
+    def last_used(self) -> float:
+        """When OpenCode last wrote its store. The -shm file is left out: it
+        changes whenever anything (codelight included) merely reads the db."""
+        newest = 0.0
+        for path in (self.db_path, self.db_path + "-wal"):
+            try:
+                newest = max(newest, os.path.getmtime(path))
+            except OSError:
+                pass
+        return newest
+
     def set_budget(self, monthly_budget_usd: float) -> None:
         self.monthly_budget_usd = max(0.0, float(monthly_budget_usd))
 
@@ -530,4 +541,5 @@ def build_integration(config: dict, *,
         conversation_provider=agent.conversation,
         # Remote steering: send new instructions to a session from a client.
         prompt_sender=agent.send_prompt,
+        last_used_hint=agent.last_used,
     )

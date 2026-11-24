@@ -54,6 +54,8 @@ POLICY_PATH       = os.path.join(CODELIGHT_CONFIG_HOME, "policy.json")
 # rewrites it.
 SETTINGS_PATH     = os.path.join(CODELIGHT_CONFIG_HOME, "settings.json")
 _settings_lock = threading.Lock()
+# Saved agent logins (e.g. work/private Claude accounts), one dir per agent.
+ACCOUNTS_DIR      = os.path.join(CODELIGHT_CONFIG_HOME, "accounts")
 USAGE_INTERVAL      = 60   # seconds between usage API polls
 IDLE_WINDOW         = 600  # seconds before a silent "working" session is dropped
 IDLE_WINDOW_WAITING = 30   # seconds before a "waiting" session is dropped (subagents resolve quickly)
@@ -161,6 +163,52 @@ def _persist_last_active_agent(agent_id: str) -> None:
               file=sys.stderr, flush=True)
 
 
+def _persist_agent_last_used(last_used: dict[str, float]) -> None:
+    """Remember when each agent was last used, so agents untouched for a long
+    time can drop out of client lists across restarts."""
+    try:
+        with _settings_lock:
+            settings = _load_settings()
+            settings["agent_last_used"] = {
+                k: round(v) for k, v in sorted(last_used.items())}
+            _write_settings(settings)
+    except Exception as e:
+        print(f"[settings] could not persist agent last use: {e}",
+              file=sys.stderr, flush=True)
+
+
+def _hide_unused_after() -> float:
+    """config.json ``hide_unused_after_days`` (default 30; 0 = never hide) in
+    seconds."""
+    try:
+        days = float(_config.get("hide_unused_after_days", 30))
+    except (TypeError, ValueError):
+        days = 30.0
+    return max(0.0, days) * 86400
+
+
+def _seed_agent_last_used(agent_ids) -> None:
+    """Agents with no recorded use start from their newest transcript when one
+    exists, else from now — so nothing disappears right after an upgrade."""
+    now = time.time()
+    fallbacks = dict(_agents.latest_transcript_fallbacks())
+    hints = _agents.last_used_hints()
+    seeds = {}
+    for agent_id in agent_ids:
+        if agent_id in hints:
+            seeds[agent_id] = min(hints[agent_id], now)
+            continue
+        ts = now
+        path = fallbacks.get(agent_id) or ""
+        try:
+            if path:
+                ts = os.path.getmtime(path)
+        except OSError:
+            pass
+        seeds[agent_id] = ts
+    _state.seed_agent_last_used(seeds)
+
+
 def _apply_persisted_budgets() -> None:
     """On startup, apply app-set budgets (settings.json) over config defaults."""
     agents = _load_settings().get("agents")
@@ -178,6 +226,8 @@ def _new_agent_registry(log=None) -> AgentRegistry:
     agents_config = _config.get("agents")
     return AgentRegistry(
         agents_config=agents_config if isinstance(agents_config, dict) else {},
+        stale_after=_hide_unused_after(),
+        accounts_dir=ACCOUNTS_DIR,
         log=log,
     )
 
@@ -193,6 +243,11 @@ _state = CodelightState(
     idle_window_waiting=IDLE_WINDOW_WAITING,
     initial_last_active_agent=_startup_settings.get("last_active_agent"),
     on_last_active_agent_changed=_persist_last_active_agent,
+    stale_after=_hide_unused_after(),
+    initial_agent_last_used=(
+        _startup_settings.get("agent_last_used")
+        if isinstance(_startup_settings.get("agent_last_used"), dict) else None),
+    on_agent_used=_persist_agent_last_used,
 )
 for _agent_id in _agents.supported_agent_ids():
     if _agents.session_reset_supported(_agent_id):
@@ -244,6 +299,12 @@ def _update_session(session_id: str, state: str,
         cwd=cwd,
         agent_id=normalized_agent,
     )
+    if state == "working":
+        try:
+            _agents.note_activity(normalized_agent)
+        except Exception as e:
+            print(f"[agents] {normalized_agent} activity hook failed: {e}",
+                  file=sys.stderr, flush=True)
 
 
 def _active_transcript() -> tuple[str, str, str]:
@@ -700,6 +761,43 @@ def _set_budget(agent_id: str, budget, request_id: str = "") -> dict:
     }
 
 
+def _switch_account(agent_id: str, account_id, request_id: str = "") -> dict:
+    """Make another saved login the agent's active one (e.g. work ↔ private
+    Claude), then refresh its meters. Claude Code re-reads its credentials, so
+    running sessions follow on their next request."""
+    aid = _state.normalize_agent_id(agent_id)
+    try:
+        result = _agents.switch_account(aid, str(account_id or ""))
+    except Exception as e:
+        import traceback
+        traceback.print_exc(file=sys.stderr)
+        result = {"ok": False, "outcome": "error",
+                  "message": f"{type(e).__name__}: {e}"}
+    _log(f"[account] {aid} → {result.get('account_label') or account_id}: "
+         f"{result.get('outcome') or ('ok' if result.get('ok') else 'failed')}")
+    if result.get("ok"):
+        fetcher = _agents.usage_fetchers().get(aid)
+        if fetcher is not None:
+            try:
+                _state.update_usage(usages={aid: fetcher()})
+            except Exception as e:
+                print(f"[usage] {aid} error: {e}", file=sys.stderr, flush=True)
+        _push()
+    payload = {
+        "type": "switch_account_result",
+        "id": request_id,
+        "agent_id": aid,
+        "agent_display": _state.agent_display_name(aid),
+        "ok": bool(result.get("ok")),
+        "outcome": str(result.get("outcome") or ""),
+        "account_id": str(result.get("account_id") or account_id or ""),
+        "account_label": str(result.get("account_label") or ""),
+    }
+    if result.get("message"):
+        payload["message"] = str(result["message"])
+    return payload
+
+
 def _send_prompt(agent_id: str, text, session_id: str = "",
                  request_id: str = "") -> dict:
     """Remote steering: forward a new instruction to an agent that has a
@@ -764,6 +862,7 @@ def _ws_thread(port: int, secret: str) -> None:
         respond_question=_resolve_question,
         consume_session_reset=_consume_session_reset,
         set_budget=_set_budget,
+        switch_account=_switch_account,
         send_prompt=_send_prompt,
         extend_request=_extend_request,
         announce_gnome=_announce_gnome,
@@ -1002,6 +1101,7 @@ def main():
     # and no active session — otherwise hook-only agents like Cursor/Grok only
     # appear while actively working.
     _state.set_enabled_agents(enabled_agents)
+    _seed_agent_last_used(enabled_agents | set(_agents.usage_fetchers()))
     _apply_persisted_budgets()
 
     lifecycle.install_agent_hooks(

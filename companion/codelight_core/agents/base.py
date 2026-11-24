@@ -140,3 +140,14 @@ class AgentIntegration:
     # and edit it on the agent's status card; the daemon persists changes.
     budget_getter: Callable[[], float] | None = None
     budget_setter: Callable[[float], None] | None = None
+    # Several logins for one agent (e.g. a work and a private Claude plan):
+    # the usage payload lists them under "accounts", and this swaps the active
+    # one. (account_id) → {"ok", "outcome", "message"?, "account_label"?}.
+    account_switcher: Callable[[str], dict] | None = None
+    # Called (cheaply, often) whenever the agent reports work, so it can
+    # remember which of its accounts is in use.
+    activity_listener: Callable[[], None] | None = None
+    # When the agent was last used, read from its own files (epoch seconds,
+    # 0 = unknown). Seeds codelight's "last used" record for agents it hasn't
+    # seen working yet, so long-unused agents are hidden right away.
+    last_used_hint: Callable[[], float] | None = None

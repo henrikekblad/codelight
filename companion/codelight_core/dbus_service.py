@@ -23,6 +23,7 @@ PermissionCallback = Callable[[str, str], bool]
 QuestionCallback = Callable[[str, Any], bool]
 ExtendCallback = Callable[[str], bool]
 AnnounceCallback = Callable[[list[str]], bool]
+SwitchAccountCallback = Callable[[str, str], bool]
 LogCallback = Callable[[str], None]
 
 
@@ -42,6 +43,7 @@ if HAVE_DBUS:
             respond_question: QuestionCallback,
             extend_request: ExtendCallback,
             announce: AnnounceCallback,
+            switch_account: SwitchAccountCallback | None = None,
         ):
             super().__init__("se.sensnology.codelight")
             self._status_snapshot = status_snapshot
@@ -50,6 +52,7 @@ if HAVE_DBUS:
             self._respond_question = respond_question
             self._extend_request = extend_request
             self._announce = announce
+            self._switch_account = switch_account
 
         @_dbus_signal()
         def StatusChanged(self, status_json: str) -> "s":  # type: ignore[return]
@@ -101,6 +104,17 @@ if HAVE_DBUS:
             return self._extend_request(request_id)
 
         @_dbus_method()
+        def SwitchAccount(self, agent_id: "s", account_id: "s") -> "b":  # type: ignore[return]
+            # Starts the switch; the outcome arrives as AccountSwitched.
+            if self._switch_account is None:
+                return False
+            return self._switch_account(agent_id, account_id)
+
+        @_dbus_signal()
+        def AccountSwitched(self, result_json: str) -> "s":  # type: ignore[return]
+            return result_json
+
+        @_dbus_method()
         def Announce(self, features_json: "s") -> "b":  # type: ignore[return]
             # The GNOME extension announces (on enable + a periodic heartbeat)
             # which features it can answer, so question fall-through doesn't fire
@@ -124,6 +138,7 @@ async def export(
     extend_request: ExtendCallback,
     announce: AnnounceCallback,
     log: LogCallback,
+    switch_account: SwitchAccountCallback | None = None,
 ) -> object | None:
     if not HAVE_DBUS:
         return None
@@ -136,6 +151,7 @@ async def export(
             respond_question=respond_question,
             extend_request=extend_request,
             announce=announce,
+            switch_account=switch_account,
         )
         dbus_bus.export("/se/sensnology/codelight", iface)
         await dbus_bus.request_name("se.sensnology.codelight")

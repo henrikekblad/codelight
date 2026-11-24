@@ -41,6 +41,10 @@ class CodelightState:
         idle_window_waiting: int,
         initial_last_active_agent: str | None = None,
         on_last_active_agent_changed: Callable[[str], None] | None = None,
+        stale_after: float = 0.0,
+        initial_agent_last_used: dict[str, float] | None = None,
+        on_agent_used: Callable[[dict[str, float]], None] | None = None,
+        clock: Callable[[], float] = time.time,
     ) -> None:
         self._lock = threading.RLock()
         self._default_agent_id = default_agent_id
@@ -61,12 +65,59 @@ class CodelightState:
         # Configured agents shown as idle even without a usage meter or an
         # active session, so hook-only agents (no readable quota) stay visible.
         self._enabled_agents: set[str] = set()
+        # Agents unused for longer than this drop out of client lists (0 =
+        # keep forever). Last use is persisted so it survives restarts.
+        self._stale_after = float(stale_after or 0.0)
+        self._clock = clock
+        self._agent_last_used: dict[str, float] = {
+            self.normalize_agent_id(k): float(v)
+            for k, v in (initial_agent_last_used or {}).items()
+            if isinstance(v, (int, float))
+        }
+        self._persisted_last_used = dict(self._agent_last_used)
+        self._on_agent_used = on_agent_used
 
     def set_enabled_agents(self, agent_ids) -> None:
         with self._lock:
             self._enabled_agents = {
                 self.normalize_agent_id(a) for a in (agent_ids or set())
             }
+
+    def seed_agent_last_used(self, seeds: dict[str, float]) -> None:
+        """Give agents with no recorded use a starting point (e.g. their newest
+        transcript, or "now" so nothing vanishes right after an upgrade)."""
+        changed = False
+        with self._lock:
+            for agent_id, ts in seeds.items():
+                aid = self.normalize_agent_id(agent_id)
+                if aid not in self._agent_last_used:
+                    self._agent_last_used[aid] = float(ts)
+                    changed = True
+            snapshot = dict(self._agent_last_used)
+            if changed:
+                self._persisted_last_used = dict(snapshot)
+        if changed and self._on_agent_used:
+            self._on_agent_used(snapshot)
+
+    def agent_last_used(self) -> dict[str, float]:
+        with self._lock:
+            return dict(self._agent_last_used)
+
+    def _note_agent_used(self, agent_id: str) -> dict[str, float] | None:
+        """Record use; return a snapshot to persist when it moved enough to be
+        worth a disk write (hourly granularity is plenty for a 30-day rule)."""
+        now = self._clock()
+        self._agent_last_used[agent_id] = now
+        if now - self._persisted_last_used.get(agent_id, 0.0) < 3600:
+            return None
+        self._persisted_last_used[agent_id] = now
+        return dict(self._agent_last_used)
+
+    def _is_stale(self, agent_id: str, now: float) -> bool:
+        if self._stale_after <= 0:
+            return False
+        last = self._agent_last_used.get(agent_id)
+        return last is not None and now - last > self._stale_after
 
     def normalize_agent_id(self, agent_id: str | None) -> str:
         aid = str(agent_id or "").strip().lower()
@@ -97,7 +148,10 @@ class CodelightState:
     ) -> None:
         normalized_agent = self.normalize_agent_id(agent_id)
         persist_last_agent = False
+        used_snapshot = None
         with self._lock:
+            if state in ("working", "waiting"):
+                used_snapshot = self._note_agent_used(normalized_agent)
             if transcript:
                 self._last_transcript = {
                     "sid": session_id,
@@ -128,6 +182,8 @@ class CodelightState:
                 persist_last_agent = True
         if persist_last_agent and self._on_last_active_agent_changed:
             self._on_last_active_agent_changed(normalized_agent)
+        if used_snapshot is not None and self._on_agent_used:
+            self._on_agent_used(used_snapshot)
 
     def active_transcript(self) -> ActiveTranscript:
         with self._lock:
@@ -211,9 +267,12 @@ class CodelightState:
                     selected_agent = agent_id
                     selected_time = event_time
             # Every configured agent stays visible (idle) even with no active
-            # session — agents without a usage meter would otherwise vanish.
+            # session — agents without a usage meter would otherwise vanish —
+            # unless it hasn't been used for a long time.
+            clock_now = self._clock()
             for agent_id in self._enabled_agents:
-                per_agent.setdefault(agent_id, "idle")
+                if not self._is_stale(agent_id, clock_now):
+                    per_agent.setdefault(agent_id, "idle")
             if not per_agent:
                 per_agent[selected_agent] = "idle"
             return active, overall, per_agent, selected_agent
@@ -277,10 +336,15 @@ class CodelightState:
             session_title = ""
         return dict(usage), weekly_title, session_title
 
-    def _per_agent_usage(self, snapshots: dict[str, dict[str, Any]]) -> dict[str, Any]:
+    def _per_agent_usage(self, snapshots: dict[str, dict[str, Any]],
+                         active: set[str] | None = None) -> dict[str, Any]:
         per_agent_usage: dict[str, Any] = {}
+        now = self._clock()
+        with self._lock:
+            stale = {aid for aid in snapshots
+                     if aid not in (active or set()) and self._is_stale(aid, now)}
         for agent_id, usage in snapshots.items():
-            if not usage:
+            if not usage or agent_id in stale:
                 continue
             entry = {
                 **usage,
@@ -312,7 +376,8 @@ class CodelightState:
             usage = dict(DEFAULT_USAGE)
             weekly_title = ""
             session_title = ""
-        per_agent_usage = self._per_agent_usage(usage_snaps)
+        per_agent_usage = self._per_agent_usage(
+            usage_snaps, active=set(per_agent_status) | {last_agent})
 
         return {
             **usage,

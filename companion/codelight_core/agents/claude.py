@@ -4,13 +4,10 @@ import json
 import os
 import subprocess
 import sys
-import urllib.error
-import urllib.request
 from typing import Callable
 
 from codelight_core import hooks as hooks_core
-from codelight_core.agents import base
-from codelight_core.timefmt import epoch, format_iso_countdown
+from codelight_core.agents import base, claude_accounts
 
 
 USAGE_API = "https://api.anthropic.com/api/oauth/usage"
@@ -70,17 +67,33 @@ def build_integration(
     config: dict,
     *,
     usage_api: str = USAGE_API,
+    stale_after: float = 0.0,
+    accounts_dir: str = "",
     log: Callable[[str], None] | None = None,
 ) -> base.AgentIntegration:
     """Config keys (~/.config/codelight/config.json, agents.claude):
-    settings_path, credentials_path."""
+    settings_path, credentials_path, claude_json_path, account_labels."""
     settings_path = (
         os.path.expanduser(str(config.get("settings_path") or ""))
         or default_settings_path())
     credentials_path = (
         os.path.expanduser(str(config.get("credentials_path") or ""))
         or default_credentials_path())
-    agent = ClaudeAgent(credentials_path, usage_api=usage_api, log=log)
+    claude_json_path = (
+        os.path.expanduser(str(config.get("claude_json_path") or ""))
+        or default_claude_json_path())
+    labels = config.get("account_labels")
+    accounts = None
+    # macOS keeps the login in the keychain, which can't be swapped as a file.
+    if accounts_dir and sys.platform != "darwin":
+        accounts = claude_accounts.ClaudeAccounts(
+            credentials_path, claude_json_path,
+            os.path.join(accounts_dir, "claude"),
+            usage_api=usage_api,
+            labels=labels if isinstance(labels, dict) else None,
+            log=log)
+    agent = ClaudeAgent(credentials_path, usage_api=usage_api,
+                        accounts=accounts, stale_after=stale_after, log=log)
 
     def _install_hooks(*, script_path, hook_wait_ceiling, remote_permissions,
                        remote_questions, permission_timeout, log=None):
@@ -99,6 +112,8 @@ def build_integration(
         agent=agent,
         hook_modes=HOOK_MODES,
         usage_fetcher=agent.get_usage,
+        account_switcher=agent.switch_account if accounts else None,
+        activity_listener=agent.note_activity if accounts else None,
         install_hooks=_install_hooks,
         removable_hook_paths=(settings_path,),
         transcript_extractor=transcript_extractor,
@@ -111,6 +126,10 @@ def default_settings_path() -> str:
 
 def default_credentials_path() -> str:
     return os.path.expanduser("~/.claude/.credentials.json")
+
+
+def default_claude_json_path() -> str:
+    return os.path.expanduser("~/.claude.json")
 
 
 # On macOS the CLI stores its OAuth credentials in the login keychain instead
@@ -167,18 +186,51 @@ class ClaudeAgent:
         credentials_path: str,
         *,
         usage_api: str = USAGE_API,
+        accounts: claude_accounts.ClaudeAccounts | None = None,
+        stale_after: float = 0.0,
         log: Callable[[str], None] | None = None,
     ) -> None:
         self.credentials_path = credentials_path
         self.usage_api = usage_api
+        self.accounts = accounts
+        self.stale_after = stale_after
         self.log = log
 
     def get_usage(self) -> dict | None:
-        return get_usage(
-            self.credentials_path,
-            usage_api=self.usage_api,
-            log=self.log,
-        )
+        if self.accounts is None:
+            return get_usage(
+                self.credentials_path,
+                usage_api=self.usage_api,
+                log=self.log,
+            )
+        try:
+            usage, accounts = self.accounts.poll(stale_after=self.stale_after)
+        except Exception as e:
+            print(f"[usage] Claude accounts error: {e}", file=sys.stderr, flush=True)
+            return get_usage(self.credentials_path, usage_api=self.usage_api,
+                             log=self.log)
+        if usage is None:
+            return None
+        if self.log:
+            self.log(f"[usage] API: session={usage['session_pct']:.0%} "
+                     f"weekly={usage['weekly_pct']:.0%}")
+        # A switcher only makes sense with somewhere to switch to.
+        if len(accounts) > 1:
+            usage["accounts"] = accounts
+            active = next((a for a in accounts if a["active"]), None)
+            if active:
+                usage["account_label"] = active["label"]
+        return usage
+
+    def switch_account(self, account_id: str) -> dict:
+        if self.accounts is None:
+            return {"ok": False, "outcome": "unsupported",
+                    "message": "Account switching is not available here."}
+        return self.accounts.switch(account_id)
+
+    def note_activity(self) -> None:
+        if self.accounts is not None:
+            self.accounts.touch_active()
 
 
 def get_usage(
@@ -204,40 +256,11 @@ def get_usage(
         print(f"[usage] could not read credentials: {e}", file=sys.stderr, flush=True)
         return None
 
-    req = urllib.request.Request(
-        usage_api,
-        headers={
-            "Authorization": f"Bearer {token}",
-            "User-Agent": "claude-code/1.0.0",
-            "anthropic-beta": "oauth-2025-04-20",
-            "Accept": "application/json",
-        },
-    )
-    try:
-        with urllib.request.urlopen(req, timeout=10) as r:
-            data = json.loads(r.read())
-    except urllib.error.HTTPError as e:
-        print(f"[usage] HTTP {e.code}: {e.reason}", file=sys.stderr, flush=True)
-        return None
-    except Exception as e:
-        print(f"[usage] request error: {e}", file=sys.stderr, flush=True)
-        return None
-
-    session = data.get("five_hour") or {}
-    weekly = data.get("seven_day") or {}
-
-    session_pct = float(session.get("utilization") or 0.0) / 100.0
-    weekly_pct = float(weekly.get("utilization") or 0.0) / 100.0
-    if log:
-        log(f"[usage] API: session={session_pct:.0%} weekly={weekly_pct:.0%}")
-    return {
-        "session_pct": session_pct,
-        "weekly_pct": weekly_pct,
-        "session_reset": format_iso_countdown(session.get("resets_at", "")),
-        "weekly_reset": format_iso_countdown(weekly.get("resets_at", "")),
-        "session_reset_at": epoch(session.get("resets_at", "")),
-        "weekly_reset_at": epoch(weekly.get("resets_at", "")),
-    }
+    usage = claude_accounts.fetch_usage(token, usage_api)
+    if usage is not None and log:
+        log(f"[usage] API: session={usage['session_pct']:.0%} "
+            f"weekly={usage['weekly_pct']:.0%}")
+    return usage
 
 
 def install_hooks(

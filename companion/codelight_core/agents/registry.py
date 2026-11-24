@@ -64,6 +64,8 @@ class AgentRegistry:
         agents_config: dict | None = None,
         claude_usage_api: str | None = None,
         github_api: Callable[[str, str], dict] | None = None,
+        stale_after: float | None = None,
+        accounts_dir: str | None = None,
         log: Logger | None = None,
         modules: Sequence[ModuleType] | None = None,
         extra_agents: Sequence[AgentIntegration] = (),
@@ -83,6 +85,10 @@ class AgentRegistry:
             # that declare the corresponding parameter.
             "usage_api": claude_usage_api,
             "api": github_api,
+            # Seconds without use before an agent's extra accounts are hidden.
+            "stale_after": stale_after,
+            # Where agents keep saved account logins (daemon config dir).
+            "accounts_dir": accounts_dir,
             "log": log,
         }
         integrations = []
@@ -152,6 +158,7 @@ class AgentRegistry:
         conversation = self.conversation_agents()
         budget = self.budget_agents()
         promptable = self.prompt_capable_agents()
+        switchable = self.account_switchable_agents()
         return {
             agent_id: {
                 "display": spec.display,
@@ -160,6 +167,7 @@ class AgentRegistry:
                 "conversation": agent_id in conversation,
                 "budget_settable": agent_id in budget,
                 "prompt_capable": agent_id in promptable,
+                "account_switchable": agent_id in switchable,
             }
             for agent_id, spec in self.specs.items()
         }
@@ -244,6 +252,37 @@ class AgentRegistry:
         if integration is None or integration.prompt_sender is None:
             return False
         return bool(integration.prompt_sender(text, session_id))
+
+    def last_used_hints(self) -> dict[str, float]:
+        hints = {}
+        for agent_id, integration in self._integrations.items():
+            if integration.last_used_hint is None:
+                continue
+            try:
+                ts = float(integration.last_used_hint() or 0)
+            except Exception:
+                ts = 0.0
+            if ts > 0:
+                hints[agent_id] = ts
+        return hints
+
+    def account_switchable_agents(self) -> set[str]:
+        return {
+            agent_id for agent_id, integration in self._integrations.items()
+            if integration.account_switcher is not None
+        }
+
+    def switch_account(self, agent_id: str, account_id: str) -> dict:
+        integration = self._integrations.get(agent_id)
+        if integration is None or integration.account_switcher is None:
+            return {"ok": False, "outcome": "unsupported",
+                    "message": "Agent does not support account switching."}
+        return integration.account_switcher(account_id)
+
+    def note_activity(self, agent_id: str) -> None:
+        integration = self._integrations.get(agent_id)
+        if integration is not None and integration.activity_listener is not None:
+            integration.activity_listener()
 
     def session_reset_supported(self, agent_id: str) -> bool:
         integration = self._integrations.get(agent_id)

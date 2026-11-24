@@ -51,6 +51,14 @@ const IFACE_XML = `<node>
       <arg direction="in" type="s" name="request_id"/>
       <arg direction="out" type="b"/>
     </method>
+    <method name="SwitchAccount">
+      <arg direction="in" type="s" name="agent_id"/>
+      <arg direction="in" type="s" name="account_id"/>
+      <arg direction="out" type="b"/>
+    </method>
+    <signal name="AccountSwitched">
+      <arg type="s" name="result_json"/>
+    </signal>
     <method name="Announce">
       <arg direction="in" type="s" name="features_json"/>
       <arg direction="out" type="b"/>
@@ -134,6 +142,40 @@ function normalizedStatus(status) {
 function usageLimits(usage) {
     if (Array.isArray(usage?.limits)) return usage.limits.slice(0, 2);
     return [];
+}
+
+// Other saved logins of an agent (e.g. work/private Claude), switchable.
+function otherAccounts(usage) {
+    if (!Array.isArray(usage?.accounts)) return [];
+    return usage.accounts.filter(a => a && a.id && !a.active);
+}
+
+function accountSummary(account) {
+    if (!account.available) return 'no data';
+    return usageLimits(account)
+        .map(l => `${String(l.label ?? '').charAt(0)} ${Math.round((l.pct ?? 0) * 100)}%`)
+        .join(' · ');
+}
+
+function makeAccountItem(account, onActivate) {
+    const item = new PopupMenu.PopupBaseMenuItem({ reactive: true });
+    item.set_style('padding: 3px 12px;');
+    const row = new St.BoxLayout({ x_expand: true, style: 'spacing: 8px;' });
+    row.add_child(new St.Label({
+        text: `⇄  Switch to ${account.label}`,
+        style: 'color: #cccccc; font-size: 11px;',
+        x_expand: true,
+        y_align: Clutter.ActorAlign.CENTER,
+    }));
+    row.add_child(new St.Label({
+        text: accountSummary(account),
+        style: 'color: #888888; font-size: 10px;',
+        x_align: Clutter.ActorAlign.END,
+        y_align: Clutter.ActorAlign.CENTER,
+    }));
+    item.add_child(row);
+    item.connect('activate', () => onActivate());
+    return item;
 }
 
 // Draw a full-width rounded progress bar via Cairo
@@ -323,6 +365,7 @@ export default class CodelightExtension extends Extension {
         this._qQuestions   = null;
         this._qKeepalive   = null;         // timer id: extends the daemon deadline while open
         this._announceTimer = null;        // timer id: presence heartbeat to the daemon
+        this._lastStatus   = null;         // last status payload, re-applied after a request
         this._indicator = new PanelMenu.Button(0.0, 'Codelight', false);
 
         // ── Panel button ────────────────────────────────────────────────────
@@ -401,10 +444,60 @@ export default class CodelightExtension extends Extension {
         const header = makeAgentHeader(agentDisplay(agent), separated);
         const weekly = makeMeterItem('Weekly');
         const session = makeMeterItem('Session');
-        this._usageItems[agent] = {header, weekly, session, meters: [weekly, session]};
+        const accounts = new PopupMenu.PopupMenuSection();
+        this._usageItems[agent] = {
+            header, weekly, session, meters: [weekly, session],
+            accounts, accountsKey: '',
+        };
         this._usageSection.addMenuItem(header);
         this._usageSection.addMenuItem(weekly);
         this._usageSection.addMenuItem(session);
+        this._usageSection.addMenuItem(accounts);
+    }
+
+    _setAccounts(agentId, items, usage) {
+        const others = otherAccounts(usage);
+        // Rebuild only when something changed, so an open menu doesn't flicker
+        // on every status push.
+        const key = JSON.stringify(others.map(a => [a.id, a.label, accountSummary(a)]));
+        if (key === items.accountsKey) return;
+        items.accountsKey = key;
+        items.accounts.removeAll();
+        for (const account of others) {
+            items.accounts.addMenuItem(makeAccountItem(
+                account, () => this._switchAccount(agentId, account)));
+        }
+    }
+
+    _switchAccount(agentId, account) {
+        if (!this._proxy) return;
+        this._proxy.call('SwitchAccount',
+            new GLib.Variant('(ss)', [agentId, String(account.id)]),
+            Gio.DBusCallFlags.NONE, -1, null,
+            (proxy, res) => {
+                try {
+                    const [started] = proxy.call_finish(res).deepUnpack();
+                    if (!started)
+                        Main.notify('Codelight', `Could not switch ${agentDisplay(agentId)} account.`);
+                } catch (e) {
+                    logError(e, 'codelight SwitchAccount failed');
+                }
+            });
+    }
+
+    _onAccountSwitched(json) {
+        let result;
+        try { result = JSON.parse(json); } catch (_) { return; }
+        const agent = result?.agent_display || agentDisplay(result?.agent_id);
+        if (result?.ok) {
+            if (result.outcome === 'already_active') return;
+            Main.notify('Codelight',
+                `${agent} now uses ${result.account_label}. Running sessions ` +
+                'switch over on their next request.');
+        } else {
+            Main.notify('Codelight',
+                result?.message || `Could not switch ${agent} account.`);
+        }
     }
 
     _refreshStatusItems() {
@@ -413,7 +506,8 @@ export default class CodelightExtension extends Extension {
         this._statusItems = [
             this._hdrItem,
             ...Object.values(this._usageItems)
-                .flatMap(items => [items.header, items.weekly, items.session]),
+                .flatMap(items => [items.header, items.weekly, items.session,
+                    items.accounts.actor]),
         ];
     }
 
@@ -480,6 +574,8 @@ export default class CodelightExtension extends Extension {
                 (_proxy, _sender, [json]) => this._onQuestionRequest(json)));
             this._permSignalIds.push(this._proxy.connectSignal('QuestionResolved',
                 (_proxy, _sender, [json]) => this._onQuestionResolved(json)));
+            this._permSignalIds.push(this._proxy.connectSignal('AccountSwitched',
+                (_proxy, _sender, [json]) => this._onAccountSwitched(json)));
             // Fetch current state immediately so the panel isn't blank on connect
             try {
                 const result = this._proxy.call_sync('GetStatus', null, Gio.DBusCallFlags.NONE, -1, null);
@@ -812,6 +908,9 @@ export default class CodelightExtension extends Extension {
         this._qQuestions = null;
         this._qSection?.removeAll();
         this._statusItems?.forEach(i => { i.visible = true; });   // restore limits/status
+        // Re-apply the last status so rows the daemon doesn't report (e.g.
+        // agents unused for a month) are hidden again.
+        if (this._lastStatus) this._handleMessage(this._lastStatus);
     }
 
     _clearAllRequests() {
@@ -820,6 +919,7 @@ export default class CodelightExtension extends Extension {
     }
 
     _handleMessage(data) {
+        this._lastStatus = data;
         // Don't update meters while a permission/question request is active.
         // Meter updates can visually leak into/behind the request popup.
         const hasActiveRequest = this._reqActiveId !== null;
@@ -855,8 +955,12 @@ export default class CodelightExtension extends Extension {
                 const usage = perAgent[agentId];
                 const hasStatus = perAgentStatus && Object.prototype.hasOwnProperty.call(perAgentStatus, agentId);
                 const display = usage?.agent_display ?? agentDisplay(agentId);
-                items.header.visible = !!usage || !!hasStatus;
-                items.header._nameLabel.set_text(display);
+                const shown = !!usage || !!hasStatus;
+                items.header.visible = shown;
+                items.header._nameLabel.set_text(usage?.account_label
+                    ? `${display} · ${usage.account_label}` : display);
+                items.accounts.actor.visible = shown;
+                this._setAccounts(agentId, items, shown ? usage : null);
                 items.header._statusLabel.set_text(
                     normalizedStatus(perAgentStatus?.[agentId]).toUpperCase());
                 const limits = usageLimits(usage);
@@ -879,6 +983,7 @@ export default class CodelightExtension extends Extension {
     }
 
     _setOffline() {
+        this._lastStatus = null;
         const hex = toHex(C.offline);
         this._panelIcon.gicon = this._agentGicon(DEFAULT_AGENT_ID, 'offline');
         this._hdrDot.set_style(`color: ${hex};`);
@@ -890,6 +995,7 @@ export default class CodelightExtension extends Extension {
             items.weekly.visible = false;
             items.session.visible = false;
             items.header._statusLabel.set_text('OFFLINE');
+            items.accounts.actor.visible = false;
             this._setMeter(items.weekly, null, null);
             this._setMeter(items.session, null, null);
         }

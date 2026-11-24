@@ -9,6 +9,7 @@ Top-level structure:
 
 ```json
 {
+  "hide_unused_after_days": 30,
   "agents": {
     "claude": {},
     "copilot": {},
@@ -18,6 +19,13 @@ Top-level structure:
 ```
 
 All keys are optional. If a key is missing, the companion uses the agent's default.
+
+`hide_unused_after_days` (number, default 30, 0 = never): agents not used for
+this long drop out of the client lists (app, widget, GNOME, VS Code) and come
+back as soon as they report work again. Last use is kept in the daemon-owned
+`~/.config/codelight/settings.json` (`agent_last_used`); an agent codelight has
+never seen working starts from its integration's `last_used_hint` (e.g. the
+newest Codex rollout), or its newest transcript, or the time of the upgrade.
 
 ## Integration model
 
@@ -81,11 +89,44 @@ Keys:
   - macOS: the CLI keeps credentials in the login keychain rather than on
     disk, so when the file is missing codelight reads the `Claude Code-credentials`
     generic-password item instead. No config needed.
+- `claude_json_path` (string): Claude Code's state file, whose `oauthAccount`
+  is swapped together with the credentials on an account switch.
+  - Default: `~/.claude.json`
+- `account_labels` (object): display names for saved accounts, keyed by email,
+  organization name or account id, e.g. `{"me@example.com": "Private"}`.
+  - Default: Team/Enterprise accounts show the organization name, personal
+    plans the email address.
+
+Multiple accounts (e.g. work + private subscription), Linux only:
+
+- Every login seen in `credentials_path` is saved as a profile under
+  `~/.config/codelight/accounts/claude/<id>.json` (mode 0600), one per Claude
+  organization. Log in once with each account (`claude` → `/login`) and both
+  become switchable; the profile is refreshed whenever Claude Code rotates its
+  tokens.
+- With two or more profiles, Claude's usage entry carries `account_label` and
+  an `accounts` list (`id`, `label`, `active`, `available`, `limits`) with
+  meters for every account. Clients switch with the WebSocket
+  `switch_account_request` (`agent_id`, `account_id`, `id` →
+  `switch_account_result`) or the D-Bus `SwitchAccount(agent_id, account_id)`
+  method (outcome via the `AccountSwitched` signal).
+- A switch saves the active login back to its profile, then writes the target
+  profile's credentials and `oauthAccount`. Conversations, memory and settings
+  are local and not tied to the account. Claude Code re-reads the
+  credentials file, so running sessions (CLI and VS Code) carry on under the
+  new account from their next request, conversation intact — no restart.
+- codelight never refreshes the active login (Claude Code owns it); it
+  refreshes only inactive profiles, to read their usage and before switching
+  to them. An inactive profile whose refresh token died needs a fresh
+  `/login` with that account.
+- Inactive accounts unused for `hide_unused_after_days` are left out of the
+  list.
 
 Behavior and quirks:
 
 - Hooks are merged into the configured Claude settings file.
-- Usage is fetched from the Claude OAuth usage API.
+- Usage is fetched from the Claude OAuth usage API
+  (`api.anthropic.com/api/oauth/usage`).
 - Permission prompts use Claude's `PermissionRequest` decision envelope.
 - Question forwarding uses a `PreToolUse` hook matching `AskUserQuestion`.
 

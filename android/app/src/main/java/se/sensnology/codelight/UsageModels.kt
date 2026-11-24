@@ -10,6 +10,15 @@ internal data class UsageLimit(
     val resetAt: Long,
 )
 
+/** One saved login of an agent (e.g. a work and a private Claude plan). */
+internal data class AgentAccount(
+    val id: String,
+    val label: String,
+    val active: Boolean,
+    val available: Boolean,
+    val limits: List<UsageLimit>,
+)
+
 internal data class AgentUsage(
     val id: String,
     val display: String,
@@ -19,6 +28,8 @@ internal data class AgentUsage(
     val rateLimitResetCreditsAvailableCount: Int? = null,
     val budgetUsd: Double = 0.0,
     val spentUsd: Double = 0.0,
+    val accountLabel: String = "",
+    val accounts: List<AgentAccount> = emptyList(),
 )
 
 internal fun loadAgentUsage(prefs: SharedPreferences, now: Long): List<AgentUsage> {
@@ -42,6 +53,21 @@ internal fun loadAgentUsage(prefs: SharedPreferences, now: Long): List<AgentUsag
 
     return ids.map { id ->
         val value = usage.optJSONObject(id)
+        val accounts = buildList {
+            val arr = value?.optJSONArray("accounts") ?: return@buildList
+            for (i in 0 until arr.length()) {
+                val acc = arr.optJSONObject(i) ?: continue
+                val accountId = acc.optString("id")
+                if (accountId.isBlank()) continue
+                add(AgentAccount(
+                    id = accountId,
+                    label = acc.optString("label", accountId),
+                    active = acc.optBoolean("active", false),
+                    available = acc.optBoolean("available", false),
+                    limits = parseLimits(acc.optJSONArray("limits"), now),
+                ))
+            }
+        }
         val rateLimitResetCredits = value?.optJSONObject("rateLimitResetCredits")
         val limits = buildList {
             val generic = value?.optJSONArray("limits")
@@ -94,10 +120,26 @@ internal fun loadAgentUsage(prefs: SharedPreferences, now: Long): List<AgentUsag
             },
             budgetUsd = value?.optDouble("budget_usd", 0.0) ?: 0.0,
             spentUsd = value?.optDouble("spent_usd", 0.0) ?: 0.0,
+            accountLabel = value?.optString("account_label", "") ?: "",
+            accounts = accounts,
         )
     }.sortedWith(compareByDescending<AgentUsage> { it.id == activeId }
         .thenByDescending { statusRank(it.status) }
         .thenBy { it.display.lowercase() })
+}
+
+private fun parseLimits(arr: org.json.JSONArray?, now: Long): List<UsageLimit> = buildList {
+    if (arr == null) return@buildList
+    for (i in 0 until arr.length()) {
+        val limit = arr.optJSONObject(i) ?: continue
+        val resetAt = limit.optLong("reset_at", 0)
+        add(UsageLimit(
+            limit.optString("label", "Limit"),
+            if (resetAt in 1 until now) 0f else limit.optDouble("pct", 0.0).toFloat(),
+            countdown(resetAt, now) ?: limit.optString("reset", "--"),
+            resetAt,
+        ))
+    }
 }
 
 private fun statusRank(status: String): Int = when (status) {

@@ -2764,5 +2764,218 @@ class PendingRequestCancellationTests(unittest.TestCase):
         self.assertTrue(entry["event"].is_set())
 
 
+class _FakeResponse(io.BytesIO):
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        self.close()
+
+
+class ClaudeAccountsTests(unittest.TestCase):
+    """Work/private Claude logins: capture, usage for both, switching."""
+
+    USAGE = {"five_hour": {"utilization": 10.0, "resets_at": ""},
+             "seven_day": {"utilization": 40.0, "resets_at": ""}}
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        root = self.tmp.name
+        self.creds = os.path.join(root, ".credentials.json")
+        self.claude_json = os.path.join(root, ".claude.json")
+        self.store = os.path.join(root, "accounts")
+        self.now = 1_000_000.0
+        self.requests = []
+        with open(self.claude_json, "w") as f:
+            json.dump({"projects": {"/x": {}}, "userID": "u"}, f)
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def http(self, req, timeout=0):
+        self.requests.append(req)
+        if req.full_url.endswith("/token"):
+            body = json.loads(req.data)
+            return _FakeResponse(json.dumps({
+                "access_token": "fresh-" + body["refresh_token"],
+                "refresh_token": "rotated-" + body["refresh_token"],
+                "expires_in": 3600}).encode())
+        return _FakeResponse(json.dumps(self.USAGE).encode())
+
+    def login(self, org, email, token, *, org_type="claude_team",
+              org_name="Drivec", expires_in=3600):
+        creds = {"claudeAiOauth": {
+            "accessToken": token, "refreshToken": "r-" + token,
+            "expiresAt": int((self.now + expires_in) * 1000),
+            "scopes": ["user:inference"]}, "organizationUuid": org}
+        with open(self.creds, "w") as f:
+            json.dump(creds, f)
+        with open(self.claude_json) as f:
+            data = json.load(f)
+        data["oauthAccount"] = {"organizationUuid": org, "emailAddress": email,
+                                "organizationType": org_type,
+                                "organizationName": org_name}
+        with open(self.claude_json, "w") as f:
+            json.dump(data, f)
+
+    def accounts(self):
+        from codelight_core.agents import claude_accounts
+        return claude_accounts.ClaudeAccounts(
+            self.creds, self.claude_json, self.store,
+            usage_api="https://usage.invalid/api/oauth/usage",
+            http=self.http, clock=lambda: self.now)
+
+    def test_logins_are_captured_and_both_report_usage(self):
+        accounts = self.accounts()
+        self.login("org-private", "me@example.com", "priv",
+                   org_type="claude_max", org_name="me's Organization")
+        accounts.sync()
+        self.login("org-work", "me@work.example", "work")
+        usage, listed = accounts.poll()
+
+        self.assertAlmostEqual(usage["weekly_pct"], 0.4)
+        self.assertEqual([a["label"] for a in listed],
+                         ["Drivec", "me@example.com"])
+        self.assertTrue(listed[0]["active"])
+        self.assertTrue(listed[1]["available"])
+        self.assertEqual(listed[1]["limits"][0]["label"], "Weekly")
+        for name in os.listdir(self.store):
+            mode = os.stat(os.path.join(self.store, name)).st_mode & 0o777
+            self.assertEqual(mode, 0o600)
+
+    def test_switch_saves_rotated_tokens_and_swaps_login(self):
+        accounts = self.accounts()
+        self.login("org-private", "me@example.com", "priv",
+                   org_type="claude_max")
+        accounts.sync()
+        self.login("org-work", "me@work.example", "work")
+        accounts.sync()
+        # Claude Code rotates the active (work) token after the snapshot.
+        self.login("org-work", "me@work.example", "work2")
+        private_id = next(a["id"] for a in accounts.poll()[1] if not a["active"])
+        self.now += 7200   # private token expired meanwhile
+
+        result = accounts.switch(private_id)
+
+        self.assertTrue(result["ok"], result)
+        with open(self.creds) as f:
+            creds = json.load(f)
+        self.assertEqual(creds["organizationUuid"], "org-private")
+        self.assertEqual(creds["claudeAiOauth"]["accessToken"], "fresh-r-priv")
+        with open(self.claude_json) as f:
+            claude_json = json.load(f)
+        self.assertEqual(claude_json["oauthAccount"]["emailAddress"],
+                         "me@example.com")
+        self.assertEqual(claude_json["projects"], {"/x": {}})   # untouched
+        # The work profile kept the newest (rotated) token, not the stale one
+        # (it expired meanwhile, so it is refreshed from work2's refresh token).
+        work_id = next(a["id"] for a in accounts.poll()[1] if not a["active"])
+        result = accounts.switch(work_id)
+        self.assertTrue(result["ok"], result)
+        with open(self.creds) as f:
+            self.assertEqual(json.load(f)["claudeAiOauth"]["accessToken"],
+                             "fresh-r-work2")
+
+    def test_active_token_is_never_refreshed_by_codelight(self):
+        accounts = self.accounts()
+        self.login("org-work", "me@work.example", "work", expires_in=-10)
+        accounts.poll()
+        self.assertFalse(any(r.full_url.endswith("/token")
+                             for r in self.requests))
+
+    def test_unused_inactive_account_is_hidden(self):
+        accounts = self.accounts()
+        self.login("org-private", "me@example.com", "priv",
+                   org_type="claude_max")
+        accounts.sync()
+        self.login("org-work", "me@work.example", "work")
+        self.now += 31 * 86400
+        accounts.touch_active()
+        _usage, listed = accounts.poll(stale_after=30 * 86400)
+        self.assertEqual([a["label"] for a in listed], ["Drivec"])
+
+    def test_unknown_account_switch_fails_cleanly(self):
+        accounts = self.accounts()
+        self.login("org-work", "me@work.example", "work")
+        result = accounts.switch("nope")
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["outcome"], "unknown_account")
+
+    def test_agent_usage_lists_accounts_only_when_there_is_a_choice(self):
+        accounts = self.accounts()
+        self.login("org-work", "me@work.example", "work")
+        agent = claude_agent.ClaudeAgent(self.creds, accounts=accounts)
+        self.assertNotIn("accounts", agent.get_usage())
+        self.login("org-private", "me@example.com", "priv",
+                   org_type="claude_max")
+        usage = agent.get_usage()
+        self.assertEqual(len(usage["accounts"]), 2)
+        self.assertEqual(usage["account_label"], "me@example.com")
+
+
+class AgentStalenessTests(unittest.TestCase):
+    DAY = 86400
+
+    def make_state(self, last_used, now):
+        clock = {"now": now}
+        persisted = []
+        state = CodelightState(
+            default_agent_id="claude",
+            agent_registry={"claude": {"display": "Claude"},
+                            "cursor": {"display": "Cursor"},
+                            "codex": {"display": "Codex"}},
+            idle_window=600, idle_window_waiting=30,
+            stale_after=30 * self.DAY,
+            initial_agent_last_used=last_used,
+            on_agent_used=persisted.append,
+            clock=lambda: clock["now"],
+        )
+        state.set_enabled_agents({"claude", "cursor", "codex"})
+        return state, clock, persisted
+
+    def test_agents_unused_for_a_month_disappear_and_return_on_use(self):
+        now = 100 * self.DAY
+        state, clock, persisted = self.make_state(
+            {"claude": now - self.DAY, "cursor": now - 40 * self.DAY}, now)
+        state.update_usage(usages={"cursor": {"monthly_pct": 0.1},
+                                   "claude": {"weekly_pct": 0.2,
+                                              "session_pct": 0.1}})
+        snap = state.status_snapshot()
+        # codex has no record yet → kept (it gets seeded at startup).
+        self.assertEqual(set(snap["per_agent_status"]), {"claude", "codex"})
+        self.assertNotIn("cursor", snap["per_agent_usage"])
+
+        state.update_session("s1", "working", agent_id="cursor")
+        snap = state.status_snapshot()
+        self.assertIn("cursor", snap["per_agent_status"])
+        self.assertIn("cursor", snap["per_agent_usage"])
+        self.assertEqual(persisted[-1]["cursor"], now)
+
+    def test_registry_reports_last_used_hints_and_switchable_agents(self):
+        spec = agents_base.AgentSpec("toy", "Toy")
+        registry = AgentRegistry(modules=[], extra_agents=[
+            agents_base.AgentIntegration(
+                spec=spec, last_used_hint=lambda: 123.0,
+                account_switcher=lambda _id: {"ok": True}),
+            agents_base.AgentIntegration(
+                spec=agents_base.AgentSpec("other", "Other"),
+                last_used_hint=lambda: 0.0),
+        ])
+        self.assertEqual(registry.last_used_hints(), {"toy": 123.0})
+        self.assertTrue(registry.client_metadata()["toy"]["account_switchable"])
+        self.assertFalse(registry.client_metadata()["other"]["account_switchable"])
+        self.assertTrue(registry.switch_account("toy", "x")["ok"])
+        self.assertEqual(registry.switch_account("other", "x")["outcome"],
+                         "unsupported")
+
+    def test_seed_does_not_override_recorded_use(self):
+        now = 100 * self.DAY
+        state, _clock, persisted = self.make_state({"claude": 5.0}, now)
+        state.seed_agent_last_used({"claude": now, "codex": now})
+        self.assertEqual(state.agent_last_used()["claude"], 5.0)
+        self.assertEqual(state.agent_last_used()["codex"], now)
+        self.assertEqual(len(persisted), 1)
+
+
 if __name__ == "__main__":
     unittest.main()

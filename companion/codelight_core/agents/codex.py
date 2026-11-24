@@ -131,6 +131,7 @@ def build_integration(config: dict) -> base.AgentIntegration:
         removable_hook_paths=(hooks_file,),
         transcript_path_for_session=agent.rollout_path_for_session,
         transcript_extractor=transcript_extractor,
+        last_used_hint=agent.last_used,
     )
 
 
@@ -151,6 +152,14 @@ class CodexAgent:
 
     def latest_rollout_path(self) -> str:
         return latest_rollout_path(self.code_home)
+
+    def last_used(self) -> float:
+        """Newest rollout's mtime: every Codex session writes one."""
+        path = self.latest_rollout_path()
+        try:
+            return os.path.getmtime(path) if path else 0.0
+        except OSError:
+            return 0.0
 
     def usage_from_rollout(self, path: str) -> dict | None:
         return usage_from_rollout(path)

@@ -28,6 +28,7 @@ import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.buildAnnotatedString
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.withStyle
 import androidx.compose.ui.text.input.KeyboardType
@@ -59,7 +60,8 @@ fun StatusScreen(onOpenConversation: (String) -> Unit = {}) {
                 key == CodelightService.KEY_STATUS ||
                 key == CodelightService.KEY_CONNECTED ||
                 key == CodelightService.KEY_AGENTS_META ||
-                key == CodelightService.KEY_SESSION_RESET_RESULT
+                key == CodelightService.KEY_SESSION_RESET_RESULT ||
+                key == CodelightService.KEY_SWITCH_ACCOUNT_RESULT
             ) revision++
         }
         state.registerOnSharedPreferenceChangeListener(listener)
@@ -73,6 +75,19 @@ fun StatusScreen(onOpenConversation: (String) -> Unit = {}) {
     val resetResult = state.getString(CodelightService.KEY_SESSION_RESET_RESULT, "") ?: ""
     var confirmResetAgent by remember { mutableStateOf<AgentUsage?>(null) }
     var editBudgetAgent by remember { mutableStateOf<AgentUsage?>(null) }
+    val switchResult = state.getString(CodelightService.KEY_SWITCH_ACCOUNT_RESULT, "") ?: ""
+
+    LaunchedEffect(switchResult) {
+        if (switchResult.isBlank()) return@LaunchedEffect
+        val obj = try { JSONObject(switchResult) } catch (_: Exception) { return@LaunchedEffect }
+        if (obj.optBoolean("pending", false)) return@LaunchedEffect
+        if (obj.optString("outcome") == "already_active") return@LaunchedEffect
+        val agentName = obj.optString("agent_display").ifBlank { "Agent" }
+        val message = if (obj.optBoolean("ok", false))
+            "$agentName now uses ${obj.optString("account_label")}"
+        else obj.optString("message").ifBlank { "Could not switch $agentName account" }
+        Toast.makeText(context, message, Toast.LENGTH_LONG).show()
+    }
 
     LaunchedEffect(resetResult) {
         if (resetResult.isBlank()) return@LaunchedEffect
@@ -175,7 +190,11 @@ fun StatusScreen(onOpenConversation: (String) -> Unit = {}) {
                 Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically,
                     horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                     AgentLogo(branding, tint = branding?.color ?: Palette.text, size = 18.dp)
-                    Text(agent.display, color = Palette.text, fontWeight = FontWeight.Bold,
+                    Text(
+                        if (agent.accountLabel.isNotBlank())
+                            "${agent.display} · ${agent.accountLabel}" else agent.display,
+                        color = Palette.text, fontWeight = FontWeight.Bold,
+                        maxLines = 1, overflow = TextOverflow.Ellipsis,
                         modifier = Modifier.weight(1f))
                     StatusPill(status = agent.status, connected = connected)
                 }
@@ -192,6 +211,39 @@ fun StatusScreen(onOpenConversation: (String) -> Unit = {}) {
                         color = usageColor(limit.pct),
                         trackColor = Color(0xFF444444),
                     )
+                }
+                agent.accounts.filter { !it.active }.forEach { account ->
+                    HorizontalDivider(color = Color(0xFF333333), thickness = 1.dp)
+                    Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+                        Column(Modifier.weight(1f)) {
+                            Text(account.label, color = Palette.text, fontSize = 12.sp,
+                                maxLines = 1, overflow = TextOverflow.Ellipsis)
+                            Text(
+                                if (!account.available) "No usage data"
+                                else account.limits.joinToString(" · ") {
+                                    "${it.label} ${(it.pct.coerceIn(0f, 1f) * 100).toInt()}%"
+                                },
+                                color = Palette.muted, fontSize = 11.sp,
+                            )
+                        }
+                        Button(
+                            onClick = {
+                                context.startService(Intent(context, CodelightService::class.java)
+                                    .setAction(CodelightService.ACTION_SWITCH_ACCOUNT)
+                                    .putExtra(CodelightService.EXTRA_AGENT_ID, agent.id)
+                                    .putExtra(CodelightService.EXTRA_ACCOUNT_ID, account.id))
+                            },
+                            enabled = connected,
+                            colors = ButtonDefaults.buttonColors(
+                                containerColor = Palette.accent,
+                                contentColor = Color.Black,
+                                disabledContainerColor = Color(0xFF333333),
+                                disabledContentColor = Palette.muted,
+                            ),
+                        ) {
+                            Text("Switch")
+                        }
+                    }
                 }
                 if (agent.sessionResetSupported) {
                     val available = agent.rateLimitResetCreditsAvailableCount

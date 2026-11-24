@@ -5,6 +5,11 @@
   "type": "object",
   "additionalProperties": true,
   "properties": {
+    "hide_unused_after_days": {
+      "type": "number",
+      "minimum": 0,
+      "description": "Hide agents (and extra Claude accounts) not used for this many days from client lists. 0 = never hide. Default 30."
+    },
     "agents": {
       "type": "object",
       "description": "Agent-specific configuration keyed by agent id.",
@@ -23,6 +28,17 @@
             "credentials_path": {
               "type": "string",
               "description": "Override Claude credentials path used for usage polling."
+            },
+            "claude_json_path": {
+              "type": "string",
+              "description": "Override the Claude Code state file (~/.claude.json) whose oauthAccount is swapped on account switch."
+            },
+            "account_labels": {
+              "type": "object",
+              "additionalProperties": {
+                "type": "string"
+              },
+              "description": "Display names for saved Claude accounts, keyed by email, organization name or account id, e.g. {\"me@example.com\": \"Private\"}."
             }
           }
         },
@@ -104,7 +120,7 @@
             },
             "monthly_budget_usd": {
               "type": "number",
-              "description": "Opt-in cost meter: this calendar month's OpenCode spend vs this budget in USD. Hidden when unset (OpenCode is BYOK — a self-set tracking budget, not an enforced limit)."
+              "description": "Opt-in cost meter: this calendar month's OpenCode spend vs this budget in USD. Hidden when unset (OpenCode is BYOK \u2014 a self-set tracking budget, not an enforced limit)."
             },
             "server_url": {
               "type": "string",

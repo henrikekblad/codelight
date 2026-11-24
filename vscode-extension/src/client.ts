@@ -9,6 +9,7 @@ export interface CodelightHandlers {
     onPermissionRequest(req: any): void;
     onQuestionRequest(req: any): void;
     onRequestResolved(msg: any): void;
+    onSwitchAccountResult?(msg: any): void;
 }
 
 /** WebSocket client for the companion daemon: HMAC auth → status stream, with
@@ -62,6 +63,12 @@ export class CodelightClient {
         this.send({ type: 'extend', id });
     }
 
+    /** Make another saved login an agent's active one (e.g. work ↔ private). */
+    switchAccount(agentId: string, accountId: string): void {
+        this.send({ type: 'switch_account_request', id: `vscode-${Date.now()}`,
+            agent_id: agentId, account_id: accountId });
+    }
+
     private connect(): void {
         if (this.stopped) { return; }
         const ws = new WebSocket(`ws://${this.host}:${this.port}`);
@@ -103,6 +110,8 @@ export class CodelightClient {
                 this.handlers.onQuestionRequest(m);
             } else if (m.type === 'question_resolved' || m.type === 'permission_resolved') {
                 this.handlers.onRequestResolved(m);
+            } else if (m.type === 'switch_account_result') {
+                this.handlers.onSwitchAccountResult?.(m);
             } else if (typeof m.status === 'string') {
                 this.handlers.onStatus(m);
             }

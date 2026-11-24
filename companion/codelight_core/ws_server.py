@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import threading
 import secrets
 import sys
 from collections.abc import Callable
@@ -53,6 +54,7 @@ class CodelightWebsocketHub:
         announce_gnome: AnnounceCallback,
         log: LogCallback,
         verbose_log: LogCallback,
+        switch_account: Callable[[str, object, str], JsonDict] | None = None,
     ):
         self._websockets = websockets_module
         self._shutdown = shutdown
@@ -71,6 +73,7 @@ class CodelightWebsocketHub:
         self._consume_session_reset = consume_session_reset
         self._set_budget = set_budget
         self._send_prompt = send_prompt
+        self._switch_account = switch_account
         self._extend_request = extend_request
         self._announce_gnome = announce_gnome
         self._log = log
@@ -169,6 +172,7 @@ class CodelightWebsocketHub:
                 request_id, answers, "gnome"),
             extend_request=self._extend_request,
             announce=self._announce_gnome,
+            switch_account=self._switch_account_from_dbus,
             log=self._log,
         )
 
@@ -302,6 +306,22 @@ class CodelightWebsocketHub:
             await ws.send(json.dumps(result))
             return client_name
 
+        if message_type == "switch_account_request":
+            request_id = str(message.get("id") or "")
+            agent_id = str(message.get("agent_id") or "")
+            if self._switch_account is None:
+                result = {"type": "switch_account_result", "id": request_id,
+                          "agent_id": agent_id, "ok": False,
+                          "outcome": "unsupported"}
+            else:
+                # Blocking (file swap + token refresh + usage fetch): keep it
+                # off the event loop.
+                result = await asyncio.to_thread(
+                    self._switch_account, agent_id,
+                    message.get("account_id"), request_id)
+            await ws.send(json.dumps(result))
+            return client_name
+
         if message_type == "send_prompt_request":
             request_id = str(message.get("id") or "")
             agent_id = str(message.get("agent_id") or "")
@@ -327,6 +347,21 @@ class CodelightWebsocketHub:
             self._extend_request(str(message.get("id", "")))
 
         return client_name
+
+    def _switch_account_from_dbus(self, agent_id: str, account_id: str) -> bool:
+        """D-Bus entry point: start the switch in the background and report the
+        outcome with the AccountSwitched signal (a D-Bus method must not block
+        the shared event loop)."""
+        if self._switch_account is None or self.loop is None:
+            return False
+
+        def run() -> None:
+            result = self._switch_account(agent_id, account_id, "")
+            self.loop.call_soon_threadsafe(
+                self._emit_dbus, "AccountSwitched", json.dumps(result))
+
+        threading.Thread(target=run, daemon=True).start()
+        return True
 
     def conversation_clients_features(self, ws) -> set:
         return {"conversation"} if ws in self.conversation_clients else set()

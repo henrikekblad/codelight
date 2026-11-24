@@ -59,6 +59,10 @@
       {
         "command": "codelight.answerQuestion",
         "title": "codelight: Review pending request"
+      },
+      {
+        "command": "codelight.switchAccount",
+        "title": "codelight: Switch account"
       }
     ]
   },

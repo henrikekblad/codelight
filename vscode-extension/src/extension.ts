@@ -84,13 +84,56 @@ function normalizedStatus(value: unknown): string {
     return status === 'inactive' ? 'idle' : status;
 }
 
+/** Other saved logins per agent, from the status payload. */
+function switchableAccounts(p: any): Array<{agentId: string; agentName: string; account: any}> {
+    const perAgent = p?.per_agent_usage;
+    if (!perAgent || typeof perAgent !== 'object') { return []; }
+    return Object.entries(perAgent).flatMap(([agentId, usage]: [string, any]) =>
+        (Array.isArray(usage?.accounts) ? usage.accounts : [])
+            .filter((a: any) => a?.id && !a.active)
+            .map((account: any) => ({
+                agentId,
+                agentName: String(usage?.agent_display ?? agentDisplay(agentId)),
+                account,
+            })));
+}
+
+function accountSummary(account: any): string {
+    if (!account?.available) { return 'no usage data'; }
+    return usageLimits(account)
+        .map(limit => `${limit.label} ${Math.round(limit.pct * 100)}%`).join(' · ');
+}
+
+async function pickAndSwitchAccount(): Promise<void> {
+    const options = switchableAccounts(lastStatus);
+    if (!options.length) {
+        vscode.window.showInformationMessage(
+            'codelight: no other saved accounts. Log in once with each account ' +
+            '(claude → /login) and codelight remembers them.');
+        return;
+    }
+    const pick = await vscode.window.showQuickPick(
+        options.map(o => ({
+            label: `$(account) ${o.account.label}`,
+            description: o.agentName,
+            detail: accountSummary(o.account),
+            option: o,
+        })),
+        { placeHolder: 'Switch to account' },
+    );
+    if (pick && client) {
+        client.switchAccount(pick.option.agentId, String(pick.option.account.id));
+    }
+}
+
 function applyStatus(p: any): void {
     const status = normalizedStatus(p?.status);
     const icon = STATUS_ICON[status] ?? '$(circle-outline)';
     const usage = availableUsage(p);
     const perAgentStatus = p?.per_agent_status;
     const details = usage.flatMap(([id, value], index) => {
-        const name = String(value?.agent_display ?? agentDisplay(id));
+        const display = String(value?.agent_display ?? agentDisplay(id));
+        const name = value?.account_label ? `${display} · ${value.account_label}` : display;
         const agentStatus = normalizedStatus(perAgentStatus?.[id] ??
             (id === p?.agent_id ? status : 'idle')).toUpperCase();
         return [
@@ -101,11 +144,13 @@ function applyStatus(p: any): void {
         ];
     });
     statusItem.text = `${icon} ${agentName(p)} ${status.toUpperCase()}`;
+    const canSwitch = switchableAccounts(p).length > 0;
     statusItem.tooltip = [
         'codelight',
         ...details,
+        ...(canSwitch ? ['', 'Click to switch account'] : []),
     ].join('\n');
-    statusItem.command = undefined;
+    statusItem.command = canSwitch ? 'codelight.switchAccount' : undefined;
     statusItem.show();
 }
 
@@ -569,6 +614,17 @@ function start(): void {
             },
             onPermissionRequest: (req) => { void activateAndShow(req); },
             onQuestionRequest: (req) => { void activateAndShow(req); },
+            onSwitchAccountResult: (msg) => {
+                if (msg?.outcome === 'already_active') { return; }
+                const agent = String(msg?.agent_display ?? agentDisplay(String(msg?.agent_id ?? '')));
+                if (msg?.ok) {
+                    vscode.window.showInformationMessage(
+                        `codelight: ${agent} now uses ${msg.account_label}.`);
+                } else {
+                    vscode.window.showErrorMessage(
+                        `codelight: ${msg?.message || `could not switch ${agent} account.`}`);
+                }
+            },
             onRequestResolved: (msg) => {
                 const id = String(msg?.id ?? '');
                 if (pending && pending.id === id) {
@@ -587,6 +643,9 @@ export function activate(context: vscode.ExtensionContext): void {
     context.subscriptions.push(
         vscode.commands.registerCommand('codelight.answerQuestion', () => {
             if (pending) { showRequest(pending); }
+        }),
+        vscode.commands.registerCommand('codelight.switchAccount', () => {
+            void pickAndSwitchAccount();
         }),
     );
     context.subscriptions.push(
